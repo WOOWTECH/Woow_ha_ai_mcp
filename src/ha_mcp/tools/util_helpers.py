@@ -1171,6 +1171,69 @@ async def wait_for_entity_registered(
     return False
 
 
+async def wait_for_automation_queryable(
+    client: Any,
+    entity_id: str,
+    expected_unique_id: str | None = None,
+    timeout: float = 10.0,
+    poll_interval: float = 0.3,
+) -> bool:
+    """
+    Poll until an automation entity is fully registered and its attributes.id matches.
+
+    Stronger than wait_for_entity_registered: ensures HA has finished populating
+    the entity's attributes (including 'id' which holds the unique_id). This
+    prevents the race where the entity exists in state API but isn't yet
+    queryable by unique_id via the config API.
+
+    Args:
+        client: HomeAssistantClient instance
+        entity_id: Entity ID to wait for (e.g., 'automation.morning_routine')
+        expected_unique_id: If provided, also verify state.attributes.id matches
+        timeout: Maximum time to wait in seconds
+        poll_interval: Time between polls in seconds
+
+    Returns:
+        True if entity is fully queryable, False if timed out
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            state = await client.get_entity_state(entity_id)
+            if state:
+                # If no unique_id to verify, entity existence is enough
+                if not expected_unique_id:
+                    logger.debug(
+                        f"Automation {entity_id} registered after "
+                        f"{time.monotonic() - start:.1f}s"
+                    )
+                    return True
+                # Verify attributes.id matches the expected unique_id
+                attributes = state.get("attributes", {})
+                if attributes.get("id") == expected_unique_id:
+                    logger.debug(
+                        f"Automation {entity_id} fully queryable (id={expected_unique_id}) "
+                        f"after {time.monotonic() - start:.1f}s"
+                    )
+                    return True
+                else:
+                    logger.debug(
+                        f"Automation {entity_id} exists but attributes.id="
+                        f"{attributes.get('id')!r} != {expected_unique_id!r}"
+                    )
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                pass  # Expected: entity not registered yet
+            else:
+                logger.warning(f"Unexpected API error polling {entity_id}: {e}")
+        except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
+            logger.warning(f"Connection/auth error polling {entity_id}: {e}")
+            raise
+        await asyncio.sleep(poll_interval)
+    logger.warning(f"Automation {entity_id} not fully queryable within {timeout}s")
+    return False
+
+
 async def wait_for_entity_removed(
     client: Any,
     entity_id: str,

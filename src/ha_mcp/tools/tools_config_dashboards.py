@@ -504,9 +504,11 @@ def register_config_dashboard_tools(mcp: Any, client: Any, **kwargs: Any) -> Non
         url_path: Annotated[
             str | None,
             Field(
-                description="Dashboard URL path (e.g., 'lovelace-home'). "
-                "Use 'default' for default dashboard. "
-                "If omitted with list_only=True, lists all dashboards."
+                description="Dashboard URL path — NOT 'dashboard_id'. "
+                "Examples: 'lovelace-home', 'my-custom-panel'. "
+                "Use 'default' for the default dashboard. "
+                "If omitted with list_only=True, lists all dashboards. "
+                "Find valid paths via ha_config_get_dashboard(list_only=True)."
             ),
         ] = None,
         list_only: Annotated[
@@ -841,9 +843,10 @@ def register_config_dashboard_tools(mcp: Any, client: Any, **kwargs: Any) -> Non
         url_path: Annotated[
             str,
             Field(
-                description="Dashboard URL path (e.g., 'my-dashboard'). "
+                description="Dashboard URL path — NOT 'dashboard_id'. "
+                "Examples: 'my-dashboard', 'lovelace-energy'. "
                 "Use 'default' or 'lovelace' for the default dashboard. "
-                "New dashboards must use a hyphenated path."
+                "New dashboards must use a hyphenated path (e.g., 'living-room-panel')."
             ),
         ],
         config: Annotated[
@@ -1498,8 +1501,9 @@ def register_config_dashboard_tools(mcp: Any, client: Any, **kwargs: Any) -> Non
         url_path: Annotated[
             str,
             Field(
-                description="Dashboard URL path or internal ID to delete "
-                "(e.g., 'my-dashboard' or 'my_dashboard'). Both forms are accepted."
+                description="Dashboard URL path or internal ID to delete — NOT 'dashboard_id'. "
+                "Examples: 'my-dashboard' or 'my_dashboard'. Both forms are accepted. "
+                "Find valid paths via ha_config_get_dashboard(list_only=True)."
             ),
         ],
     ) -> dict[str, Any]:

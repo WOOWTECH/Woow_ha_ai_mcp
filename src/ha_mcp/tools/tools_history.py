@@ -138,7 +138,9 @@ class HistoryTools:
         entity_ids: Annotated[
             str | list[str],
             Field(
-                description="Entity ID(s) to query. Can be a single ID, comma-separated string, or JSON array."
+                description="Entity ID(s) to query — use 'entity_ids' (plural), NOT 'entity_id'. "
+                "Accepts: a single string, comma-separated string, or JSON array. "
+                "Examples: 'sensor.temperature', 'sensor.temp,sensor.humidity', ['sensor.power']."
             ),
         ],
         source: Annotated[
@@ -162,6 +164,18 @@ class HistoryTools:
             str | None,
             Field(
                 description="End time: ISO datetime. Default: now",
+                default=None,
+            ),
+        ] = None,
+        hours: Annotated[
+            int | float | str | None,
+            Field(
+                description=(
+                    "Convenience alias: look back N hours from now. "
+                    "Equivalent to start_time='{N}h'. "
+                    "Cannot be used together with start_time. "
+                    "Examples: hours=1, hours=24, hours=0.5."
+                ),
                 default=None,
             ),
         ] = None,
@@ -290,6 +304,24 @@ class HistoryTools:
             except ValueError as exc:
                 raise_tool_error(create_validation_error(str(exc), parameter="fields"))
         try:
+            # Resolve hours alias → start_time
+            if hours is not None:
+                if start_time is not None:
+                    raise_tool_error(
+                        create_error_response(
+                            ErrorCode.VALIDATION_INVALID_PARAMETER,
+                            "Cannot specify both 'hours' and 'start_time' — use one or the other",
+                            suggestions=[
+                                "Use hours=24 for a simple look-back",
+                                "Use start_time='24h' or start_time='2024-01-01T00:00:00Z' for explicit control",
+                            ],
+                            context={"hours": hours, "start_time": start_time},
+                        )
+                    )
+                # Convert hours to relative start_time format
+                hours_val = float(hours) if isinstance(hours, str) else hours
+                start_time = f"{hours_val}h"
+
             # Parse entity_ids
             entity_id_list = _parse_entity_ids(entity_ids)
 

@@ -354,13 +354,33 @@ class FuzzyEntitySearcher:
             return results
         for i, doc_tokens in enumerate(docs):
             best_token_score = 0
+            lev_used = False
             for qt in query_tokens:
                 for dt in doc_tokens:
                     ratio = calculate_ratio(qt, dt)
                     best_token_score = max(best_token_score, ratio)
 
-            if best_token_score < 75:  # stricter threshold for typo fallback
-                continue
+            # Tier-4: Levenshtein fallback for tokens that SequenceMatcher misses.
+            # Only for tokens ≥ 5 chars (short tokens produce too many false positives).
+            if best_token_score < 75:
+                lev_match = False
+                for qt in query_tokens:
+                    if len(qt) < 5:
+                        continue
+                    for dt in doc_tokens:
+                        if len(dt) < 5:
+                            continue
+                        if levenshtein_distance(qt, dt) <= 2:
+                            lev_match = True
+                            # Map distance to a synthetic score (dist 0→90, 1→80, 2→70)
+                            lev_score = 90 - levenshtein_distance(qt, dt) * 10
+                            best_token_score = max(best_token_score, lev_score)
+                            break
+                    if lev_match:
+                        break
+                if not lev_match:
+                    continue
+                lev_used = True
 
             # Multi-token coverage gate: how many distinct query tokens
             # have any doc token within the typo-fallback threshold?
@@ -390,7 +410,7 @@ class FuzzyEntitySearcher:
                 "state": state,
                 "attributes": attrs,
                 "score": score,
-                "match_type": "typo_fallback",
+                "match_type": "levenshtein_fallback" if lev_used else "typo_fallback",
             })
         return results
 
@@ -657,6 +677,28 @@ def calculate_token_sort_ratio(query: str, value: str) -> int:
     query_sorted = " ".join(sorted(query.split()))
     value_sorted = " ".join(sorted(value.split()))
     return calculate_ratio(query_sorted, value_sorted)
+
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute Levenshtein edit distance between two strings (stdlib-only, single-row DP)."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if not s2:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            # Insertion, deletion, substitution
+            curr_row.append(
+                min(
+                    curr_row[j] + 1,
+                    prev_row[j + 1] + 1,
+                    prev_row[j] + (0 if c1 == c2 else 1),
+                )
+            )
+        prev_row = curr_row
+    return prev_row[-1]
 
 
 def extract_best_matches(

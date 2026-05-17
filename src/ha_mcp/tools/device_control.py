@@ -750,6 +750,21 @@ class DeviceControlTools:
             ),
         }
 
+        # Build human-readable summary
+        summary_parts = []
+        for r in results:
+            if isinstance(r, dict) and r.get("command_sent"):
+                eid = r.get("entity_id", "unknown")
+                action = r.get("action", r.get("service", "unknown"))
+                summary_parts.append(f"{eid}\u2192{action}")
+            elif isinstance(r, dict):
+                eid = r.get("entity_id", r.get("context", {}).get("entity_id", "unknown"))
+                summary_parts.append(f"{eid}\u2192FAILED")
+        response["summary"] = (
+            f"{successful}/{len(operations)} operations successful"
+            + (f": {', '.join(summary_parts)}" if summary_parts else "")
+        )
+
         # Include skipped operation details if any were skipped
         if skipped_operations:
             response["skipped_details"] = skipped_operations

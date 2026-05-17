@@ -289,7 +289,19 @@ class ServiceTools:
         domain: str,
         service: str,
         entity_id: str | None = None,
-        data: str | dict[str, Any] | None = None,
+        data: Annotated[
+            str | dict[str, Any] | None,
+            Field(
+                description=(
+                    "Service-specific parameters as a dict or JSON string. "
+                    "NOT 'service_data' — use 'data'. "
+                    "Examples: {\"temperature\": 22}, {\"brightness\": 255}, "
+                    "{\"option\": \"home\"}, {\"value\": 50}. "
+                    "The entity_id is added automatically — do NOT include it here."
+                ),
+                default=None,
+            ),
+        ] = None,
         return_response: bool | str = False,
         wait: bool | str = True,
         verbose: Annotated[

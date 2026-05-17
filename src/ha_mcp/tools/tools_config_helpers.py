@@ -2015,7 +2015,16 @@ def register_config_helper_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 "utility_meter",
                 "zone",
             ],
-            Field(description="Type of helper entity to create or update"),
+            Field(
+                description=(
+                    "Type of helper entity to create or update. "
+                    "NOT 'type' — use 'helper_type'. "
+                    "Common types: 'input_boolean' (on/off), 'input_number' (numeric), "
+                    "'input_select' (dropdown), 'input_text' (text), 'input_datetime', "
+                    "'counter', 'timer', 'schedule'. "
+                    "Advanced: 'template', 'group', 'utility_meter', 'statistics' (use Config Entry Flow)."
+                )
+            ),
         ],
         name: Annotated[
             str | None,
