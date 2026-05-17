@@ -318,9 +318,18 @@ class HistoryTools:
                             context={"hours": hours, "start_time": start_time},
                         )
                     )
-                # Convert hours to relative start_time format
+                # Convert hours to start_time
                 hours_val = float(hours) if isinstance(hours, str) else hours
-                start_time = f"{hours_val}h"
+                # If integer-like, use the relative format (e.g., "24h")
+                # Otherwise, compute absolute ISO datetime for fractional hours
+                if hours_val == int(hours_val) and hours_val > 0:
+                    start_time = f"{int(hours_val)}h"
+                else:
+                    from datetime import UTC, datetime, timedelta
+
+                    start_time = (
+                        datetime.now(UTC) - timedelta(hours=hours_val)
+                    ).isoformat()
 
             # Parse entity_ids
             entity_id_list = _parse_entity_ids(entity_ids)
