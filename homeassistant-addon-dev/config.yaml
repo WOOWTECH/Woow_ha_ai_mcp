@@ -2,7 +2,7 @@ name: "Home Assistant MCP Server (Dev)"
 description: "Development channel - AI assistant integration via MCP (unstable)"
 version: "7.5.0.dev360"
 slug: "ha_mcp_dev"
-url: "https://github.com/homeassistant-ai/ha-mcp"
+url: "https://github.com/WOOWTECH/ha-mcp"
 stage: experimental
 arch:
   - aarch64
@@ -20,7 +20,7 @@ hassio_api: true
 hassio_role: manager
 homeassistant_api: true
 host_network: true
-image: "ghcr.io/homeassistant-ai/ha-mcp-addon-dev-{arch}"
+image: "ghcr.io/woowtech/ha-mcp-addon-dev-{arch}"
 options:
   backup_hint: "normal"
   enable_tool_search: false
