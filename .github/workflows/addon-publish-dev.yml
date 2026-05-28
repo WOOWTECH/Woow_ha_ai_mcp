@@ -12,7 +12,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ghcr.io/${{ github.repository }}-addon-dev
+  IMAGE_PREFIX: ghcr.io/woowtech/ha-mcp-addon-dev
 
 # Restrict permissions by default
 permissions:
