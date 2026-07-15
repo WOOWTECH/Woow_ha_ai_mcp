@@ -15,6 +15,15 @@ on:
         description: 'Version override (leave empty to use config.yaml)'
         required: false
         type: string
+  # Auto-publish the stable add-on image when its version (config.yaml) changes.
+  # The fork removed semver-release.yml, so without this the GHCR image would never
+  # be rebuilt on a version bump and store installs would fail. On push events there is
+  # no 'version' input, so checkout falls back to github.sha and reads config.yaml.
+  push:
+    branches:
+      - master
+    paths:
+      - 'homeassistant-addon/config.yaml'
 
 env:
   REGISTRY: ghcr.io
