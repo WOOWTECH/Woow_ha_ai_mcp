@@ -54,6 +54,23 @@ needed.
 1. `git fetch upstream`
 2. `git tag backup/pre-sync-<date> master && git reset --hard upstream/master`
 3. Re-apply branding: `git checkout backup/pre-sync-<date> -- <the 10 image paths>`
-4. Re-derive config/repository/addon-publish rebrand (this file's "Config" section).
-5. Re-disable non-essential workflows (keep `addon-publish.yml`).
-6. Update this file, commit, `git push --force-with-lease origin master`.
+4. **Re-apply the custom-component display rebrand: `python scripts/woowtech-brand.py`**
+   (idempotent; rebrands `custom_components/ha_mcp_tools` display strings to "WOOWTECH MCP").
+5. Re-derive config/repository/addon-publish rebrand (this file's "Config" section).
+6. Re-disable non-essential workflows (keep `addon-publish.yml`).
+7. Update this file, commit, `git push --force-with-lease origin master`.
+
+## Custom-component display rebrand (`scripts/woowtech-brand.py`)
+
+Display name **"WOOWTECH MCP"** applied to `custom_components/ha_mcp_tools`
+(manifest/hacs name, config-flow titles + menu labels, sidebar `PANEL_TITLE`,
+startup notifications, device `manufacturer`/`model`/`name`, entry titles, LLM
+API / webhook / OAuth display strings, English description prose).
+**Functional endpoints are deliberately NOT rebranded** so install + auto-update
+keep working against upstream: `DIST_NAME` (`ha-mcp`/`ha-mcp-dev`), all
+github/pypi/raw URLs, HACS mirror/legacy repo names, `DOMAIN`, `PANEL_URL_PATH`
+(`ha-mcp`), and `LICENSE`. Genuine package references ("ha-mcp package/build",
+pip_spec, `homeassistant-ai/ha-mcp-integration`) stay accurate. de/ru prose keeps
+translated wording (brand token already handled). The in-app "HA-MCP Tool
+Settings" UI comes from the `ha-mcp` PyPI package, not this repo, so it is not
+rebranded here.

@@ -1,4 +1,4 @@
-"""Legacy OAuth 2.1 authorization server for the HA-MCP Server webhook.
+"""Legacy OAuth 2.1 authorization server for the WOOWTECH MCP Server webhook.
 
 Ported from the webhook-proxy add-on's ``mcp_proxy/oauth.py`` ``OAuthProvider``
 + ``AuthorizeView`` + ``TokenView`` (the proven ``legacy`` mode). Self-hosted,
@@ -194,7 +194,7 @@ def bind_legacy_views(
     owner = hass.data.get(OAUTH_ROUTE_OWNER_KEY)
     if owner is not None and owner != _DOMAIN:
         _LOGGER.error(
-            "HA-MCP: cannot enable legacy OAuth mode -- the Webhook Proxy "
+            "WOOWTECH MCP: cannot enable legacy OAuth mode -- the Webhook Proxy "
             "add-on ('%s') already owns the root /authorize and /token routes "
             "in this Home Assistant instance, and Home Assistant cannot "
             "release them until it restarts. Stop that add-on and restart "
@@ -209,7 +209,7 @@ def bind_legacy_views(
         creds_changed = bound_fingerprint != fingerprint
         if creds_changed:
             _LOGGER.warning(
-                "HA-MCP: legacy OAuth credentials changed but the bound root "
+                "WOOWTECH MCP: legacy OAuth credentials changed but the bound root "
                 "views still use the previous ones -- a Home Assistant "
                 "restart is required to activate the new credentials."
             )
@@ -417,7 +417,7 @@ class PKCECodeStore:
         self._codes = {k: v for k, v in self._codes.items() if v["expires"] > now}
         if len(self._codes) >= MAX_PENDING_CODES:
             _LOGGER.warning(
-                "HA-MCP OAuth: pending-code store at cap (%d); refusing "
+                "WOOWTECH MCP OAuth: pending-code store at cap (%d); refusing "
                 "new issuance until existing codes expire or are consumed.",
                 MAX_PENDING_CODES,
             )
@@ -670,7 +670,7 @@ class AuthorizeView(HomeAssistantView):
 </head>
 <body>
   <h1>Authorize MCP Connector</h1>
-  <p>An MCP client is requesting access to your Home Assistant MCP server.</p>
+  <p>An MCP client is requesting access to your WOOWTECH MCP server.</p>
   <p>It will redirect to:<br><code>{escape(redirect_uri)}</code></p>
   <p>Only allow this if you started this connection yourself.</p>
   <form method="POST" action="{AUTHORIZE_PATH}">
@@ -802,7 +802,7 @@ class TokenView(HomeAssistantView):
             return _json_error(
                 "invalid_client",
                 401,
-                headers={"WWW-Authenticate": 'Basic realm="HA-MCP OAuth"'},
+                headers={"WWW-Authenticate": 'Basic realm="WOOWTECH MCP OAuth"'},
                 restart_hint=True,
             )
 

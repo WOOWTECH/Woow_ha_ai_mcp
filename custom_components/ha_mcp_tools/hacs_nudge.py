@@ -100,7 +100,7 @@ async def async_nudge_hacs_refresh(hass: HomeAssistant, target_version: str) -> 
         # renamed attributes, a network failure inside update_repository); any
         # of it must degrade to a debug log, never fault the caller.
         _LOGGER.debug(
-            "HA-MCP: could not nudge HACS to refresh the component repository",
+            "WOOWTECH MCP: could not nudge HACS to refresh the component repository",
             exc_info=True,
         )
         return
@@ -168,7 +168,7 @@ async def _async_force_hacs_repo_refresh(hass: HomeAssistant) -> bool:
             coordinator.async_update_listeners()
     except Exception:
         _LOGGER.debug(
-            "HA-MCP: HACS listener push after the repository refresh failed",
+            "WOOWTECH MCP: HACS listener push after the repository refresh failed",
             exc_info=True,
         )
     return True

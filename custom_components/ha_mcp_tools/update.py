@@ -53,7 +53,7 @@ _RELEASE_NOTES_TIMEOUT_SECONDS = 15
 # component version the release ships, ``{running}`` the one currently installed.
 _COMPONENT_HOLD_WARNING = (
     '<ha-alert alert-type="warning">\n'
-    "This release also updates the HA-MCP Custom Component (to {shipped}; you "
+    "This release also updates the WOOWTECH MCP (to {shipped}; you "
     "are running {running}). Update the component in HACS first — installing "
     "this server update now runs a server build the HACS component has never "
     "been tested with.\n"
@@ -88,11 +88,11 @@ class ServerUpdateEntity(CoordinatorEntity[ServerVersionCoordinator], UpdateEnti
         """Group under one device per config entry; sw_version = installed."""
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
-            name="HA-MCP Server",
-            manufacturer="homeassistant-ai",
-            model="ha-mcp (in-process server)",
+            name="WOOWTECH MCP Server",
+            manufacturer="WOOWTECH",
+            model="WOOWTECH MCP (in-process server)",
             sw_version=self.installed_version,
-            configuration_url="https://github.com/homeassistant-ai/ha-mcp",
+            configuration_url="https://github.com/WOOWTECH/Woow_ha_ai_mcp",
         )
 
     @property
@@ -191,7 +191,7 @@ class ServerUpdateEntity(CoordinatorEntity[ServerVersionCoordinator], UpdateEnti
             # exception escaping it is a bug — logged visibly per the repo's
             # convention (review finding), still degrading to plain notes.
             _LOGGER.warning(
-                "HA-MCP release-notes component-hold check failed", exc_info=True
+                "WOOWTECH MCP release-notes component-hold check failed", exc_info=True
             )
             return None
         if held is None:
@@ -226,14 +226,14 @@ class ServerUpdateEntity(CoordinatorEntity[ServerVersionCoordinator], UpdateEnti
         except (ClientError, TimeoutError) as err:
             # Expected transients (GitHub unreachable, rate-limited, slow) —
             # quiet; the dialog falls back to release_url.
-            _LOGGER.debug("HA-MCP release-notes fetch failed: %s", err)
+            _LOGGER.debug("WOOWTECH MCP release-notes fetch failed: %s", err)
             return None
         except Exception:
             # An unexpected payload shape (TypeError/AttributeError in the
             # parse loop) is a bug or a GitHub API change — logged visibly per
             # the repo's convention (review finding), still degrading to the
             # release_url fallback rather than breaking the update dialog.
-            _LOGGER.warning("HA-MCP release-notes fetch failed", exc_info=True)
+            _LOGGER.warning("WOOWTECH MCP release-notes fetch failed", exc_info=True)
             return None
 
         if not notes:
@@ -282,15 +282,15 @@ class ServerUpdateEntity(CoordinatorEntity[ServerVersionCoordinator], UpdateEnti
                     _installed_dist_version, data.dist
                 )
         except Exception as err:
-            _LOGGER.exception("HA-MCP server update install failed")
+            _LOGGER.exception("WOOWTECH MCP server update install failed")
             raise HomeAssistantError(
-                f"Could not install the HA-MCP server update: {err}"
+                f"Could not install the WOOWTECH MCP server update: {err}"
             ) from err
         # Outside the broad except: these raises must reach the UI as-is, not
         # get re-wrapped into the generic message.
         if data is not None and installed != target:
             raise HomeAssistantError(
-                f"The HA-MCP server update to {target} did not complete "
+                f"The WOOWTECH MCP server update to {target} did not complete "
                 f"(installed: {installed or 'none'}). See Settings > Repairs "
                 "for the failure details."
             )

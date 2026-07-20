@@ -184,7 +184,7 @@ async def async_bring_up_server(hass: HomeAssistant, entry: ConfigEntry) -> None
         await async_teardown_server(hass)
         raise
     except EmbeddedServerError as err:
-        _LOGGER.error("HA-MCP in-process server failed to start: %s", err)
+        _LOGGER.error("WOOWTECH MCP in-process server failed to start: %s", err)
         # suppress: filing the repair issue must be UNCONDITIONAL (review
         # finding) - a raising teardown would otherwise leave the entry
         # looking healthy with the failure visible only in the log.
@@ -195,7 +195,7 @@ async def async_bring_up_server(hass: HomeAssistant, entry: ConfigEntry) -> None
         # it — the repair issue above is the user-facing signal.
         _drop_pending_update_notify(hass)
     except Exception as err:
-        _LOGGER.exception("HA-MCP in-process server: bring-up failed")
+        _LOGGER.exception("WOOWTECH MCP in-process server: bring-up failed")
         with suppress(Exception):
             await async_teardown_server(hass)
         _create_issue(hass, "start", str(err))
@@ -420,7 +420,7 @@ def _surface_connect_urls(
 
     url_lines = "\n".join(f"- {url}" for url in urls)
     log_message = (
-        "HA-MCP in-process server is running. "
+        "WOOWTECH MCP in-process server is running. "
         f"Connect URL(s):\n{url_lines}\n{auth_note}"
     )
     if webhook_enabled and auth_mode == WEBHOOK_AUTH_LEGACY:
@@ -475,7 +475,7 @@ def _surface_connect_urls(
     # with the panel option off the /ha-mcp route does not exist and the link
     # would 404.
     panel_line = (
-        "Manage it from the [HA-MCP settings panel](/ha-mcp) in the sidebar.\n\n"
+        "Manage it from the [WOOWTECH MCP settings panel](/ha-mcp) in the sidebar.\n\n"
         if bool(entry.options.get(OPT_ENABLE_SIDEBAR_PANEL, True))
         else ""
     )
@@ -488,18 +488,18 @@ def _surface_connect_urls(
     # log at INFO, which only admin-gated surfaces expose - the same posture
     # as the add-on printing its URL to the admin-only add-on log.
     message = (
-        "The HA-MCP Server is now running inside Home Assistant.\n\n"
+        "The WOOWTECH MCP Server is now running inside Home Assistant.\n\n"
         f"{panel_line}"
         "The connect URL is shown on the entry's Configure screen "
-        "(Settings - Devices & Services - HA-MCP Custom Component - "
-        "HA-MCP Server - Configure) and in the Home Assistant log - both "
+        "(Settings - Devices & Services - WOOWTECH MCP - "
+        "WOOWTECH MCP Server - Configure) and in the Home Assistant log - both "
         "administrator-only, because the URL is the credential.\n\n"
         f"{auth_note}\n"
     )
     persistent_notification.async_create(
         hass,
         message,
-        title="HA-MCP Server",
+        title="WOOWTECH MCP Server",
         notification_id=_NOTIFICATION_ID,
     )
 
@@ -622,7 +622,7 @@ async def async_maybe_auto_update(
     except AwesomeVersionException as err:
         # Incomparable version strategies (e.g. a non-semver build string) — the
         # only expected failure here. Real bugs (TypeError, etc.) propagate.
-        _LOGGER.debug("HA-MCP auto-update version compare failed: %s", err)
+        _LOGGER.debug("WOOWTECH MCP auto-update version compare failed: %s", err)
         return
 
     if not newer:
@@ -635,10 +635,10 @@ async def async_maybe_auto_update(
     if held is not None:
         shipped, running = held
         _LOGGER.warning(
-            "HA-MCP server %s is available, but that release also updated the "
+            "WOOWTECH MCP server %s is available, but that release also updated the "
             "custom component (%s; running %s); holding the automatic server "
             "update until the component is updated via HACS. Press Install on "
-            "the HA-MCP server update entity to install anyway.",
+            "the WOOWTECH MCP server update entity to install anyway.",
             info.latest,
             shipped,
             running,
@@ -667,7 +667,7 @@ async def async_maybe_auto_update(
 
     channel = channel_for_dist(info.dist)
     _LOGGER.info(
-        "HA-MCP server update available on the %s channel (%s -> %s); "
+        "WOOWTECH MCP server update available on the %s channel (%s -> %s); "
         "reloading the entry to install it.",
         channel,
         info.installed,
@@ -691,7 +691,7 @@ async def async_maybe_auto_update(
         # coordinator refresh retries the whole cycle.
         _drop_pending_update_notify(hass)
         _LOGGER.exception(
-            "HA-MCP auto-update reload failed (%s -> %s on the %s channel)",
+            "WOOWTECH MCP auto-update reload failed (%s -> %s on the %s channel)",
             info.installed,
             info.latest,
             channel,
@@ -732,7 +732,7 @@ async def _async_update_held_by_component(
         # Same wide loader surface as _async_check_component_compat: advisory
         # gate, logged visibly rather than swallowed silently.
         _LOGGER.warning(
-            "Could not read the HA-MCP component version for the auto-update "
+            "Could not read the WOOWTECH MCP component version for the auto-update "
             "gate; proceeding with the update",
             exc_info=True,
         )
@@ -743,7 +743,7 @@ async def _async_update_held_by_component(
             return shipped, running
     except AwesomeVersionException as err:
         # Incomparable version strategies only; real bugs propagate.
-        _LOGGER.debug("HA-MCP auto-update gate version compare failed: %s", err)
+        _LOGGER.debug("WOOWTECH MCP auto-update gate version compare failed: %s", err)
     return None
 
 
@@ -771,7 +771,7 @@ async def _async_fetch_shipped_component_version(
         return str(payload["version"])
     except (ClientError, TimeoutError, KeyError, TypeError, ValueError) as err:
         _LOGGER.debug(
-            "HA-MCP shipped-component manifest fetch failed for %s: %s", url, err
+            "WOOWTECH MCP shipped-component manifest fetch failed for %s: %s", url, err
         )
         return None
 
@@ -795,7 +795,7 @@ async def _async_finish_update_cycle(hass: HomeAssistant) -> None:
         if coordinator is not None:
             await coordinator.async_refresh()
     except Exception:
-        _LOGGER.warning("HA-MCP: post-install version refresh failed", exc_info=True)
+        _LOGGER.warning("WOOWTECH MCP: post-install version refresh failed", exc_info=True)
     marker = domain_data.pop(DATA_PENDING_UPDATE_NOTIFY, None)
     if marker is None or coordinator is None or coordinator.data is None:
         return
@@ -829,14 +829,14 @@ def _create_update_notification(
         else f"https://github.com/homeassistant-ai/ha-mcp/releases/tag/v{new_version}"
     )
     message = (
-        f"The HA-MCP server was automatically updated from {old_version} to "
+        f"The WOOWTECH MCP server was automatically updated from {old_version} to "
         f"{new_version} on the {channel} channel.\n\n"
         f"[Release notes]({release_url})"
     )
     persistent_notification.async_create(
         hass,
         message,
-        title="HA-MCP Server updated",
+        title="WOOWTECH MCP Server updated",
         notification_id=_UPDATE_NOTIFICATION_ID,
     )
 
@@ -890,7 +890,7 @@ async def _async_check_component_compat(
         # (IntegrationNotFound, manifest errors); advisory check, logged
         # visibly with the traceback rather than swallowed silently.
         _LOGGER.warning(
-            "Could not read the HA-MCP component version for the compatibility check",
+            "Could not read the WOOWTECH MCP component version for the compatibility check",
             exc_info=True,
         )
         return
@@ -899,12 +899,12 @@ async def _async_check_component_compat(
         outdated = AwesomeVersion(own) < AwesomeVersion(required)
     except AwesomeVersionException as err:
         # Incomparable version strategies only; real bugs propagate.
-        _LOGGER.debug("HA-MCP component-compat version compare failed: %s", err)
+        _LOGGER.debug("WOOWTECH MCP component-compat version compare failed: %s", err)
         return
 
     if outdated:
         _LOGGER.warning(
-            "The installed ha-mcp server requires HA-MCP Custom Component %s or "
+            "The installed ha-mcp server requires WOOWTECH MCP %s or "
             "newer, but %s is running; update the component via HACS.",
             required,
             own,

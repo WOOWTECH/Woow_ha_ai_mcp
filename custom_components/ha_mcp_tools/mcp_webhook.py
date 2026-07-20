@@ -77,7 +77,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 # Human-readable webhook name shown in the HA webhook registry.
-_WEBHOOK_NAME = "HA-MCP in-process server"
+_WEBHOOK_NAME = "WOOWTECH MCP in-process server"
 
 # Hop-by-hop / sensitive request headers never forwarded upstream (identical set
 # to mcp_proxy). ``authorization`` is stripped because the server authenticates
@@ -505,7 +505,7 @@ def _build_unauthorized_response(request: web.Request) -> web.Response:
         text="Unauthorized",
         headers={
             "WWW-Authenticate": (
-                f'Bearer realm="HA-MCP", resource_metadata="{metadata_url}"'
+                f'Bearer realm="WOOWTECH MCP", resource_metadata="{metadata_url}"'
             )
         },
     )

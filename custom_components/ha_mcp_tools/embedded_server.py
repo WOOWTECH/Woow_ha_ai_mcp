@@ -358,7 +358,7 @@ class EmbeddedServerManager:
             )
             if installed and installed != self._running_version:
                 _LOGGER.warning(
-                    "HA-MCP in-process server is running version %s but "
+                    "WOOWTECH MCP in-process server is running version %s but "
                     "version %s is installed; restart Home Assistant to "
                     "finish applying the update.",
                     self._running_version,
@@ -391,7 +391,7 @@ class EmbeddedServerManager:
         await self._hass.async_add_executor_job(thread.join, _STOP_JOIN_TIMEOUT_SECONDS)
         if thread.is_alive():
             _LOGGER.warning(
-                "HA-MCP in-process server thread did not stop within %.0fs; "
+                "WOOWTECH MCP in-process server thread did not stop within %.0fs; "
                 "leaving it to terminate with the process.",
                 _STOP_JOIN_TIMEOUT_SECONDS,
             )
@@ -768,7 +768,7 @@ class EmbeddedServerManager:
                 "reload this integration.",
                 kind="package",
             )
-        _LOGGER.info("HA-MCP in-process server package ready (version %s)", version)
+        _LOGGER.info("WOOWTECH MCP in-process server package ready (version %s)", version)
         # A DEFERRED spec change must not be recorded as installed: with the
         # stored spec advanced, the next reload would see "unchanged", take the
         # fast path (for a stable spec) and skip the replaced-source uninstall,
@@ -1147,7 +1147,7 @@ class EmbeddedServerManager:
         failure message names the phase the worker was last seen in.
         """
         self._startup_phase = phase
-        _LOGGER.debug("HA-MCP in-process server startup: %s", phase)
+        _LOGGER.debug("WOOWTECH MCP in-process server startup: %s", phase)
 
     def _thread_main(self, access_token: str) -> None:
         """Thread entry point: stage non-secret env, then run the server.
@@ -1191,13 +1191,13 @@ class EmbeddedServerManager:
                 f"the server exited during startup ({self._startup_phase}): {detail}"
             )
             _LOGGER.error(
-                "HA-MCP in-process server exited during startup (%s): %s",
+                "WOOWTECH MCP in-process server exited during startup (%s): %s",
                 self._startup_phase,
                 detail,
             )
         except Exception as err:
             self._thread_exc = err
-            _LOGGER.exception("HA-MCP in-process server thread crashed")
+            _LOGGER.exception("WOOWTECH MCP in-process server thread crashed")
         finally:
             with _IMPORTING_WORKERS_LOCK:
                 _IMPORTING_WORKERS.discard(threading.current_thread())
@@ -1447,15 +1447,15 @@ class EmbeddedServerManager:
         while True:
             if self._thread_exc is not None:
                 raise EmbeddedServerError(
-                    f"HA-MCP in-process server failed to start: {self._thread_exc}"
+                    f"WOOWTECH MCP in-process server failed to start: {self._thread_exc}"
                 ) from self._thread_exc
             if self._thread is not None and not self._thread.is_alive():
                 raise EmbeddedServerError(
-                    "HA-MCP in-process server thread exited during startup."
+                    "WOOWTECH MCP in-process server thread exited during startup."
                 )
             if await self._async_probe_port():
                 _LOGGER.info(
-                    "HA-MCP in-process server is listening on %s:%d",
+                    "WOOWTECH MCP in-process server is listening on %s:%d",
                     self._bind_host,
                     self._port,
                 )
@@ -1467,14 +1467,14 @@ class EmbeddedServerManager:
                 last_progress = now
             if now - start >= _READY_TOTAL_CAP_SECONDS:
                 failure = (
-                    f"HA-MCP in-process server did not become reachable on "
+                    f"WOOWTECH MCP in-process server did not become reachable on "
                     f"port {self._port} within {_READY_TOTAL_CAP_SECONDS:.0f}s "
                     f"(last startup phase: {self._startup_phase})."
                 )
                 break
             if now - last_progress >= _READY_STALL_TIMEOUT_SECONDS:
                 failure = (
-                    f"HA-MCP in-process server did not become reachable on "
+                    f"WOOWTECH MCP in-process server did not become reachable on "
                     f"port {self._port}: no startup progress observed for "
                     f"{_READY_STALL_TIMEOUT_SECONDS:.0f}s (last phase: "
                     f"{self._startup_phase}; {now - start:.0f}s since start)."

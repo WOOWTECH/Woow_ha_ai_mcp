@@ -132,7 +132,7 @@ _SEARCH_RESULT_LIMIT = 8
 # should — ha-mcp ships server-level instructions — but never render an empty
 # prompt if a build does not).
 _FALLBACK_API_PROMPT = (
-    "The following tools are provided by the HA-MCP server running inside "
+    "The following tools are provided by the WOOWTECH MCP server running inside "
     "Home Assistant. They give full control over this Home Assistant "
     "instance: entities, automations, scripts, dashboards, helpers, and "
     "configuration."
@@ -357,7 +357,7 @@ async def _forward_tool_call(
         if not _is_transport_failure(err):
             raise
         raise HomeAssistantError(
-            f"Error calling the HA-MCP tool {name}: {err}"
+            f"Error calling the WOOWTECH MCP tool {name}: {err}"
         ) from err
     # Full CallToolResult (content blocks, structuredContent, isError) —
     # the same shape HA core's mcp integration hands to agents; ha-mcp
@@ -388,7 +388,7 @@ class HaMcpSearchTool(llm.Tool):
 
     name = _SEARCH_TOOL_NAME
     description = (
-        "Search the Home Assistant MCP toolset for tools relevant to a task. "
+        "Search the WOOWTECH MCP toolset for tools relevant to a task. "
         "Returns each match's name, description, and input schema. Execute "
         f"matches with {_CALL_TOOL_NAME}."
     )
@@ -439,7 +439,7 @@ class HaMcpCallTool(llm.Tool):
 
     name = _CALL_TOOL_NAME
     description = (
-        "Execute a Home Assistant MCP tool by name with a dictionary of "
+        "Execute a WOOWTECH MCP tool by name with a dictionary of "
         f"arguments. Discover tools and their schemas with {_SEARCH_TOOL_NAME} "
         "first."
     )
@@ -506,7 +506,7 @@ class HaMcpLlmApi(llm.API):
             if not _is_transport_failure(err):
                 raise
             raise HomeAssistantError(
-                f"Could not reach the in-process HA-MCP server: {err}"
+                f"Could not reach the in-process WOOWTECH MCP server: {err}"
             ) from err
 
         exposed, pinned, stamped = _partition_tools(list_result.tools)
@@ -656,16 +656,16 @@ async def async_register_llm_api(
         hass.data.setdefault(DOMAIN, {})[DATA_LLM_API_UNSUB] = unsubs
     except Exception:
         _LOGGER.warning(
-            "Could not register the HA-MCP LLM API; conversation agents will "
+            "Could not register the WOOWTECH MCP LLM API; conversation agents will "
             "not see the toolset until the entry is reloaded",
             exc_info=True,
         )
         return
     # The embedded e2e (test_llm_api_registered_inside_ha) asserts on this
     # message to prove the registration ran inside a real HA — keep the
-    # "Registered the HA-MCP toolset as LLM API" prefix stable.
+    # "Registered the WOOWTECH MCP toolset as LLM API" prefix stable.
     _LOGGER.info(
-        "Registered the HA-MCP toolset as LLM API (%s mode) — select it in a "
+        "Registered the WOOWTECH MCP toolset as LLM API (%s mode) — select it in a "
         "conversation agent's settings to chat with it (text or voice)",
         exposure,
     )

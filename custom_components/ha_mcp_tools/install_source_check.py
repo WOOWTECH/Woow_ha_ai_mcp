@@ -91,7 +91,7 @@ async def _async_check_install_source(hass: HomeAssistant) -> None:
             installed = repo is not None and bool(repo.data.installed)
     except Exception:
         _LOGGER.warning(
-            "HA-MCP: could not determine the HACS install source", exc_info=True
+            "WOOWTECH MCP: could not determine the HACS install source", exc_info=True
         )
         return
 

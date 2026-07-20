@@ -3256,7 +3256,7 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
         configuration_url="https://github.com/homeassistant-ai/ha-mcp",
     )
 
-    _LOGGER.info("HA-MCP File & YAML Tools initialized with file management services")
+    _LOGGER.info("WOOWTECH MCP File & YAML Tools initialized with file management services")
     return True
 
 

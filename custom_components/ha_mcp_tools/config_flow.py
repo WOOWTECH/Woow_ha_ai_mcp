@@ -1,4 +1,4 @@
-"""Config + options flow for the HA-MCP custom component.
+"""Config + options flow for the WOOWTECH MCP custom component.
 
 One config flow serves two entry types under the shared domain, chosen from a
 menu on the first step:
@@ -96,7 +96,7 @@ from .const import (
 
 # Title shown for the server entry in the integration tile's entry list; the
 # tools entry's title lives in const.py (setup migration in __init__ needs it).
-_SERVER_ENTRY_TITLE = "HA-MCP Server"
+_SERVER_ENTRY_TITLE = "WOOWTECH MCP Server"
 
 # The single-instance server entry's unique id — distinct from the tools entry's
 # unique id (``DOMAIN``) so both entry types coexist under the one domain.
@@ -147,7 +147,7 @@ def _installed_server_version() -> str | None:
 
 
 class HaMcpToolsConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg]
-    """Handle the config flow for the HA-MCP custom component (both entry types)."""
+    """Handle the config flow for the WOOWTECH MCP custom component (both entry types)."""
 
     VERSION = 1
 
@@ -437,7 +437,7 @@ class HaMcpServerOptionsFlow(OptionsFlow):
         # at a route that 404s. The trailing space keeps the surrounding prose
         # spaced correctly whether the sentence is present or empty.
         panel_hint = (
-            "Open the [HA-MCP settings panel](/ha-mcp) for tool management and "
+            "Open the [WOOWTECH MCP settings panel](/ha-mcp) for tool management and "
             "server settings. "
             if bool(opts.get(OPT_ENABLE_SIDEBAR_PANEL, True))
             else ""

@@ -1,4 +1,4 @@
-"""Constants for the HA-MCP custom component.
+"""Constants for the WOOWTECH MCP custom component.
 
 The integration serves two config-entry types under one domain
 (:data:`DOMAIN`), discriminated by ``entry.data[CONF_ENTRY_TYPE]``:
@@ -36,7 +36,7 @@ ENTRY_TYPE_SERVER = "server"
 # Titles shown for each entry in the integration tile's entry list. Public so
 # __init__'s setup migration can retitle pre-#1853 tools entries still
 # carrying the legacy default (a user-customized title is left alone).
-TOOLS_ENTRY_TITLE = "HA-MCP File & YAML Tools"
+TOOLS_ENTRY_TITLE = "WOOWTECH MCP File & YAML Tools"
 TOOLS_ENTRY_LEGACY_TITLE = "HA MCP Tools"
 MIN_EMBEDDED_HOME_ASSISTANT_VERSION = "2026.6.0"
 
@@ -194,7 +194,7 @@ RESERVED_DASHBOARD_URL_PATHS = frozenset(
 
 
 # ---------------------------------------------------------------------------
-# HA-MCP Server entry (issue #1527)
+# WOOWTECH MCP Server entry (issue #1527)
 #
 # Folded in from the former standalone ``ha_mcp_server`` integration. The
 # "server" config-entry type runs the full ha-mcp FastMCP server in-process
@@ -340,7 +340,7 @@ DEFAULT_LLM_API_EXPOSURE = EXPOSURE_TOOL_SEARCH
 # When False, the persistent notification created on every server bring-up is
 # suppressed; the connect URLs still reach the admin-only Home Assistant log.
 OPT_ENABLE_STARTUP_NOTIFICATION = "enable_startup_notification"
-# When False, the admin-only "HA-MCP" sidebar settings panel is not registered;
+# When False, the admin-only "WOOWTECH MCP" sidebar settings panel is not registered;
 # the server's options stay reachable on the entry's Configure screen.
 OPT_ENABLE_SIDEBAR_PANEL = "enable_sidebar_panel"
 
@@ -435,11 +435,11 @@ SERVER_CONFIG_SUBDIR = ".ha_mcp"
 
 # Client name recorded on the provisioned long-lived access token, and the name
 # of the local admin user the server logs in as. Stable so a reused token is
-# recognizable in Settings -> People -> <user> -> tokens. "HA-MCP" phrasing (not
+# recognizable in Settings -> People -> <user> -> tokens. "WOOWTECH MCP" phrasing (not
 # "Home Assistant MCP Server") to avoid confusion with HA's official MCP Server
 # integration.
-SERVER_TOKEN_CLIENT_NAME = "HA-MCP Server"
-SERVER_USER_NAME = "HA-MCP Server"
+SERVER_TOKEN_CLIENT_NAME = "WOOWTECH MCP Server"
+SERVER_USER_NAME = "WOOWTECH MCP Server"
 
 # RFC 8414 / RFC 9728 discovery documents for ha_auth mode are served under this
 # namespace (mirrors the webhook-proxy add-on's /api/mcp_proxy/oauth base).

@@ -108,5 +108,5 @@ class ServerVersionCoordinator(DataUpdateCoordinator[ServerVersionInfo]):
                     payload = await resp.json()
             return str(payload["info"]["version"])
         except (ClientError, TimeoutError, KeyError, ValueError) as err:
-            _LOGGER.debug("HA-MCP server version check failed for %s: %s", dist, err)
+            _LOGGER.debug("WOOWTECH MCP server version check failed for %s: %s", dist, err)
             return None

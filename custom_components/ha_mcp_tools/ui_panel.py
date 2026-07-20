@@ -3,7 +3,7 @@
 The in-process ha-mcp server serves its web settings UI on the loopback interface
 at ``http://127.0.0.1:<port><secret_path>/settings`` — unreachable from a browser
 and guarded only by the secret path. This module gives every install type the
-add-on's "Open Web UI" experience: an admin-only sidebar panel ("HA-MCP") that
+add-on's "Open Web UI" experience: an admin-only sidebar panel ("WOOWTECH MCP") that
 opens that settings UI through Home Assistant's own HTTP server, so it works over
 the Nabu Casa remote URL and never exposes the loopback secret path to the browser.
 
@@ -64,10 +64,10 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 # Sidebar panel identity. The url_path is the frontend route (…/ha-mcp).
-# "HA-MCP" (not "MCP Server") avoids confusion with HA's official MCP Server
+# "WOOWTECH MCP" (not "MCP Server") avoids confusion with HA's official MCP Server
 # integration.
 PANEL_URL_PATH = "ha-mcp"
-PANEL_TITLE = "HA-MCP"
+PANEL_TITLE = "WOOWTECH MCP"
 PANEL_ICON = "mdi:robot-happy-outline"
 
 # HTTP surface, all under one base so the session cookie can be tightly scoped.
@@ -358,10 +358,10 @@ class _ProxyView(HomeAssistantView):
             ) as upstream:
                 return await _relay_response(request, upstream)
         except aiohttp.ClientError as err:
-            _LOGGER.error("HA-MCP settings proxy: upstream request failed: %s", err)
+            _LOGGER.error("WOOWTECH MCP settings proxy: upstream request failed: %s", err)
             return web.Response(status=502, text="MCP settings server unavailable")
         except Exception as err:
-            _LOGGER.exception("HA-MCP settings proxy: unexpected error: %s", err)
+            _LOGGER.exception("WOOWTECH MCP settings proxy: unexpected error: %s", err)
             return web.Response(status=500, text="MCP settings server error")
 
 
@@ -390,7 +390,7 @@ async def _relay_response(
             async for chunk in upstream.content.iter_any():
                 await response.write(chunk)
         except aiohttp.ClientError as err:
-            _LOGGER.error("HA-MCP settings proxy: upstream dropped mid-stream: %s", err)
+            _LOGGER.error("WOOWTECH MCP settings proxy: upstream dropped mid-stream: %s", err)
         with _suppress_connection_reset():
             await response.write_eof()
         return response
@@ -418,7 +418,7 @@ async def async_register_ui_panel(hass: HomeAssistant) -> None:
         _register_views(hass)
         await _register_panel(hass)
     except Exception:
-        _LOGGER.exception("HA-MCP: failed to register the settings-UI panel")
+        _LOGGER.exception("WOOWTECH MCP: failed to register the settings-UI panel")
 
 
 def async_unregister_ui_panel(hass: HomeAssistant) -> None:
@@ -502,7 +502,7 @@ class _suppress_all:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         if exc_type is None or not issubclass(exc_type, Exception):
             return False  # never swallow KeyboardInterrupt/SystemExit
-        _LOGGER.warning("HA-MCP: settings-UI panel teardown error", exc_info=exc)
+        _LOGGER.warning("WOOWTECH MCP: settings-UI panel teardown error", exc_info=exc)
         return True
 
 
@@ -627,14 +627,14 @@ async function mint() {{
         return;
       }}
       if (window.parent === window) {{
-        showMessage("Open this page from the HA-MCP entry in the Home Assistant sidebar.");
+        showMessage("Open this page from the WOOWTECH MCP entry in the Home Assistant sidebar.");
         return;
       }}
       tokenMisses += 1;
       if (tokenMisses === TOKEN_HINT_AFTER) {{
         showMessage(
           "Still waiting for the Home Assistant sign-in. If this page is not " +
-            "inside the Home Assistant frontend, open it from the HA-MCP " +
+            "inside the Home Assistant frontend, open it from the WOOWTECH MCP " +
             "sidebar entry."
         );
       }}
@@ -662,7 +662,7 @@ async function mint() {{
       return;
     }}
     if (resp.status === 403) {{
-      showMessage("The HA-MCP settings UI is available to administrators only.", true);
+      showMessage("The WOOWTECH MCP settings UI is available to administrators only.", true);
       return;
     }}
     if (!resp.ok) {{
@@ -718,7 +718,7 @@ _BOOT_HTML = f"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HA-MCP settings</title>
+<title>WOOWTECH MCP settings</title>
 <style>
   html, body {{ height: 100%; margin: 0; background: #fafafa; }}
   main {{ height: 100%; outline: none; }}
@@ -736,8 +736,8 @@ _BOOT_HTML = f"""<!doctype html>
 </head>
 <body>
 <main id="main-content" tabindex="-1">
-<div class="msg" role="status" aria-live="polite">Loading the HA-MCP settings UI…</div>
-<iframe class="hidden" title="HA-MCP settings"></iframe>
+<div class="msg" role="status" aria-live="polite">Loading the WOOWTECH MCP settings UI…</div>
+<iframe class="hidden" title="WOOWTECH MCP settings"></iframe>
 </main>
 <script>
 {_BOOT_JS}
