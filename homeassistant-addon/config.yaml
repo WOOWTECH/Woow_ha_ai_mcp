@@ -2,7 +2,7 @@ name: "Home Assistant MCP Server"
 description: "AI assistant integration for Home Assistant via Model Context Protocol (MCP)"
 version: "7.14.1"
 slug: "ha_mcp"
-url: "https://github.com/homeassistant-ai/ha-mcp"
+url: "https://github.com/WOOWTECH/Woow_ha_ai_mcp"
 arch:
   - aarch64 # 64-bit ARM (Raspberry Pi 4+, modern ARM devices)
   - amd64 # 64-bit x86 (most PCs and servers)
@@ -33,7 +33,7 @@ homeassistant_api: true
 # Enable host network mode for local network access
 host_network: true
 # Use pre-built Docker images
-image: "ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}"
+image: "ghcr.io/woowtech/ha-mcp-addon-{arch}"
 # Options for user configuration
 # NOTE: enable_yaml_config_editing (+ enable_yaml_packages_* and
 # enable_yaml_edit_confirm),

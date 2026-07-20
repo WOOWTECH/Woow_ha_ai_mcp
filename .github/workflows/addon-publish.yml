@@ -18,7 +18,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ghcr.io/${{ github.repository }}-addon
+  IMAGE_PREFIX: ghcr.io/woowtech/ha-mcp-addon
 
 jobs:
   build-addon:
