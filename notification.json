@@ -1,0 +1,342 @@
+{
+  "schema": 1,
+  "repository": "WOOWTECH/Woow_ha_ai_mcp",
+  "components": {
+    "ha_mcp_dev": {
+      "id": "ha_mcp_dev",
+      "name": "Home Assistant MCP Server (Dev)",
+      "version": "7.14.0.dev2054",
+      "repository": "WOOWTECH/Woow_ha_ai_mcp",
+      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_path": "homeassistant-addon-dev",
+      "config_file": "config.yaml",
+      "config_sha256": "sha256:bf0080b9fe163a3e73078881c61b312b7705e9ec4a5f4156d7f151eed52f0487",
+      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "context_fingerprint": "sha256:7b72b3a95f6c39e546364e386b1a20b285cd069b60370459f60a687289d457e6",
+      "material_fingerprint": "sha256:289e45cbae75e619628712ec9f3a94b02b4c2bdc22fa9a5ec7e5c3d59559c38f",
+      "architectures": [
+        "aarch64",
+        "amd64"
+      ],
+      "config": {
+        "name": "Home Assistant MCP Server (Dev)",
+        "description": "Development channel - AI assistant integration via MCP (unstable)",
+        "version": "7.14.0.dev2054",
+        "slug": "ha_mcp_dev",
+        "url": "https://github.com/homeassistant-ai/ha-mcp",
+        "stage": "experimental",
+        "arch": [
+          "aarch64",
+          "amd64"
+        ],
+        "init": false,
+        "startup": "application",
+        "boot": "manual",
+        "ingress": true,
+        "ingress_port": 9583,
+        "ingress_stream": true,
+        "hassio_api": true,
+        "hassio_role": "manager",
+        "homeassistant_api": true,
+        "host_network": true,
+        "image": "ghcr.io/homeassistant-ai/ha-mcp-addon-dev-{arch}",
+        "options": {
+          "backup_hint": "normal",
+          "enable_tool_search": false,
+          "enable_tool_security_policies": false,
+          "read_only_mode": false,
+          "enable_beta_features": true,
+          "enable_yaml_config_editing": false,
+          "enable_yaml_packages_automation": false,
+          "enable_yaml_packages_script": false,
+          "enable_yaml_packages_scene": false,
+          "enable_yaml_edit_confirm": true,
+          "enable_filesystem_tools": false,
+          "enable_dashboard_screenshot": false,
+          "enable_code_mode": false,
+          "enable_lite_docstrings": false,
+          "enable_mandatory_bps": true,
+          "enable_strict_mandatory_bps": true,
+          "enable_auto_backup": true,
+          "auto_backup_throttle_minutes": 0,
+          "auto_backup_retain_per_entity": 100,
+          "enable_snapshot_delete": false,
+          "snapshot_delete_min_age_days": 7,
+          "tool_search_max_results": 5,
+          "disabled_tools": "",
+          "pinned_tools": "",
+          "verify_ssl": true
+        },
+        "schema": {
+          "backup_hint": "list(strong|normal|weak|auto)",
+          "secret_path": "str?",
+          "enable_tool_search": "bool?",
+          "enable_tool_security_policies": "bool?",
+          "read_only_mode": "bool?",
+          "enable_beta_features": "bool?",
+          "enable_yaml_config_editing": "bool?",
+          "enable_yaml_packages_automation": "bool?",
+          "enable_yaml_packages_script": "bool?",
+          "enable_yaml_packages_scene": "bool?",
+          "enable_yaml_edit_confirm": "bool?",
+          "enable_code_mode": "bool?",
+          "enable_lite_docstrings": "bool?",
+          "enable_mandatory_bps": "bool?",
+          "enable_strict_mandatory_bps": "bool?",
+          "enable_filesystem_tools": "bool?",
+          "enable_dashboard_screenshot": "bool?",
+          "enable_auto_backup": "bool?",
+          "auto_backup_throttle_minutes": "int(0,1440)?",
+          "auto_backup_retain_per_entity": "int(1,10000)?",
+          "enable_snapshot_delete": "bool?",
+          "snapshot_delete_min_age_days": "int(0,365)?",
+          "tool_search_max_results": "int(2,10)?",
+          "disabled_tools": "str?",
+          "pinned_tools": "str?",
+          "verify_ssl": "bool?"
+        },
+        "ports": {
+          "9583/tcp": 9583
+        }
+      },
+      "source_build_supported": false,
+      "images": {
+        "aarch64": {
+          "reference": "ghcr.io/homeassistant-ai/ha-mcp-addon-dev-aarch64:7.14.0.dev2054",
+          "index_digest": "sha256:e184648d6dc22e1c971a02b158eeb2bf108de66e9a91ea2d9f62c60c65b9dddb",
+          "digest": "sha256:a09270039e010052dfd044340d13040a1a03d9236ee8f9ba05467aa415e07f57",
+          "source_revision": null
+        },
+        "amd64": {
+          "reference": "ghcr.io/homeassistant-ai/ha-mcp-addon-dev-amd64:7.14.0.dev2054",
+          "index_digest": "sha256:e5262a728ae3b48707e151eafdc8801cd579826eea195ce9ce66fe7341dd65cb",
+          "digest": "sha256:85d2e90f373b6f6b79b45184dbb8bf988ecfd493bdcd0e26ea842023b8f2c586",
+          "source_revision": null
+        }
+      },
+      "delivery": "published-image",
+      "validation": "manifest+architecture-images+configured-CI",
+      "publisher_run_id": "37410078805",
+      "channel": "prerelease"
+    },
+    "ha_mcp_webhook_proxy_dev": {
+      "id": "ha_mcp_webhook_proxy_dev",
+      "name": "Nabu Casa - Webhook Proxy for HA MCP (Dev)",
+      "version": "2.0.3.dev3",
+      "repository": "WOOWTECH/Woow_ha_ai_mcp",
+      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_path": "homeassistant-addon-webhook-proxy-dev",
+      "config_file": "config.yaml",
+      "config_sha256": "sha256:8d6af0d154ef903e7b9300f118b711b9f402a4d2230b9abcfec40277c34a8fba",
+      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "context_fingerprint": "sha256:45e8eb8b0b974a11032b4d2a283d05db423b0274976d1a482ad6977e158fe547",
+      "material_fingerprint": "sha256:4f2dcedda5e958fb17ea81b17fc7ce666434abc3d8b96209d6d2b41d5a595fb5",
+      "architectures": [
+        "aarch64",
+        "amd64"
+      ],
+      "config": {
+        "name": "Nabu Casa - Webhook Proxy for HA MCP (Dev)",
+        "description": "DEV CHANNEL (unstable) — remote access proxy via Nabu Casa or any reverse proxy. Cannot run alongside the stable Webhook Proxy add-on.",
+        "version": "2.0.3.dev3",
+        "slug": "ha_mcp_webhook_proxy_dev",
+        "url": "https://github.com/homeassistant-ai/ha-mcp",
+        "stage": "experimental",
+        "arch": [
+          "aarch64",
+          "amd64"
+        ],
+        "init": false,
+        "startup": "application",
+        "boot": "manual",
+        "hassio_api": true,
+        "hassio_role": "manager",
+        "homeassistant_api": true,
+        "host_network": true,
+        "map": [
+          "config:rw"
+        ],
+        "options": {
+          "remote_url": "",
+          "mcp_server_url": "",
+          "mcp_port": 9583,
+          "debug_logging": false
+        },
+        "schema": {
+          "remote_url": "str?",
+          "mcp_server_url": "str?",
+          "mcp_port": "port?",
+          "enable_oauth": "bool?",
+          "oauth_mode": "list(ha_auth|legacy)?",
+          "oauth_client_id": "str?",
+          "oauth_client_secret": "password?",
+          "regenerate_oauth_creds": "bool?",
+          "debug_logging": "bool?"
+        }
+      },
+      "source_build_supported": true,
+      "images": {},
+      "delivery": "local-source-build",
+      "validation": "manifest+source-context+configured-CI (runtime build not certified)",
+      "publisher_run_id": "37410078805",
+      "channel": "prerelease"
+    },
+    "ha_mcp_webhook_proxy": {
+      "id": "ha_mcp_webhook_proxy",
+      "name": "Nabu Casa - Webhook Proxy for HA MCP",
+      "version": "2.0.4",
+      "repository": "WOOWTECH/Woow_ha_ai_mcp",
+      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_path": "homeassistant-addon-webhook-proxy",
+      "config_file": "config.yaml",
+      "config_sha256": "sha256:fbd30e177718a2390a34145278388adbc8826f05c086c90892403c39a88f200e",
+      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "context_fingerprint": "sha256:c97dd9446bca402cd672e122410c671a05888489606a016996a367d60b238e47",
+      "material_fingerprint": "sha256:f5123c45b7a569cef1e284c1bf3e6f28f86bad422f25683befd7665dfba8fae9",
+      "architectures": [
+        "aarch64",
+        "amd64"
+      ],
+      "config": {
+        "name": "Nabu Casa - Webhook Proxy for HA MCP",
+        "description": "Remote access proxy via Nabu Casa or any reverse proxy (Cloudflare, DuckDNS, nginx)",
+        "version": "2.0.4",
+        "slug": "ha_mcp_webhook_proxy",
+        "url": "https://github.com/homeassistant-ai/ha-mcp",
+        "arch": [
+          "aarch64",
+          "amd64"
+        ],
+        "init": false,
+        "startup": "application",
+        "boot": "auto",
+        "hassio_api": true,
+        "hassio_role": "manager",
+        "homeassistant_api": true,
+        "host_network": true,
+        "map": [
+          "config:rw"
+        ],
+        "options": {
+          "remote_url": "",
+          "mcp_server_url": "",
+          "mcp_port": 9583,
+          "debug_logging": false
+        },
+        "schema": {
+          "remote_url": "str?",
+          "mcp_server_url": "str?",
+          "mcp_port": "port?",
+          "enable_oauth": "bool?",
+          "oauth_mode": "list(ha_auth|legacy)?",
+          "oauth_client_id": "str?",
+          "oauth_client_secret": "password?",
+          "regenerate_oauth_creds": "bool?",
+          "debug_logging": "bool?"
+        }
+      },
+      "source_build_supported": true,
+      "images": {},
+      "delivery": "local-source-build",
+      "validation": "manifest+source-context+configured-CI (runtime build not certified)",
+      "publisher_run_id": "37410078805",
+      "channel": "stable"
+    },
+    "ha_mcp": {
+      "id": "ha_mcp",
+      "name": "Home Assistant MCP Server",
+      "version": "7.14.1",
+      "repository": "WOOWTECH/Woow_ha_ai_mcp",
+      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_path": "homeassistant-addon",
+      "config_file": "config.yaml",
+      "config_sha256": "sha256:7d0262d3636733b64e073a8ccbd55a691ca317b005bfdfce85ebb7fc8a8208ea",
+      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "context_fingerprint": "sha256:9da2a154f42c9eeafe924849057949a8cc7b22d1b1531d2799bc717d279811b4",
+      "material_fingerprint": "sha256:956b4b60c1f0f99527045cf33820ada137b2c90aa76e70a09fcb301e40b77c43",
+      "architectures": [
+        "aarch64",
+        "amd64"
+      ],
+      "config": {
+        "name": "Home Assistant MCP Server",
+        "description": "AI assistant integration for Home Assistant via Model Context Protocol (MCP)",
+        "version": "7.14.1",
+        "slug": "ha_mcp",
+        "url": "https://github.com/homeassistant-ai/ha-mcp",
+        "arch": [
+          "aarch64",
+          "amd64"
+        ],
+        "init": false,
+        "startup": "application",
+        "boot": "manual",
+        "ingress": true,
+        "ingress_port": 9583,
+        "ingress_stream": true,
+        "hassio_api": true,
+        "hassio_role": "manager",
+        "homeassistant_api": true,
+        "host_network": true,
+        "image": "ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}",
+        "options": {
+          "backup_hint": "normal",
+          "enable_tool_search": false,
+          "tool_search_max_results": 5,
+          "enable_tool_security_policies": false,
+          "read_only_mode": false,
+          "enable_mandatory_bps": true,
+          "enable_strict_mandatory_bps": true,
+          "disabled_tools": "",
+          "pinned_tools": "",
+          "enable_auto_backup": true,
+          "auto_backup_throttle_minutes": 0,
+          "auto_backup_retain_per_entity": 100,
+          "enable_snapshot_delete": false,
+          "snapshot_delete_min_age_days": 7,
+          "verify_ssl": true
+        },
+        "schema": {
+          "backup_hint": "list(strong|normal|weak|auto)",
+          "secret_path": "str?",
+          "enable_tool_search": "bool?",
+          "tool_search_max_results": "int(2,10)?",
+          "enable_tool_security_policies": "bool?",
+          "read_only_mode": "bool?",
+          "enable_mandatory_bps": "bool?",
+          "enable_strict_mandatory_bps": "bool?",
+          "disabled_tools": "str?",
+          "pinned_tools": "str?",
+          "enable_auto_backup": "bool?",
+          "auto_backup_throttle_minutes": "int(0,1440)?",
+          "auto_backup_retain_per_entity": "int(1,10000)?",
+          "enable_snapshot_delete": "bool?",
+          "snapshot_delete_min_age_days": "int(0,365)?",
+          "verify_ssl": "bool?"
+        },
+        "ports": {
+          "9583/tcp": 9583
+        }
+      },
+      "source_build_supported": false,
+      "images": {
+        "aarch64": {
+          "reference": "ghcr.io/homeassistant-ai/ha-mcp-addon-aarch64:7.14.1",
+          "index_digest": "sha256:ff321015965d957feb6bab0b7f634b71aa69a62cfe8650e9f1b6f1627b54662a",
+          "digest": "sha256:10b898e586f4e2d629eb58ac6c6321b8d636ce97abd81a5b3863eebf8558cd48",
+          "source_revision": null
+        },
+        "amd64": {
+          "reference": "ghcr.io/homeassistant-ai/ha-mcp-addon-amd64:7.14.1",
+          "index_digest": "sha256:49baaa7cedb8c011666a2c9b25428b9d36fba689999d3447b6ef37ed0ef8a8a0",
+          "digest": "sha256:5cef3017731656a22f68183b82d7fbb8f63476e7951d018efd9c054210a811b3",
+          "source_revision": null
+        }
+      },
+      "delivery": "published-image",
+      "validation": "manifest+architecture-images+configured-CI",
+      "publisher_run_id": "37410078805",
+      "channel": "stable"
+    }
+  }
+}
