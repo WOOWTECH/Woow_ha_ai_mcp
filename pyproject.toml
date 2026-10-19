@@ -103,8 +103,8 @@ module = [
     "awesomeversion",
     "yarl",
     "voluptuous",
-    # Ships with HA core at runtime (helpers.llm schema conversion, #1745);
-    # not installed in this dev environment.
+    # Declared in the component manifest for HA 2026.9+; earlier cores
+    # bundled it. Unit tests stub it in this dev environment.
     "voluptuous_openapi",
     "jsonschema",
     "requests",
@@ -215,7 +215,7 @@ dev = [
     "voluptuous>=0.15.2",
     # Real voluptuous-openapi for the embedded e2e LLM-API test: it converts
     # the REAL tool-schema catalog exactly like llm_api.py does at runtime
-    # (HA core provides it at runtime; unit tests stub it).
+    # (the component manifest installs it; unit tests stub it).
     "voluptuous-openapi>=0.4.1",
     "pytest-xdist>=3.8.0",
     "requests>=2.25.0",
