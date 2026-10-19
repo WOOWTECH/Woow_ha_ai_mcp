@@ -20,7 +20,9 @@ def test_schema_converter_is_installed_on_clean_home_assistant():
     }
     assert "voluptuous-openapi" in requirements
     assert "0.4.1" in requirements["voluptuous-openapi"].specifier
-    assert "0.3.0" not in requirements["voluptuous-openapi"].specifier
+    # HA 2026.6 constrains this to 0.3.0, which already exports the converter.
+    assert "0.3.0" in requirements["voluptuous-openapi"].specifier
+    assert "0.2.0" not in requirements["voluptuous-openapi"].specifier
 
 
 def test_manifest_and_component_version_match():

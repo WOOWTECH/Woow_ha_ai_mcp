@@ -21,7 +21,7 @@
     "issue_tracker": "https://github.com/homeassistant-ai/ha-mcp/issues",
     "requirements": [
         "ruamel.yaml>=0.18.0",
-        "voluptuous-openapi>=0.4.1"
+        "voluptuous-openapi>=0.3.0"
     ],
     "version": "1.2.3"
 }
