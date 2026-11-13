@@ -428,15 +428,15 @@ class TestServerOptionsFlow:
         )
         assert channel.default() == const.CHANNEL_STABLE
 
-    def test_auto_update_defaults_on(self):
-        # The auto-update checkbox is present and defaults on (checked) when the
-        # option has never been saved.
+    def test_auto_update_defaults_off(self):
+        # The auto-update checkbox is present and defaults off (unchecked) when
+        # the option has never been saved (WOOWTECH fork, ai-mcp-pinning/44).
         flow = _make_options_flow(data={const.DATA_WEBHOOK_ID: "mcp_abc"})
         form = asyncio.run(flow.async_step_init(None))
         marker = next(
             m for m in form["data_schema"].schema if m.schema == const.OPT_AUTO_UPDATE
         )
-        assert marker.default() is True
+        assert marker.default() is False
 
     def test_form_prefills_every_field_from_saved_options(self):
         # Review gap: the form must show the user's SAVED values, not the
