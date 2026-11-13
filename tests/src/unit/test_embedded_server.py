@@ -95,6 +95,26 @@ def _make_entry(*, options=None, data=None) -> MagicMock:
     return entry
 
 
+@pytest.fixture(autouse=True)
+def _no_installed_dist_by_default(request, monkeypatch):
+    """Keep the auto-update-off re-pin hermetic.
+
+    ``_async_ensure_package`` reads the target distribution's installed version
+    through ``_installed_dist_version``. Unpatched, that reads the test
+    environment's own ha-mcp, so a test that expects the unpinned channel name
+    passes or fails depending on what happens to be installed (below or above
+    ``MIN_EMBEDDED_SERVER_VERSION``). Default to "not installed"; tests that
+    need a version patch it themselves, and ``TestInstalledDistVersion`` tests
+    the real function.
+    """
+    if (
+        request.node.cls is not None
+        and request.node.cls.__name__ == "TestInstalledDistVersion"
+    ):
+        return
+    monkeypatch.setattr(es, "_installed_dist_version", lambda dist: None)
+
+
 def _manager(tmp_path, *, options=None, data=None):
     hass = _make_hass(tmp_path)
     entry = _make_entry(options=options, data=data)
