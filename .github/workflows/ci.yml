@@ -1,0 +1,185 @@
+---
+name: CI
+
+# WOOWTECH's gate for what the App Store ships from this fork (WOOW addon
+# pipeline release-gating #103). The Store's registry lists this file in
+# `required_workflows`, so the Store takes a commit of master only after this
+# workflow has succeeded on it in a run that was not a pull_request run
+# (Woow_HA_App_Store .addon-sync/addon_sync.py `ci_gate`).
+#
+# It checks the four add-on directories the Store ships, and nothing else:
+#   homeassistant-addon                    ha_mcp                   (upstream image)
+#   homeassistant-addon-dev                ha_mcp_dev               (upstream image)
+#   homeassistant-addon-webhook-proxy      ha_mcp_webhook_proxy     (built on the device)
+#   homeassistant-addon-webhook-proxy-dev  ha_mcp_webhook_proxy_dev (built on the device)
+#
+# No path filter on purpose: every commit of master gets its own run, so the
+# Store never has to fall back to an earlier commit's run.
+#
+# This file is not from upstream homeassistant-ai/ha-mcp. A fork-sync that
+# resets master to upstream must re-apply it, together with
+# woow-addon-sync.yml (pipeline #44).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A push run of master is never cancelled: a cancelled run is not a success,
+# and the Store would block that commit (ci_gate "CI failed: ...").
+# Push runs are grouped per commit, so each one gets its own group. GitHub
+# keeps only one pending run per group and cancels an older pending run when
+# a newer one queues, even with cancel-in-progress false. A per-ref group
+# would let a fast second push cancel the first commit's run. PR runs share
+# a group per ref, so a new push to the PR cancels the old run.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint (add-on configs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Frenck's add-on linter, pinned to v2.21.2 so that a new linter rule
+      # cannot turn master red overnight. The same linter as
+      # frenck/action-addon-linter@v2 (used by WOOWTECH/Woow_ha_odoo), run
+      # through docker instead of `uses:` because of the filter below.
+      - name: Check out the add-on linter (v2.21.2)
+        uses: actions/checkout@v7
+        with:
+          repository: frenck/action-addon-linter
+          ref: d51677290aef26cdfc835271dd3c7343ce502809
+          path: .addon-linter
+
+      - name: Build the add-on linter
+        run: docker build --quiet --tag addon-linter .addon-linter/src
+
+      # Every error fails the job except one kind: "'<key>' should be removed,
+      # it uses a default value" (startup: application, boot: auto). Those
+      # keys are redundant, not wrong, and the configs are upstream's files:
+      # editing them would change what the Store ships and diverge from
+      # upstream, which #103 rules out. Schema errors, deprecated or invalid
+      # options and everything else still fail. The tolerated errors are
+      # shown as notices, warnings as warnings.
+      - name: Lint the four add-on configs
+        run: |
+          set -euo pipefail
+          tolerated="::'[A-Za-z_]+' should be removed, it uses a default value$"
+          failed=0
+          for dir in homeassistant-addon homeassistant-addon-dev \
+                     homeassistant-addon-webhook-proxy homeassistant-addon-webhook-proxy-dev; do
+            status=0
+            out="$(docker run --rm -v "${PWD}:/github/workspace:ro" -w /github/workspace \
+              -e "INPUT_PATH=${dir}" -e INPUT_COMMUNITY=false addon-linter 2>&1)" || status=$?
+            # The linter's ::error/::warning lines become annotations here.
+            sed -E "/${tolerated}/s/^::error /::notice /" <<< "${out}"
+            blocking="$(grep '^::error' <<< "${out}" | grep -Ev "${tolerated}" || true)"
+            if [ -n "${blocking}" ]; then
+              echo "::error::${dir}: the add-on linter reported the errors above"
+              failed=1
+            elif [ "${status}" -ne 0 ] && ! grep -q '^::error' <<< "${out}"; then
+              echo "::error::${dir}: the add-on linter exited ${status} without reporting an error"
+              failed=1
+            else
+              echo "${dir}: ok"
+            fi
+          done
+          exit "${failed}"
+
+  # The webhook proxies have no `image:`, so Supervisor builds them on the
+  # device from this source. Build each one for both architectures it
+  # declares, on a native runner, without pushing anything.
+  build:
+    name: build (${{ matrix.addon }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        addon:
+          - homeassistant-addon-webhook-proxy
+          - homeassistant-addon-webhook-proxy-dev
+        arch: [amd64, aarch64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the add-on version
+        id: meta
+        env:
+          ADDON: ${{ matrix.addon }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="$(yq -r '.version' "${ADDON}/config.yaml")"
+          if ! yq -e ".arch[] | select(. == \"${ARCH}\")" "${ADDON}/config.yaml" > /dev/null; then
+            echo "::error::${ADDON}/config.yaml does not declare ${ARCH}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.addon }}
+          push: false
+          provenance: false
+          build-args: |
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ matrix.addon }}-${{ matrix.arch }}:ci
+
+  # ha_mcp and ha_mcp_dev ship upstream's prebuilt images
+  # (`image: ghcr.io/homeassistant-ai/...-{arch}`). Supervisor pulls
+  # <image>:<version>, so every declared architecture must have that tag.
+  upstream-images:
+    name: upstream images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Every declared architecture has the declared version
+        run: |
+          set -euo pipefail
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          failed=0
+          for dir in homeassistant-addon homeassistant-addon-dev; do
+            config="${dir}/config.yaml"
+            image="$(yq -r '.image // ""' "${config}")"
+            version="$(yq -r '.version' "${config}")"
+            if [[ "${image}" != ghcr.io/*'{arch}'* ]]; then
+              echo "::error file=${config}::expected image: ghcr.io/...{arch}, found '${image}'"
+              failed=1
+              continue
+            fi
+            mapfile -t arches < <(yq -r '.arch[]' "${config}")
+            for arch in "${arches[@]}"; do
+              ref="${image//\{arch\}/${arch}}"
+              repo="${ref#ghcr.io/}"
+              token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token')"
+              code="$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' --head \
+                -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+                "https://ghcr.io/v2/${repo}/manifests/${version}")"
+              case "${code}" in
+                200) echo "${ref}:${version} exists" ;;
+                404) echo "::error file=${config}::${ref}:${version} does not exist"; failed=1 ;;
+                *) echo "::error file=${config}::${ref}:${version} could not be checked (HTTP ${code})"; failed=1 ;;
+              esac
+            done
+          done
+          exit "${failed}"

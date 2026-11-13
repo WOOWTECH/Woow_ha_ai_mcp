@@ -37,6 +37,7 @@ name: WOOW addon source notification
     - Webhook Proxy — Promote Dev to Stable
     - Webhook Proxy — Reset Dev from Stable
     - Webhook Proxy — Stable Guard
+    - CI
     types:
     - completed
 permissions:
