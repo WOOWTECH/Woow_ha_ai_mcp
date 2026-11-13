@@ -35,6 +35,21 @@ Python 3.14.6）驗證過：embedded server 接受的 ha-mcp（≥7.10.0）都�
 opentelemetry-api 等，違反 HA 內建套件宣告的版本範圍；8.x 以後的元件還要求 HA ≥2026.8。出貨的 HA
 升到 2026.8 以上之後，再把 `DEFAULT_PIP_SPEC` 釘在驗證過的版本。
 
+另外兩種情況，自動更新關掉了仍會裝最新的 ha-mcp（負責人 2026-11-13 決定記為已知風險，不另外修正）：
+
+- **已經存過選項的機器**：新的預設值只在 config entry 沒有 `auto_update` 這個 key 時生效。1.2.4 之前
+  選項表單的「自動更新」預設是勾選的，所以有人開過伺服器選項並按下儲存的機器，存的是 `True`，升到
+  1.2.4 之後仍會自動更新。元件沒有 options 遷移。要關掉，得在該機器的選項裡手動取消勾選。
+- **已安裝的 ha-mcp 低於 `MIN_EMBEDDED_SERVER_VERSION`**：`embedded_server.py` 記一筆
+  「Ignoring auto-update pin to legacy …」，然後改用不釘版的 dist，裝當時最新的 ha-mcp。
+
+### 第 5 列：為什麼元件版本是 1.2.4
+
+上游 AGENTS.md 的規則是：`master` 上的元件版本還沒進 `stable` 時不再升版。fork `master` 原本是
+1.2.3，從沒出貨（出貨的 28 份副本都是 1.2.2），照上游規則應該留在 1.2.3。負責人 2026-11-13 決定用
+1.2.4：WOOWTECH 不走上游的 `stable` 發版週期，元件靠同步副本出貨，新的版本號讓副本裡帶不帶這個修改
+一眼就分得出來。
+
 ### 第 1、3 列的注意事項
 
 - `woow-addon-sync.yml` 的 `workflow_run.workflows` 是照上游 workflow 的 `name:` 列的。同步後上游可能改名、增減 workflow，要用新的 `.github/workflows/*.yml` 重新核對這份清單。
