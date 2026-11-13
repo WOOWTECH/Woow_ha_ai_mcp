@@ -25,6 +25,7 @@ git diff --stat "$(git merge-base upstream/master origin/master)" origin/master
 | 3 | `woow-addon-sync.yml` 的 `on.workflow_run.workflows` 裡的 `- CI` | `6860a577`（fork PR #2） | **保留**（負責人 2026-11-13 決定）：ci.yml 跑完後再通知 Store 一次，Store 才看得到這個 commit 的 CI 結果。 |
 | 4 | `custom_components/ha_mcp_tools/brand/*.png`（8 個檔） | `a770e7ad` | WOOWTECH 圖示（`icon`、`logo`、`dark_*`，含 `@2x`）。上游的同名檔會蓋掉它們。 |
 | 5 | `custom_components/ha_mcp_tools/const.py` 的 `DEFAULT_AUTO_UPDATE = False`，元件版本 1.2.4（`COMPONENT_VERSION`、`manifest.json`），以及跟著改的單元測試 | `1987814b`（#44 步驟 44b） | 關閉 ha-mcp server 的自動更新：reload／重開機會留在已安裝的版本，update entity 仍會顯示新版。`DEFAULT_PIP_SPEC` **刻意不釘版**，等出貨的 HA ≥2026.8 再釘（見下一節）。 |
+| 6 | `pyproject.toml`、`uv.lock` 的套件版本 = `homeassistant-addon/config.yaml` 的版本（目前 7.14.1） | `d217e8a6`（fork PR #5，#198） | fork 的 semantic-release 曾在 `49a47e1e` 把套件版本改成 7.7.0，上游 Unit／E2E 因版本不一致而紅燈。重設回上游後如果版本號一致就不必重套；之後若 fork 的 semantic-release 又改壞版本號（見下一節），照這列改回來。 |
 
 ### 第 5 列：已知的剩餘風險
 
@@ -70,6 +71,12 @@ fork 的元件修正 `89ea666e`、`da0d2f3e`（`manifest.json` 加 `voluptuous-o
 `voluptuous-openapi>=0.4.1` 涵蓋。HA 2026.7.2 內建 `voluptuous_openapi` 0.4.1，所以上游的寫法
 在出貨機器上也成立；只有要支援 HA 2026.6 時才需要保留 `>=0.3.0`。
 
+## 上游 CI 在 fork 上不看的項目
+
+`HAOS E2E Tests`、`HAOS E2E Tests (embedded)`、`HAOS E2E Tests (inaddon)` 在 fork 上從沒通過過（HAOS VM 在 600 秒內開不起來，原因未查，見 pipeline #198）。在 #191 決定 fork 要不要改成 mirror 之前，fork 的 PR 上這 3 項紅燈**不看**；合併以 WOOWTECH 的 `ci.yml` 與其餘上游 check 為準。
+
+fork 的 `semver-release.yml`（`49a47e1e` 就是它產生的）目前被 GitHub 因長期沒有活動而停用（`disabled_inactivity`，最後一次排程 run 是 2026-09-23）。fork 上最新的正式版 tag 仍是 `v7.7.0`，所以若有人重新啟用排程或手動觸發，它會從 `v7.7.0` 往上算，把第 6 列的版本號改成 7.7.x 或 7.8.0，一定會再改壞（低於 7.14.1，也低於 `MIN_EMBEDDED_SERVER_VERSION` 7.10.0）。
+
 ## 同步時丟掉的 fork commit
 
 | commit | 內容 | 為什麼可以丟 |
@@ -79,7 +86,7 @@ fork 的元件修正 `89ea666e`、`da0d2f3e`（`manifest.json` 加 `voluptuous-o
 
 ## 同步後的檢查
 
-1. 上表第 1–5 列都在（第 3 列看當時的決定）。
+1. 上表第 1–6 列都在（第 3 列看當時的決定）。
 2. `ci.yml` 在 `master` 的 push run 是綠的。
 3. `woow-addon-sync.yml` 的 `workflow_run.workflows` 跟 `.github/workflows/*.yml` 的 `name:` 一致。
 4. 元件版本和 ha-mcp 釘版跟出貨機器的 HA 版本相容（見上一節）。
