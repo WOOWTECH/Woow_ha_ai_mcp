@@ -100,7 +100,7 @@ class TestProperties:
         [
             (True, False, True),
             (False, False, False),
-            (None, True, True),
+            (None, True, False),
         ],
     )
     def test_auto_update_reflects_entry_option(

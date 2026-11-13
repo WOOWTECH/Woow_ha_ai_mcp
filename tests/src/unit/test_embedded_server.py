@@ -383,12 +383,13 @@ class TestChannelResolution:
         mgr, _hass, _entry = _manager(tmp_path, options={OPT_AUTO_UPDATE: False})
         assert mgr._pip_spec == DIST_NAME_STABLE
 
-    def test_auto_update_default_on_never_pins(self, tmp_path, monkeypatch):
-        # Default (option absent) is auto-update ON: the spec stays unpinned even
-        # when a version is installed, and no version is read at construction.
+    def test_auto_update_on_never_pins(self, tmp_path, monkeypatch):
+        # Auto-update ON (upstream's default; off by default in the WOOWTECH
+        # fork): the spec stays unpinned even when a version is installed, and
+        # no version is read at construction.
         reader = MagicMock(return_value="7.9.0")
         monkeypatch.setattr(es, "_installed_dist_version", reader)
-        mgr, _hass, _entry = _manager(tmp_path)
+        mgr, _hass, _entry = _manager(tmp_path, options={OPT_AUTO_UPDATE: True})
         assert mgr._pip_spec == DIST_NAME_STABLE
         reader.assert_not_called()
 
@@ -461,6 +462,7 @@ class TestEnsurePackage:
         # path (upgrade=True) so every reload pulls the newest stable build.
         mgr, _hass, _entry = _manager(
             tmp_path,
+            options={OPT_AUTO_UPDATE: True},
             data={DATA_SECRET_PATH: "/p", DATA_LAST_PIP_SPEC: DEFAULT_PIP_SPEC},
         )
         proc = AsyncMock()
@@ -808,6 +810,7 @@ class TestEnsurePackage:
         # reinstall then fails, e.g. offline).
         mgr, _hass, _entry = _manager(
             tmp_path,
+            options={OPT_AUTO_UPDATE: True},
             data={DATA_SECRET_PATH: "/p", DATA_LAST_PIP_SPEC: DEFAULT_PIP_SPEC},
         )
         install_pkg = MagicMock(return_value=True)
@@ -975,7 +978,7 @@ class TestEnsurePackage:
         # the package is present, so every reload pulls the newest dev build.
         mgr, _hass, _entry = _manager(
             tmp_path,
-            options={OPT_CHANNEL: CHANNEL_DEV},
+            options={OPT_CHANNEL: CHANNEL_DEV, OPT_AUTO_UPDATE: True},
             data={DATA_SECRET_PATH: "/p", DATA_LAST_PIP_SPEC: DEV_PIP_SPEC},
         )
         proc = AsyncMock()
@@ -3129,7 +3132,7 @@ class TestImporterAwareBringUp:
         # manager, which installs any unsatisfied spec) and say so.
         mgr, _hass, _entry = _manager(
             tmp_path,
-            options={OPT_CHANNEL: CHANNEL_DEV},
+            options={OPT_CHANNEL: CHANNEL_DEV, OPT_AUTO_UPDATE: True},
             data={DATA_SECRET_PATH: "/p", DATA_LAST_PIP_SPEC: DEV_PIP_SPEC},
         )
 

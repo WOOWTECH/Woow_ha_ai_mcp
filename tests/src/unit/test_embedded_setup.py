@@ -1008,7 +1008,7 @@ class TestMaybeAutoUpdate:
         # _async_finish_update_cycle, which only runs after the reloaded
         # entry's bring-up actually confirms the install landed.
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         notif = MagicMock()
         monkeypatch.setattr(esetup.persistent_notification, "async_create", notif)
 
@@ -1032,7 +1032,7 @@ class TestMaybeAutoUpdate:
 
         hass = _make_async_hass()
         hass.config_entries.async_reload = AsyncMock(side_effect=RuntimeError("boom"))
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
 
         with caplog.at_level(logging.ERROR):
             await esetup.async_maybe_auto_update(hass, entry, self._NEWER)  # no raise
@@ -1071,7 +1071,9 @@ class TestMaybeAutoUpdate:
         # The default pip-spec ("ha-mcp") stored verbatim still means "no
         # override" - the reload must run, not skip.
         hass = _make_async_hass()
-        entry = _make_entry(options={OPT_PIP_SPEC: DEFAULT_PIP_SPEC})
+        entry = _make_entry(
+            options={OPT_PIP_SPEC: DEFAULT_PIP_SPEC, OPT_AUTO_UPDATE: True}
+        )
 
         await esetup.async_maybe_auto_update(hass, entry, self._NEWER)
 
@@ -1130,7 +1132,7 @@ class TestMaybeAutoUpdate:
     async def test_bringup_done_allows_reload(self, monkeypatch):
         hass = _make_async_hass()
         hass.data[DOMAIN] = {DATA_BRINGUP_TASK: _FakeTask(done=True)}
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
 
         await esetup.async_maybe_auto_update(hass, entry, self._NEWER)
 
@@ -1172,7 +1174,7 @@ class TestAutoUpdateComponentGate:
         import logging
 
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         self._stub_gate(monkeypatch, shipped="1.0.9", running="1.0.2")
 
         with caplog.at_level(logging.WARNING):
@@ -1196,7 +1198,7 @@ class TestAutoUpdateComponentGate:
 
     async def test_same_shipped_component_proceeds_and_clears_issue(self, monkeypatch):
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         self._stub_gate(monkeypatch, shipped="1.0.2", running="1.0.2")
 
         await esetup.async_maybe_auto_update(hass, entry, self._NEWER)
@@ -1211,7 +1213,7 @@ class TestAutoUpdateComponentGate:
         # the gate existed: install the update. Held-forever is the failure
         # mode this trades away deliberately.
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         self._stub_gate(monkeypatch, shipped=None)
 
         await esetup.async_maybe_auto_update(hass, entry, self._NEWER)
@@ -1221,7 +1223,7 @@ class TestAutoUpdateComponentGate:
 
     async def test_component_version_read_failure_fails_open(self, monkeypatch):
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         monkeypatch.setattr(
             esetup,
             "_async_fetch_shipped_component_version",
@@ -1242,7 +1244,7 @@ class TestAutoUpdateComponentGate:
         from awesomeversion import AwesomeVersion as RealAwesomeVersion
 
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         self._stub_gate(monkeypatch, shipped="weird", running="strange")
 
         def picky(value):
@@ -1262,7 +1264,7 @@ class TestAutoUpdateComponentGate:
         # catches up via the then-unblocked reload) the stale issue must not
         # linger.
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         self._stub_gate(monkeypatch, shipped="1.0.2", running="1.0.2")
         info = ServerVersionInfo(
             installed="7.12.1", latest="7.12.1", dist=DIST_NAME_STABLE
@@ -1293,7 +1295,7 @@ class TestAutoUpdateComponentGate:
         # component becomes visible promptly (#1783/#1785 follow-up). The nudge
         # targets the shipped component version and is fire-and-forget.
         hass = _make_async_hass()
-        entry = _make_entry()
+        entry = _make_entry(options={OPT_AUTO_UPDATE: True})
         self._stub_gate(monkeypatch, shipped="1.0.9", running="1.0.2")
         nudge = MagicMock()
         monkeypatch.setattr(esetup, "async_schedule_hacs_nudge", nudge)
