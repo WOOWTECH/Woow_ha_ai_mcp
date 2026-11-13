@@ -21,10 +21,19 @@ git diff --stat "$(git merge-base upstream/master origin/master)" origin/master
 | # | 路徑 | 來源 commit | 說明 |
 |---|------|-------------|------|
 | 1 | `.github/workflows/woow-addon-sync.yml` | `b94ee541`、`49d00c1e`、`c7b8d79f` | WOOWTECH 自有，整個檔案照抄回來。通知 App Store 有新版本：呼叫 `WOOWTECH/Woow_HA_App_Store/.github/workflows/woow-addon-publish.yml@main`，再以 `repository_dispatch woow-addon-ready` 通知 Store（secret `APP_STORE_DISPATCH_TOKEN`，沒有時只警告）。 |
-| 2 | `.github/workflows/ci.yml` | `f3c2c536`（fork PR #2，分支 `pipeline/103-ci-gate`，#103） | WOOWTECH 自有，整個檔案照抄回來，**連同裡面的版本釘選**：add-on linter v2.21.2（`frenck/action-addon-linter` `d51677290aef26cdfc835271dd3c7343ce502809`）、`docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c`（v4）、`docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a`（v7）。Store registry 把它列在 `required_workflows`；漏掉的話 Store 會擋住 ai_mcp 的同步。 |
-| 3 | `woow-addon-sync.yml` 的 `on.workflow_run.workflows` 裡的 `- CI` | `6860a577`（fork PR #2） | **待定**：負責人還沒決定要不要保留（ci.yml 跑完後再通知 Store 一次）。PR #2 合併時的決定寫回這一列。 |
+| 2 | `.github/workflows/ci.yml` | `f3c2c536`、`e5d433f2`（fork PR #2，merge `4b368133`，#103） | WOOWTECH 自有，整個檔案照抄回來，**連同裡面的版本釘選**：add-on linter v2.21.2（`frenck/action-addon-linter` `d51677290aef26cdfc835271dd3c7343ce502809`）、`docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c`（v4）、`docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a`（v7）。Store registry 把它列在 `required_workflows`；漏掉的話 Store 會擋住 ai_mcp 的同步。 |
+| 3 | `woow-addon-sync.yml` 的 `on.workflow_run.workflows` 裡的 `- CI` | `6860a577`（fork PR #2） | **保留**（負責人 2026-11-13 決定）：ci.yml 跑完後再通知 Store 一次，Store 才看得到這個 commit 的 CI 結果。 |
 | 4 | `custom_components/ha_mcp_tools/brand/*.png`（8 個檔） | `a770e7ad` | WOOWTECH 圖示（`icon`、`logo`、`dark_*`，含 `@2x`）。上游的同名檔會蓋掉它們。 |
-| 5 | `custom_components/ha_mcp_tools/const.py` 的 `DEFAULT_PIP_SPEC`、`DEFAULT_AUTO_UPDATE` | #44 步驟 44b（尚未合併） | 把 ha-mcp 釘在驗證過的版本，並關閉自動更新。44b 合併後把 commit 補進這一列。 |
+| 5 | `custom_components/ha_mcp_tools/const.py` 的 `DEFAULT_AUTO_UPDATE = False`，元件版本 1.2.4（`COMPONENT_VERSION`、`manifest.json`），以及跟著改的單元測試 | `1987814b`（#44 步驟 44b） | 關閉 ha-mcp server 的自動更新：reload／重開機會留在已安裝的版本，update entity 仍會顯示新版。`DEFAULT_PIP_SPEC` **刻意不釘版**，等出貨的 HA ≥2026.8 再釘（見下一節）。 |
+
+### 第 5 列：已知的剩餘風險
+
+`DEFAULT_PIP_SPEC` 沒有釘版，所以**第一次安裝**（機器上還沒有 ha-mcp）仍會裝當時最新的
+ha-mcp。關掉自動更新只能讓之後的 reload／重開機不再自己升級。2026-11-13 在 .36、.33（HA 2026.7.2，
+Python 3.14.6）驗證過：embedded server 接受的 ha-mcp（≥7.10.0）都釘 websockets 16.x，HA 2026.7.2
+是 15.0.1；照 HA requirements manager 的方式安裝會一起升級 websockets、click、rich、cachetools、
+opentelemetry-api 等，違反 HA 內建套件宣告的版本範圍；8.x 以後的元件還要求 HA ≥2026.8。出貨的 HA
+升到 2026.8 以上之後，再把 `DEFAULT_PIP_SPEC` 釘在驗證過的版本。
 
 ### 第 1、3 列的注意事項
 
@@ -39,7 +48,7 @@ git diff --stat "$(git merge-base upstream/master origin/master)" origin/master
 - `MIN_EMBEDDED_HOME_ASSISTANT_VERSION = "2026.8.0"`。
 
 出貨機器是 HA 2026.7.2，所以直接重設回上游最新版，元件就不能用在出貨機器上。同步時要選一個上游
-版本，或保留 fork 的元件（`1.2.3`），由 #191／#44 決定；不要只照抄上表就結束。
+版本，或保留 fork 的元件（`1.2.4`），由 #191／#44 決定；不要只照抄上表就結束。
 
 fork 的元件修正 `89ea666e`、`da0d2f3e`（`manifest.json` 加 `voluptuous-openapi>=0.3.0`，
 `COMPONENT_VERSION` 與 manifest 版本 `1.2.3`，相關測試與 `pyproject.toml` 註解）上游已經用
