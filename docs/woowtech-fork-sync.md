@@ -6,6 +6,26 @@ commit 可以丟掉。來源：WOOW addon pipeline #44（ai-mcp-pinning/44），
 
 「fork-sync 還是改成 mirror」由 pipeline #191 決定；這份清單兩種做法都要用。
 
+## integration 改在分支 `woowtech/ha-mcp-tools` 維護（pipeline #215）
+
+WOOWTECH 版的 `custom_components/ha_mcp_tools`（元件 1.2.4，下表第 4、5 列）從 2026-11-23 起在長期分支
+`woowtech/ha-mcp-tools` 維護，不再放在 `master`。pipeline #216 會把 `master` 改成只跟上游的 mirror，
+之後 `master` 上的 integration 就是上游版，**不是**出貨的版本。
+
+- **起點**：fork `master` `3456f26f`（integration tree `76a79bfc`）。
+- **誰在用**：multi_ha_core 兩個 repo（`apporo_ha_multi_ha_core`、`woowtech_ha_multi_ha_core`）的 seed manifest
+  把 `ha_mcp_tools` 釘在這個分支上的 commit sha（pipeline #111 的釘法）；ha-rebrand 的副本來源紀錄也指向這個分支。
+  元件要出貨新版時，先合進這個分支，再到兩個 multi_ha_core repo 改釘 sha、重跑 vendor。
+- **怎麼改**：分支規則跟預設分支一樣，只能經 PR 合併。必要檢查是這個分支上的
+  `.github/workflows/ha-mcp-tools-tests.yml`（job 名稱 `ha_mcp_tools unit tests`），只跑 `tests/src/unit` 裡
+  import `custom_components.ha_mcp_tools` 的測試模組（含經由其他測試模組間接 import 的 `*_contract`）。
+  這個 workflow 只在這個分支上，`master` 沒有。
+- **分支上其他檔案**（上游 server、add-on、其他 workflow）只是起點的快照，不維護、也不從這裡出貨。
+  `ci.yml`、`woow-addon-sync.yml` 只對 `master` 的 push 與 PR 觸發，在這個分支上不會跑。
+- **什麼時候結束**：等出貨的 HA ≥2026.8，這個分支改從上游當時的 integration 重新開始，重新套用下表第 4、5 列
+  （第 5 列的 `DEFAULT_PIP_SPEC` 那時要釘在驗證過的 ha-mcp 版本，見「第 5 列：已知的剩餘風險」），
+  不要把舊分支 rebase 上去。重新開始後一樣要通過上面的單元測試 workflow。
+
 盤點基準（2026-11-13）：fork `master` = `da0d2f3e`；和上游的 merge-base = `4911d09d`
 （上游 `chore(addon): publish version 7.14.1`，2026-07-19）；當時上游 `master` = `25d32693`，
 fork 落後 1466 個 commit。查 fork 專屬修改：
