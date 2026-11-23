@@ -1,0 +1,86 @@
+---
+name: ha_mcp_tools tests
+
+# WOOWTECH's required check for the long-lived branch woowtech/ha-mcp-tools
+# (WOOW addon pipeline release-gating #215). That branch holds the WOOWTECH
+# build of the custom_components/ha_mcp_tools integration, which ships through
+# the multi_ha_core seeds, not through the App Store. Branch protection on
+# woowtech/ha-mcp-tools requires the job below ("ha_mcp_tools unit tests").
+#
+# It runs only the integration's unit tests: every test module under
+# tests/src/unit that imports custom_components.ha_mcp_tools, directly or
+# through another test module (the *_contract suites reuse
+# test_component_ws_search). The rest of the upstream suite tests the ha-mcp
+# server, which this branch does not ship.
+#
+# No path filter on purpose: a required check has to report on every PR.
+#
+# This file is not from upstream homeassistant-ai/ha-mcp; it lives only on
+# woowtech/ha-mcp-tools (see docs/woowtech-fork-sync.md).
+
+on:
+  push:
+    branches: [woowtech/ha-mcp-tools]
+  pull_request:
+    branches: [woowtech/ha-mcp-tools]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-mcp-tools-tests-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    name: ha_mcp_tools unit tests
+    runs-on: ubuntu-latest
+    container:
+      # The same image as upstream's Unit Tests job (pr.yml).
+      image: ghcr.io/astral-sh/uv:0.11.28-python3.13-trixie-slim
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python dependencies
+        run: uv sync --all-extras --dev --locked
+
+      - name: Select the integration's test modules
+        id: select
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import re
+
+          root = pathlib.Path("tests/src/unit")
+          texts = {p.stem: p.read_text() for p in root.glob("*.py")}
+          component = re.compile(
+              r"custom_components\.ha_mcp_tools|custom_components[/\"', ]+ha_mcp_tools"
+          )
+          selected = {name for name, text in texts.items() if component.search(text)}
+          while True:
+              added = {
+                  name
+                  for name, text in texts.items()
+                  if name not in selected
+                  and any(
+                      re.search(rf"from \.{m} import|from \. import [^\n]*\b{m}\b", text)
+                      for m in selected
+                  )
+              }
+              if not added:
+                  break
+              selected |= added
+          tests = sorted(str(root / f"{n}.py") for n in selected if n.startswith("test_"))
+          if not tests:
+              raise SystemExit("no ha_mcp_tools test modules found")
+          print("\n".join(tests))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"tests={' '.join(tests)}\n")
+
+      - name: Run the integration's unit tests
+        env:
+          TESTS: ${{ steps.select.outputs.tests }}
+        run: uv run pytest $TESTS -n auto --tb=short -q
