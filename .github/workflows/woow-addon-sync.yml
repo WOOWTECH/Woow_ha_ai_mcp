@@ -8,36 +8,7 @@ name: WOOW addon source notification
   - cron: 23 */6 * * *
   workflow_run:
     workflows:
-    - Build Binaries and Attach to Release
-    - Update Add-on Config Version
-    - Home Assistant Add-on Publish (Dev)
-    - Home Assistant Add-on Publish
-    - Build Binary (Test Only)
-    - CodeQL Code Quality
-    - Dependabot auto-merge
-    - Deploy to GitHub Pages
-    - E2E Tests
-    - HAOS E2E Tests (embedded)
-    - HAOS E2E Tests (inaddon)
-    - HAOS E2E Tests
-    - Hotfix Release
-    - 🤖 Issue Triage
-    - Notify Dev Channel on Merge
-    - Send Codex PR Review
-    - Admit Codex PR Review
-    - Validate Hotfix Branch
-    - PR Validation Pipeline
-    - Publish Dev Channel
-    - Release Publish
-    - Sync Integration Mirror
-    - Sync Tool Documentation
-    - Codex Hello World Tests
-    - Webhook Proxy Dev — Bump Version
-    - Webhook Proxy Dev — Version Guard
-    - Webhook Proxy — Promote Dev to Stable
-    - Webhook Proxy — Reset Dev from Stable
-    - Webhook Proxy — Stable Guard
-    - CI
+    - mirror-sync
     types:
     - completed
 permissions:
