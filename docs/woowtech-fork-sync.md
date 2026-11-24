@@ -1,92 +1,86 @@
-# WOOWTECH fork-sync：重新套用清單
+# WOOWTECH fork：`master` 是 mirror，integration 在 `woowtech/ha-mcp-tools`
 
-`WOOWTECH/Woow_ha_ai_mcp` 是 `homeassistant-ai/ha-mcp` 的 fork。fork-sync 如果把 `master`
-重設回上游，fork 專屬的修改都會消失。本文件列出同步之後**必須重新套用**的修改，以及哪些 fork
-commit 可以丟掉。來源：WOOW addon pipeline #44（ai-mcp-pinning/44），#103 的 `ci.yml`。
+`WOOWTECH/Woow_ha_ai_mcp` 是 `homeassistant-ai/ha-mcp` 的 fork。從 WOOW addon pipeline release-gating #216
+起（母 issue #191），`master` 不再是「上游＋WOOWTECH 修改」，而是和其他 5 個 Mirror 來源一樣的 **mirror**：
+`master` 只跟上游 `master`，WOOWTECH 只在上面加一層 overlay。這份文件是本 repo 唯一的 WOOWTECH 說明，
+也是 overlay 的一部分（每次重建都會放回 `master`）。
 
-「fork-sync 還是改成 mirror」由 pipeline #191 決定；這份清單兩種做法都要用。
+## `master` 怎麼來的
 
-盤點基準（2026-11-13）：fork `master` = `da0d2f3e`；和上游的 merge-base = `4911d09d`
-（上游 `chore(addon): publish version 7.14.1`，2026-07-19）；當時上游 `master` = `25d32693`，
-fork 落後 1466 個 commit。查 fork 專屬修改：
+`.github/workflows/mirror-sync.yml`，每天排程一次，也可以手動觸發（作法同 pipeline #166）：
 
-```sh
-git fetch upstream master
-git log --oneline "$(git merge-base upstream/master origin/master)"..origin/master
-git diff --stat "$(git merge-base upstream/master origin/master)" origin/master
-```
+1. 抓上游 `master`，把去掉 `.github` 的 tree 加成 `upstream` 分支上的一個 snapshot commit
+   （只往前加 commit，不 force-push，不推上游的 tag）。
+2. `master` 的 tree 換成上游 tree，刪掉上游的 `.github`，放回 overlay，在舊的 `master` 上面加一個 commit
+   （不 force-push；Store 只接受從上一個快照往下長的 commit）。
+3. Store 的升版比對（sha 模式）把每個版本和最新正式 Release 不同的出貨 add-on 跟那個 Release 比；
+   通過的才由 Store 的 Release workflow 發正式 Release（`ha_mcp-v<version>`、`ha_mcp_webhook_proxy-v<version>`）。
+   dev 通道（`homeassistant-addon-dev`、`homeassistant-addon-webhook-proxy-dev`）不比對、不發 Release、不進 Store。
 
-## 必須重新套用
+**overlay**（其他東西都會在下一次重建被上游的版本蓋掉，不要手動改在 `master` 上）：
 
-| # | 路徑 | 來源 commit | 說明 |
-|---|------|-------------|------|
-| 1 | `.github/workflows/woow-addon-sync.yml` | `b94ee541`、`49d00c1e`、`c7b8d79f` | WOOWTECH 自有，整個檔案照抄回來。通知 App Store 有新版本：呼叫 `WOOWTECH/Woow_HA_App_Store/.github/workflows/woow-addon-publish.yml@main`，再以 `repository_dispatch woow-addon-ready` 通知 Store（secret `APP_STORE_DISPATCH_TOKEN`，沒有時只警告）。 |
-| 2 | `.github/workflows/ci.yml` | `f3c2c536`、`e5d433f2`（fork PR #2，merge `4b368133`，#103） | WOOWTECH 自有，整個檔案照抄回來，**連同裡面的版本釘選**：add-on linter v2.21.2（`frenck/action-addon-linter` `d51677290aef26cdfc835271dd3c7343ce502809`）、`docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c`（v4）、`docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a`（v7）。Store registry 把它列在 `required_workflows`；漏掉的話 Store 會擋住 ai_mcp 的同步。 |
-| 3 | `woow-addon-sync.yml` 的 `on.workflow_run.workflows` 裡的 `- CI` | `6860a577`（fork PR #2） | **保留**（負責人 2026-11-13 決定）：ci.yml 跑完後再通知 Store 一次，Store 才看得到這個 commit 的 CI 結果。 |
-| 4 | `custom_components/ha_mcp_tools/brand/*.png`（8 個檔） | `a770e7ad` | WOOWTECH 圖示（`icon`、`logo`、`dark_*`，含 `@2x`）。上游的同名檔會蓋掉它們。 |
-| 5 | `custom_components/ha_mcp_tools/const.py` 的 `DEFAULT_AUTO_UPDATE = False`，元件版本 1.2.4（`COMPONENT_VERSION`、`manifest.json`），以及跟著改的單元測試 | `1987814b`（#44 步驟 44b） | 關閉 ha-mcp server 的自動更新：reload／重開機會留在已安裝的版本，update entity 仍會顯示新版。`DEFAULT_PIP_SPEC` **刻意不釘版**，等出貨的 HA ≥2026.8 再釘（見下一節）。 |
-| 6 | `pyproject.toml`、`uv.lock` 的套件版本 = `homeassistant-addon/config.yaml` 的版本（目前 7.14.1） | `d217e8a6`（fork PR #5，#198） | fork 的 semantic-release 曾在 `49a47e1e` 把套件版本改成 7.7.0，上游 Unit／E2E 因版本不一致而紅燈。重設回上游後如果版本號一致就不必重套；之後若 fork 的 semantic-release 又改壞版本號（見下一節），照這列改回來。 |
+| 路徑 | 內容 |
+|------|------|
+| `.github/workflows/woow-addon-sync.yml` | 通知 App Store 有新的正式 Release（`push` 到 `master`、`mirror-sync` 跑完、排程）。 |
+| `.github/workflows/mirror-sync.yml` | 上面的同步、比對、發 Release。 |
+| `.mirror/` | `config.env`（上游網址與分支）、`last-sync.yaml`、各 add-on 的 `version-ceiling.yaml`、`upgrade-notes.yaml`（說明見 `.mirror/README.md`）。 |
+| `docs/woowtech-fork-sync.md` | 本文件。 |
 
-### 第 5 列：已知的剩餘風險
+`.github` 只有上面兩個 workflow。上游的 CI（E2E、semantic-release、dev 發布、Codex…）以及 #103 的
+`ci.yml` 都不在 `master` 上，不會在 fork 上跑。Store registry 的 `required_workflows` 是空的，
+`branch_rules.exempt` 以 `mirror:` 開頭（issue monitor 靠它列出 mirror-sync 結果）。
 
-`DEFAULT_PIP_SPEC` 沒有釘版，所以**第一次安裝**（機器上還沒有 ha-mcp）仍會裝當時最新的
-ha-mcp。關掉自動更新只能讓之後的 reload／重開機不再自己升級。2026-11-13 在 .36、.33（HA 2026.7.2，
-Python 3.14.6）驗證過：embedded server 接受的 ha-mcp（≥7.10.0）都釘 websockets 16.x，HA 2026.7.2
-是 15.0.1；照 HA requirements manager 的方式安裝會一起升級 websockets、click、rich、cachetools、
-opentelemetry-api 等，違反 HA 內建套件宣告的版本範圍；8.x 以後的元件還要求 HA ≥2026.8。出貨的 HA
-升到 2026.8 以上之後，再把 `DEFAULT_PIP_SPEC` 釘在驗證過的版本。
+出貨的兩個 add-on 目錄 `homeassistant-addon/`、`homeassistant-addon-webhook-proxy/` 和上游 `master` 相同，
+只多了 overlay 複製進去的 `version-ceiling.yaml`、`upgrade-notes.yaml`。ha_mcp 用上游預先建好的映像
+（`ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}`，`config.yaml` 的 `version:` 決定拉哪個）；webhook proxy
+在裝置上建置。映像沒有複製到 WOOWTECH 的 GHCR。
 
-另外兩種情況，自動更新關掉了仍會裝最新的 ha-mcp（負責人 2026-11-13 決定記為已知風險，不另外修正）：
+## 版本上限（Version Ceiling）
 
-- **已經存過選項的機器**：新的預設值只在 config entry 沒有 `auto_update` 這個 key 時生效。1.2.4 之前
-  選項表單的「自動更新」預設是勾選的，所以有人開過伺服器選項並按下儲存的機器，存的是 `True`，升到
-  1.2.4 之後仍會自動更新。元件沒有 options 遷移。要關掉，得在該機器的選項裡手動取消勾選。
-- **已安裝的 ha-mcp 低於 `MIN_EMBEDDED_SERVER_VERSION`**：`embedded_server.py` 記一筆
-  「Ignoring auto-update pin to legacy …」，然後改用不釘版的 dist，裝當時最新的 ha-mcp。
+在 `.mirror/<add-on 目錄>/version-ceiling.yaml`，每個出貨 add-on 一份：
 
-### 第 5 列：為什麼元件版本是 1.2.4
+| add-on | 檔案 | 上限 |
+|--------|------|------|
+| `ha_mcp` | `.mirror/homeassistant-addon/version-ceiling.yaml` | `9.2.x` |
+| `ha_mcp_webhook_proxy` | `.mirror/homeassistant-addon-webhook-proxy/version-ceiling.yaml` | `3.0.x` |
 
-上游 AGENTS.md 的規則是：`master` 上的元件版本還沒進 `stable` 時不再升版。fork `master` 原本是
-1.2.3，從沒出貨（出貨的 28 份副本都是 1.2.2），照上游規則應該留在 1.2.3。負責人 2026-11-13 決定用
-1.2.4：WOOWTECH 不走上游的 `stable` 發版週期，元件靠同步副本出貨，新的版本號讓副本裡帶不帶這個修改
-一眼就分得出來。
+- **為什麼**：上游 `master` 在 9.2.0 之後的程式碼（`d5c88170e`，2026-11-21）要求 HA 2026.11，但 add-on 的
+  `config.yaml` 沒寫 `homeassistant:`，所以 Store 的 Core 版本要求檢查（#217）抓不到。出貨 HA 是 2026.7.2；
+  9.2.0／3.0.5 在 2026.7.2 上實機驗過（#214）。
+- **超過時**：Store 的升版比對把該 add-on 判為**暫緩**：`upstream` 快照與 `master` 照樣更新，但不比對、
+  不發正式 Release；`mirror-sync` 的 run 是綠的，多一個 `Held (暫緩)` 步驟，monitor 以黃色「held」顯示，
+  和失敗的紅色分開。Store 繼續提供最後一個正式 Release。
+- **怎麼調**：只能由人改。出貨 HA 升到上游新版要求的版本（並經過實機驗收）之後，改這份檔案的 `ceiling`
+  （或刪掉檔案），commit 到 `master`，手動觸發 `mirror-sync`；新版本通過升版比對才會發 Release。
+  沒有自動解除。不要改 `homeassistant-addon/version-ceiling.yaml`，那是重建時複製過去的副本。
 
-### 第 1、3 列的注意事項
+## integration：分支 `woowtech/ha-mcp-tools`（pipeline #215）
 
-- `woow-addon-sync.yml` 的 `workflow_run.workflows` 是照上游 workflow 的 `name:` 列的。同步後上游可能改名、增減 workflow，要用新的 `.github/workflows/*.yml` 重新核對這份清單。
-- 上游的 add-on 設定（`homeassistant-addon*/config.yaml` 等）**刻意保持跟上游 byte-identical**，不要為了 linter 去改。`ci.yml` 的 lint job 只容許「`'<key>' should be removed, it uses a default value`」這一類錯誤（`startup: application`、`boot: auto`），其他錯誤都會讓 job 失敗。
+WOOWTECH 版的 `custom_components/ha_mcp_tools`（元件 1.2.4）在長期分支 `woowtech/ha-mcp-tools` 維護。
+`master` 上的 `custom_components/ha_mcp_tools` 是上游版，**不是**出貨的版本，也不會從 `master` 出貨。
 
-## 元件本身：同步前要先決定
+- **起點**：mirror 之前的 fork `master` `3456f26f`（integration tree `76a79bfc`）。
+- **誰在用**：`apporo_ha_multi_ha_core`、`woowtech_ha_multi_ha_core` 的 seed manifest 把 `ha_mcp_tools` 釘在
+  這個分支上的 commit sha；ha-rebrand 的副本來源紀錄也指向這個分支。元件要出貨新版時，先合進這個分支，
+  再到兩個 multi_ha_core repo 改釘 sha、重跑 vendor。
+- **怎麼改**：只能經 PR 合併（ruleset「woowtech/ha-mcp-tools: PR and green checks」），必要檢查是這個分支上的
+  `.github/workflows/ha-mcp-tools-tests.yml`（job `ha_mcp_tools unit tests`）。分支上的說明文件寫了它的細節。
+- **什麼時候結束**：出貨 HA ≥2026.8 時，從上游當時的 integration 重新開始，重新套用 WOOWTECH 的修改
+  （品牌圖、`DEFAULT_AUTO_UPDATE = False`，`DEFAULT_PIP_SPEC` 那時釘在驗證過的 ha-mcp 版本），不要 rebase 舊分支。
 
-上游 `master`（`25d32693`）的 `ha_mcp_tools` 已經是 9.2.0：
+## mirror 之前的 WOOWTECH 修改去哪了
 
-- `manifest.json` 的 `requirements` 有 `"ha-mcp==9.2.0"`、`"mcp>=1.24.0"`、`"voluptuous-openapi>=0.4.1"`。
-- `MIN_EMBEDDED_HOME_ASSISTANT_VERSION = "2026.8.0"`。
+切換時沒有改寫歷史：mirror 之前的 commit（含 WOOWTECH 的修改與合併）仍在 `master` 的歷史裡，第一個重建
+commit 直接接在 `3456f26f` 上面。舊的「fork-sync 重新套用清單」（#44、#103）各列的去向：
 
-出貨機器是 HA 2026.7.2，所以直接重設回上游最新版，元件就不能用在出貨機器上。同步時要選一個上游
-版本，或保留 fork 的元件（`1.2.4`），由 #191／#44 決定；不要只照抄上表就結束。
+| 舊列 | 內容 | 現在 |
+|------|------|------|
+| 1 | `woow-addon-sync.yml` | 留在 overlay；`workflow_run` 只剩 `mirror-sync`。 |
+| 2、3 | `ci.yml` 與 `woow-addon-sync.yml` 裡的 `- CI` | 刪除（#191 決定 4）；mirror 改由升版比對把關。 |
+| 4、5 | integration 的品牌圖、`DEFAULT_AUTO_UPDATE`、元件 1.2.4 | 在 `woowtech/ha-mcp-tools`（#215）。 |
+| 6 | `pyproject.toml`、`uv.lock` 的版本號 | 不再需要：用上游的。fork 的 `semver-release.yml` 已不在 `master`，不會再改壞版本號。 |
 
-fork 的元件修正 `89ea666e`、`da0d2f3e`（`manifest.json` 加 `voluptuous-openapi>=0.3.0`，
-`COMPONENT_VERSION` 與 manifest 版本 `1.2.3`，相關測試與 `pyproject.toml` 註解）上游已經用
-`voluptuous-openapi>=0.4.1` 涵蓋。HA 2026.7.2 內建 `voluptuous_openapi` 0.4.1，所以上游的寫法
-在出貨機器上也成立；只有要支援 HA 2026.6 時才需要保留 `>=0.3.0`。
-
-## 上游 CI 在 fork 上不看的項目
-
-`HAOS E2E Tests`、`HAOS E2E Tests (embedded)`、`HAOS E2E Tests (inaddon)` 在 fork 上從沒通過過（HAOS VM 在 600 秒內開不起來，原因未查，見 pipeline #198）。在 #191 決定 fork 要不要改成 mirror 之前，fork 的 PR 上這 3 項紅燈**不看**；合併以 WOOWTECH 的 `ci.yml` 與其餘上游 check 為準。
-
-fork 的 `semver-release.yml`（`49a47e1e` 就是它產生的）目前被 GitHub 因長期沒有活動而停用（`disabled_inactivity`，最後一次排程 run 是 2026-09-23）。fork 上最新的正式版 tag 仍是 `v7.7.0`，所以若有人重新啟用排程或手動觸發，它會從 `v7.7.0` 往上算，把第 6 列的版本號改成 7.7.x 或 7.8.0，一定會再改壞（低於 7.14.1，也低於 `MIN_EMBEDDED_SERVER_VERSION` 7.10.0）。
-
-## 同步時丟掉的 fork commit
-
-| commit | 內容 | 為什麼可以丟 |
-|--------|------|--------------|
-| `49a47e1e` | `7.7.0`（python-semantic-release 在 fork 上跑出來的 `CHANGELOG.md`、`pyproject.toml`、`uv.lock`） | 機器產生；上游有自己的版本號與 changelog。 |
-| `83b3f4f2` | `chore(addon): sync changelog for Home Assistant add-on` | 同上，機器產生。 |
-
-## 同步後的檢查
-
-1. 上表第 1–6 列都在（第 3 列看當時的決定）。
-2. `ci.yml` 在 `master` 的 push run 是綠的。
-3. `woow-addon-sync.yml` 的 `workflow_run.workflows` 跟 `.github/workflows/*.yml` 的 `name:` 一致。
-4. 元件版本和 ha-mcp 釘版跟出貨機器的 HA 版本相容（見上一節）。
+fork 的 GitHub Release `v7.7.0` 與 `v7.*.dev*` 是 fork 以前的 semantic-release 產生的，不是正式 Release
+（正式 Release 的 tag 是 `ha_mcp-v<version>` 與 `ha_mcp_webhook_proxy-v<version>`），Store 不看它們。
+第一組正式 Release 是 mirror 之前 `master` `3456f26f` 上手動建立的種子 `ha_mcp-v7.14.1`、
+`ha_mcp_webhook_proxy-v2.0.4`，第一次 `mirror-sync` 拿 9.2.0／3.0.5 跟它們比對。
