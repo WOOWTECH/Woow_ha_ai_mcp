@@ -8,3 +8,11 @@
         Nothing to do. Upstream removed the backup_hint option (ha-mcp 6cca0322, #2822); Supervisor skips the
         stored value with a warning in the add-on log, and ha_manage_backup always gives the former default
         (normal) backup guidance.
+  accepted_vulnerabilities:
+    - id: CVE-2026-119170
+      package: python
+      reason: >-
+        Inside upstream's prebuilt image ghcr.io/homeassistant-ai/ha-mcp-addon-*:9.2.0, which WOOWTECH cannot rebuild;
+        no fixed 9.2.x will come because later upstream versions are above the version ceiling (they need a newer HA
+        than the shipping 2026.7.2). ha_mcp is not listed in the WOOW App Store (store_enabled false) and not in any
+        shipping backup, so no customer installs this image; re-evaluate before relisting (owner, 2026-11-24, #216).

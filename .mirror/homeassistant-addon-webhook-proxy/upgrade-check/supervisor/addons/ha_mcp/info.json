@@ -1,0 +1,1 @@
+{"slug": "ha_mcp", "name": "Home Assistant MCP Server", "state": "started", "version": "9.2.0", "host_network": false, "ip_address": "127.0.0.1", "options": {"secret_path": "/private_upgrade_test"}}
