@@ -7,11 +7,11 @@
       "name": "Home Assistant MCP Server (Dev)",
       "version": "7.14.0.dev2054",
       "repository": "WOOWTECH/Woow_ha_ai_mcp",
-      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_sha": "3456f26f4f200429328b3f6466d4e7c844a937c5",
       "source_path": "homeassistant-addon-dev",
       "config_file": "config.yaml",
       "config_sha256": "sha256:bf0080b9fe163a3e73078881c61b312b7705e9ec4a5f4156d7f151eed52f0487",
-      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "archive_sha256": "sha256:49cae9936e73dcc4b37324cddc56f7e5b071d1cf997a98a6c62d5a0eb8838ae1",
       "context_fingerprint": "sha256:7b72b3a95f6c39e546364e386b1a20b285cd069b60370459f60a687289d457e6",
       "material_fingerprint": "sha256:289e45cbae75e619628712ec9f3a94b02b4c2bdc22fa9a5ec7e5c3d59559c38f",
       "architectures": [
@@ -116,7 +116,7 @@
       },
       "delivery": "published-image",
       "validation": "manifest+architecture-images+configured-CI",
-      "publisher_run_id": "37410078805",
+      "publisher_run_id": "45326179556",
       "channel": "prerelease"
     },
     "ha_mcp_webhook_proxy_dev": {
@@ -124,11 +124,11 @@
       "name": "Nabu Casa - Webhook Proxy for HA MCP (Dev)",
       "version": "2.0.3.dev3",
       "repository": "WOOWTECH/Woow_ha_ai_mcp",
-      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_sha": "3456f26f4f200429328b3f6466d4e7c844a937c5",
       "source_path": "homeassistant-addon-webhook-proxy-dev",
       "config_file": "config.yaml",
       "config_sha256": "sha256:8d6af0d154ef903e7b9300f118b711b9f402a4d2230b9abcfec40277c34a8fba",
-      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "archive_sha256": "sha256:49cae9936e73dcc4b37324cddc56f7e5b071d1cf997a98a6c62d5a0eb8838ae1",
       "context_fingerprint": "sha256:45e8eb8b0b974a11032b4d2a283d05db423b0274976d1a482ad6977e158fe547",
       "material_fingerprint": "sha256:4f2dcedda5e958fb17ea81b17fc7ce666434abc3d8b96209d6d2b41d5a595fb5",
       "architectures": [
@@ -178,7 +178,7 @@
       "images": {},
       "delivery": "local-source-build",
       "validation": "manifest+source-context+configured-CI (runtime build not certified)",
-      "publisher_run_id": "37410078805",
+      "publisher_run_id": "45326179556",
       "channel": "prerelease"
     },
     "ha_mcp_webhook_proxy": {
@@ -186,11 +186,11 @@
       "name": "Nabu Casa - Webhook Proxy for HA MCP",
       "version": "2.0.4",
       "repository": "WOOWTECH/Woow_ha_ai_mcp",
-      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_sha": "3456f26f4f200429328b3f6466d4e7c844a937c5",
       "source_path": "homeassistant-addon-webhook-proxy",
       "config_file": "config.yaml",
       "config_sha256": "sha256:fbd30e177718a2390a34145278388adbc8826f05c086c90892403c39a88f200e",
-      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "archive_sha256": "sha256:49cae9936e73dcc4b37324cddc56f7e5b071d1cf997a98a6c62d5a0eb8838ae1",
       "context_fingerprint": "sha256:c97dd9446bca402cd672e122410c671a05888489606a016996a367d60b238e47",
       "material_fingerprint": "sha256:f5123c45b7a569cef1e284c1bf3e6f28f86bad422f25683befd7665dfba8fae9",
       "architectures": [
@@ -239,7 +239,7 @@
       "images": {},
       "delivery": "local-source-build",
       "validation": "manifest+source-context+configured-CI (runtime build not certified)",
-      "publisher_run_id": "37410078805",
+      "publisher_run_id": "45326179556",
       "channel": "stable"
     },
     "ha_mcp": {
@@ -247,11 +247,11 @@
       "name": "Home Assistant MCP Server",
       "version": "7.14.1",
       "repository": "WOOWTECH/Woow_ha_ai_mcp",
-      "source_sha": "b94ee5419d961c9814357206694ef66fd91f139d",
+      "source_sha": "3456f26f4f200429328b3f6466d4e7c844a937c5",
       "source_path": "homeassistant-addon",
       "config_file": "config.yaml",
       "config_sha256": "sha256:7d0262d3636733b64e073a8ccbd55a691ca317b005bfdfce85ebb7fc8a8208ea",
-      "archive_sha256": "sha256:2bc976f83bf43832ce246423194604b44f80ef347f5d6579e9f03e4f42839246",
+      "archive_sha256": "sha256:49cae9936e73dcc4b37324cddc56f7e5b071d1cf997a98a6c62d5a0eb8838ae1",
       "context_fingerprint": "sha256:9da2a154f42c9eeafe924849057949a8cc7b22d1b1531d2799bc717d279811b4",
       "material_fingerprint": "sha256:956b4b60c1f0f99527045cf33820ada137b2c90aa76e70a09fcb301e40b77c43",
       "architectures": [
@@ -335,7 +335,7 @@
       },
       "delivery": "published-image",
       "validation": "manifest+architecture-images+configured-CI",
-      "publisher_run_id": "37410078805",
+      "publisher_run_id": "45326179556",
       "channel": "stable"
     }
   }
