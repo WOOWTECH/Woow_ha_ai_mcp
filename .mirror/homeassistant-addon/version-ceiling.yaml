@@ -2,5 +2,5 @@
 # The highest ha_mcp version (config.yaml version:) that may get a formal Release. Above it the
 # upgrade comparison holds the add-on (暫緩): the upstream snapshot still moves, no Release.
 # Raise it by hand only after the shipping HA can run that version (docs/woowtech-fork-sync.md).
-ceiling: "9.1.x"
+ceiling: "9.2.x"
 reason: "upstream master after 9.2.0 (d5c88170e) requires HA 2026.11; the shipping HA is 2026.7.2 (#191, #214)"
