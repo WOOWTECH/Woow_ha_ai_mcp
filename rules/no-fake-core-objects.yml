@@ -1,0 +1,18 @@
+id: no-fake-core-objects
+language: python
+rule:
+  kind: class_definition
+  has:
+    field: name
+    regex: ^_?(Fake|Stub)\w*(Hass|Registry|Reg|RegEntry|State|States|Entry|Entries|Subentry|Bus|Connection|WSApi|Store|Storage\w*|Device|Area|Floor|Label|Category|Issue|Lovelace\w*|Dashboard|Template\w*|Entity|Component|Services|Config|Module)$
+files:
+  - "tests/src/unit/**"
+  - "tests/addon/**"
+message: |
+  Do not write a stand-in for a Home Assistant object (hass, a registry or its
+  entries, a state, a config entry, a WebSocket connection, a store, ...).
+  Build the real one in the `hass` fixture: a hand-written copy asserts against
+  a guess of what Core does. A double of this repository's own classes is fine
+  under another name. See tests/AGENTS.md, "Unit Tests Run on Real Home
+  Assistant Core".
+severity: error

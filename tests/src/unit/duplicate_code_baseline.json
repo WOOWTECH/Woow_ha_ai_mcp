@@ -1,0 +1,329 @@
+{
+  "0457553b0835": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_handle_refresh",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_handle_refresh"
+  ],
+  "052b1fbe8f0d": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::_read_capped_body",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::_read_capped_body"
+  ],
+  "093537d0d0d4": [
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::AutoApproveTokenView._ha_auth_token",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_autoapprove.py::AutoApproveTokenView._ha_auth_token"
+  ],
+  "11e11ce8f9fb": [
+    "tests/src/e2e/haos_only/test_dashboard_screenshot_addon.py::_set_options",
+    "tests/src/e2e/haos_only/test_webhook_proxy_addon.py::_set_options"
+  ],
+  "1316d0124a7d": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::wrap_refresh_token",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::wrap_refresh_token"
+  ],
+  "13c4f80e2340": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::LegacyOAuthProvider._validate_token",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::OAuthProvider._validate_token"
+  ],
+  "17acad1bbaea": [
+    "tests/src/unit/test_config.py::isolated_data_dir",
+    "tests/src/unit/test_individual_fetch_settings.py::isolated_data_dir",
+    "tests/src/unit/test_search_time_budget_settings.py::isolated_data_dir"
+  ],
+  "1922dcf67f88": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::LegacyOAuthProvider._issue_token",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::OAuthProvider._issue_token"
+  ],
+  "1ac1af8b747e": [
+    "tests/src/e2e/tools/test_dev_mode_tools.py::_dev_mode_server",
+    "tests/src/e2e/tools/test_security_policy_tool.py::_security_policy_server"
+  ],
+  "21f68459c51e": [
+    "tests/src/unit/test_tool_docstring_no_parameter_section.py::all_tools",
+    "tests/src/unit/test_tool_schema_exclusive_bounds.py::all_tools"
+  ],
+  "2a47e123bb66": [
+    "tests/src/e2e/tools/test_create_custom_tool.py::_skip_if_unavailable",
+    "tests/src/e2e/workflows/filesystem/test_file_operations.py::_skip_if_component_not_installed"
+  ],
+  "2b4f18d9c25b": [
+    "tests/src/e2e/haos_only/test_addon_lifecycle.py::_get_addon_detail",
+    "tests/src/e2e/haos_only/test_dashboard_screenshot_addon.py::_get_addon_detail",
+    "tests/src/e2e/haos_only/test_webhook_proxy_addon.py::_get_addon_detail"
+  ],
+  "2fdf9391edca": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::normalized_origin",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::normalized_origin"
+  ],
+  "33bd31bdbeb7": [
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::_redirect_with",
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_redirect_with_params",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_redirect_with_params",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_autoapprove.py::_redirect_with"
+  ],
+  "36579b7ba470": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_resolve_public_addresses",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_resolve_public_addresses"
+  ],
+  "3678766f4bda": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::stable_translation_origin",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::stable_translation_origin"
+  ],
+  "38b3dc026d22": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::PKCECodeStore.consume_code",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::PKCECodeStore.consume_code"
+  ],
+  "3de4cb4258ba": [
+    "tests/src/e2e/workflows/embedded/test_embedded_dependency_conflict.py::_docker_available",
+    "tests/src/e2e/workflows/embedded/test_embedded_server.py::_docker_available"
+  ],
+  "44acf302f8d7": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_translation_for",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_translation_for"
+  ],
+  "451ed9b11fe1": [
+    "tests/src/e2e/workflows/embedded/test_embedded_server.py::_mcp_post",
+    "tests/src/e2e/workflows/embedded/test_embedded_update_path.py::_mcp_post"
+  ],
+  "4e0435c0fbf2": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::client_redirect_uris",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::client_redirect_uris"
+  ],
+  "51526fb3c70b": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::bind_dcr_view",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::bind_dcr_view"
+  ],
+  "5490cf17c114": [
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::bind_autoapprove_views",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_autoapprove.py::register_autoapprove_views"
+  ],
+  "5500871179c8": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::unwrap_refresh_token",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::unwrap_refresh_token"
+  ],
+  "57e36fc3ae5a": [
+    "src/ha_mcp/tools/best_practice_checker.py::_as_list",
+    "src/ha_mcp/tools/coercion.py::coerce_to_list"
+  ],
+  "58b1c85f9868": [
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::_validate_autoapprove_authorize",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_autoapprove.py::_validate_autoapprove_authorize"
+  ],
+  "593d6f7e0fad": [
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_atomic_write_0600",
+    "homeassistant-addon-webhook-proxy-dev/start.py::_atomic_write_0600"
+  ],
+  "5de8ad3f0a84": [
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::_unavailable",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_autoapprove.py::_unavailable"
+  ],
+  "624482911c9a": [
+    "custom_components/ha_mcp_tools/mcp_webhook.py::_active_webhook_cfg",
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::_webhook_cfg",
+    "custom_components/ha_mcp_tools/ui_panel.py::_webhook_cfg"
+  ],
+  "66f85ab13708": [
+    "tests/src/e2e/workflows/embedded/test_embedded_server.py::_wait_http_ok",
+    "tests/src/e2e/workflows/embedded/test_embedded_update_path.py::_wait_http_ok"
+  ],
+  "688b765accda": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::_non_loopback_origins",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::_non_loopback_origins"
+  ],
+  "693e781a2e88": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::RefreshDisposition",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::RefreshDisposition"
+  ],
+  "6a6fc02d9091": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::origin_client_id",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::origin_client_id"
+  ],
+  "6f99e11a5fb5": [
+    "custom_components/ha_mcp_tools/mcp_webhook.py::_unregister_webhook",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/__init__.py::_unregister_webhook"
+  ],
+  "7083682913c1": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_handle_authorization_code",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_handle_authorization_code"
+  ],
+  "7b168a7ee5ef": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_extract_client_creds",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_extract_client_creds"
+  ],
+  "7b8cc7325470": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::read_form",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::read_form"
+  ],
+  "7d7afd2fb81e": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::translated_client_id_for_refresh",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::translated_client_id_for_refresh"
+  ],
+  "7ddf78ed433f": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_fetch_pinned_cimd",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_fetch_pinned_cimd"
+  ],
+  "85135aa6a2c5": [
+    "tests/src/unit/test_container_param_coercion_complete.py::test_container_param_coerces_json_array_string",
+    "tests/src/unit/test_container_param_coercion_complete.py::test_dict_only_param_coerces_json_object_string"
+  ],
+  "860ff0b9cd5e": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_oauth_route_fingerprint",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/__init__.py::_oauth_route_fingerprint"
+  ],
+  "87047f9aa37d": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::rewrite_token_response_body",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::rewrite_token_response_body"
+  ],
+  "8878c3561656": [
+    "tests/src/unit/test_log_filters_install.py::TestInstallSdkLogFiltersIdempotent.teardown_method",
+    "tests/src/unit/test_log_filters_install.py::TestInstallSdkLogFiltersReplacesStaleGeneration.teardown_method"
+  ],
+  "88f781cc9eb7": [
+    "tests/src/unit/test_build_skill_content.py::TestDegradedPaths.test_nothing_requested",
+    "tests/src/unit/test_build_skill_content.py::TestIncludeSkillOff.test_canonical_suppressed_when_off"
+  ],
+  "89b0fce0a9fd": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_parse_cimd",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_parse_cimd"
+  ],
+  "8e0f9e9e2254": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::redirect_matches",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::redirect_matches"
+  ],
+  "8eaf38809733": [
+    "tests/src/unit/_js_harness.py::_render_consent_html",
+    "tests/src/unit/test_consent_form_js_behavior.py::consent_form_html"
+  ],
+  "93ec9cb4abd0": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::mint_client_id",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::mint_client_id"
+  ],
+  "9925d5a902ca": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::core_token_for_revocation",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::core_token_for_revocation"
+  ],
+  "993b3aefb89c": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_b64url_decode",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_b64url_decode"
+  ],
+  "9ada52f05d49": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_stable_origin_or_unreproducible",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_stable_origin_or_unreproducible"
+  ],
+  "9c0d2742752d": [
+    "custom_components/ha_mcp_tools/repairs.py::LegacyOAuthRestartRepairFlow",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/repairs.py::OAuthRestartRepairFlow"
+  ],
+  "9fe200745afb": [
+    "tests/src/e2e/workflows/dashboards/test_lifecycle.py::parse_mcp_result",
+    "tests/src/e2e/workflows/todo/test_lifecycle.py::enhanced_parse_mcp_result"
+  ],
+  "a1cb99adf0fd": [
+    "tests/src/e2e/workflows/filesystem/conftest.py::mcp_client_fs",
+    "tests/src/e2e/workflows/services/test_ha_mcp_tools_refusal.py::mcp_client_for_refusal"
+  ],
+  "a4b437f4c1c5": [
+    "custom_components/ha_mcp_tools/dependency_diagnostics.py::_exception_text",
+    "custom_components/ha_mcp_tools/websocket_api/bulk.py::_bulk_op_error"
+  ],
+  "a7a3c8f24529": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::LegacyOAuthProvider.validate_bearer",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::OAuthProvider.validate_bearer"
+  ],
+  "af2e03446ed9": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::_redirect_uris_error",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::_redirect_uris_error"
+  ],
+  "b7bf3fbc8949": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::_refresh_identity_is_reproducible",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::_refresh_identity_is_reproducible"
+  ],
+  "b7d73f4d4dd0": [
+    "custom_components/ha_mcp_tools/websocket_api/search.py::_is_entity_id",
+    "src/ha_mcp/utils/entity_membership.py::_is_entity_id"
+  ],
+  "b941eb05b141": [
+    "homeassistant-addon-webhook-proxy-dev/start.py::_log",
+    "homeassistant-addon/start.py::_log_with_timestamp"
+  ],
+  "be61eddea6a0": [
+    "custom_components/ha_mcp_tools/repairs.py::LegacyOAuthRestartRepairFlow.async_step_confirm",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/repairs.py::OAuthRestartRepairFlow.async_step_confirm"
+  ],
+  "c552212d71b5": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_valid_cimd_client_id",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_valid_cimd_client_id"
+  ],
+  "c67dcb7443c2": [
+    "tests/src/e2e/workflows/config/test_helper_crud.py::get_entity_id_from_response",
+    "tests/src/e2e/workflows/config/test_helper_field_persistence.py::_entity_id_from_create",
+    "tests/src/e2e/workflows/config/test_ws_event_waiter.py::_entity_id_from_response",
+    "tests/src/e2e/workflows/core/test_service.py::get_entity_id_from_response"
+  ],
+  "cf05a2024943": [
+    "tests/src/unit/test_config_param_no_string_schema.py::test_list_param_does_not_advertise_string",
+    "tests/src/unit/test_config_param_no_string_schema.py::test_param_does_not_advertise_string"
+  ],
+  "d29ab431ea8a": [
+    "tests/src/e2e/tools/test_dev_mode_tools.py::_reset_settings_state",
+    "tests/src/e2e/tools/test_security_policy_tool.py::_reset_settings_state"
+  ],
+  "d41845b97bca": [
+    "custom_components/ha_mcp_tools/websocket_api/search.py::_normalize_member_entity_ids",
+    "src/ha_mcp/utils/entity_membership.py::normalize_member_entity_ids"
+  ],
+  "d4dfcdf48d4e": [
+    "tests/uat/mcp_config.py::mcp_server_command",
+    "tests/uat/stories/scripts/ha_query.py::mcp_server_command"
+  ],
+  "d524aa51c882": [
+    "custom_components/ha_mcp_tools/oauth_dcr.py::canonical_origin_url",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_dcr.py::canonical_origin_url"
+  ],
+  "d6a0cca64986": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::LegacyOAuthProvider.authenticate_client",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::OAuthProvider.authenticate_client"
+  ],
+  "d93ceddc57f3": [
+    "src/ha_mcp/transforms/lite_docstrings.py::LiteDocstringsTransform.get_tool",
+    "src/ha_mcp/transforms/write_tool_note.py::WriteToolNoteTransform.get_tool"
+  ],
+  "d9ea4da57d9d": [
+    "custom_components/ha_mcp_tools/mcp_webhook.py::_WellKnownAuthorizationServerMetadataView.__init__",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::WellKnownAuthorizationServerMetadataView.__init__"
+  ],
+  "db35806e49da": [
+    "tests/src/e2e/haos_only/test_dashboard_screenshot_addon.py::_wait_for_state",
+    "tests/src/e2e/haos_only/test_webhook_proxy_addon.py::_wait_for_state"
+  ],
+  "dda58af63482": [
+    "custom_components/ha_mcp_tools/oauth_legacy.py::_PendingCode",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth.py::_PendingCode"
+  ],
+  "e01a776301d3": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::fetch_cimd_redirects",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::fetch_cimd_redirects"
+  ],
+  "e0bf3eee1fe6": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_pinned_url",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_pinned_url"
+  ],
+  "e34422a43d9c": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::resolve_forward_client_id",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::resolve_forward_client_id"
+  ],
+  "e41af98d69df": [
+    "tests/src/e2e/workflows/embedded/test_embedded_dependency_conflict.py::_dump_logs",
+    "tests/src/e2e/workflows/embedded/test_embedded_update_path.py::_dump_logs"
+  ],
+  "ea80f53a904b": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::_lookup_cimd",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::_lookup_cimd"
+  ],
+  "ed5d4e154c39": [
+    "custom_components/ha_mcp_tools/oauth_autoapprove.py::_json_error",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_autoapprove.py::_json_error"
+  ],
+  "fbca60b1fbf8": [
+    "custom_components/ha_mcp_tools/oauth_ha_auth.py::EnvelopeState",
+    "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/oauth_indirect.py::EnvelopeState"
+  ]
+}

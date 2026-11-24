@@ -1,0 +1,211 @@
+# Custom component development
+
+Read this document before changing `custom_components/ha_mcp_tools/` or a
+server feature that depends on the component. The component (installed through
+the Marketplace) and the `ha-mcp` server ship through separate installation paths; see
+[Compatibility](#compatibility) for which version skew matters.
+
+## Version cycle
+
+The component shares the server's version and pins the server build it runs
+(#2427). `manifest.json`'s `version`, its `ha-mcp==` requirement,
+`COMPONENT_VERSION` in `const.py` and `MIN_COMPONENT_VERSION` in
+`src/ha_mcp/tools/tools_filesystem.py` always equal `pyproject.toml`'s version.
+Never edit them by hand: semantic-release stamps all five in each release
+commit (`version_variables` in `pyproject.toml`). The PR **Component Version
+Gate** fails a pull request that moves one of the component's three, and a
+unit test holds the floor to the component's version.
+
+The Marketplace installs the component from this repository; the
+`homeassistant-ai/ha-mcp-integration` mirror stays for installs made from it and
+receives the same releases (#2763). Releases follow from that:
+
+- **Stable:** the SemVer Release commit carries the stamp, so this
+  repository's `vX.Y.Z` release is the component release. After it, the mirror
+  sync snapshots the release tag's component and tags the mirror `vX.Y.Z`
+  once PyPI serves `ha-mcp==X.Y.Z`. A server-only release is therefore also a
+  component release.
+- **Development:** **Publish Dev Channel** stamps the component with the next
+  release number and its `ha-mcp-dev` build on a commit only its
+  `v<next>.dev<N>` pre-release tag references, so master keeps its stable
+  pin. After it, the mirror sync stamps the
+  snapshot of the commit it built with the next release number (what
+  semantic-release would cut) and pins the exact build it uploaded,
+  `ha-mcp-dev==<next>.dev<N>` (the version `scripts/dev_version.sh` gave
+  that run, handed over as its `dev-version` artifact), and tags it
+  `v<next>-dev.<N>` as a GitHub pre-release once PyPI serves that build. As
+  here, the stamp is on a commit only that tag references: the mirror's `main`
+  carries master's component unstamped. Both
+  repositories keep their newest five dev pre-releases, because the Marketplace reads a
+  repository's 30 newest releases and installs the default branch when none
+  of them is stable (#2881).
+
+The component never reports a dev suffix: released servers parse the version
+segment by segment as integers, so the suffix lives only in the pre-release tag
+and the pin.
+
+`MIN_COMPONENT_VERSION` is the component version every call to the File & YAML
+Tools entry's services needs: the release's own. That covers the file and YAML
+tools, their backups, the fault log read (`ha_get_logs`) and the settings UI's
+file handlers. An external server (app (add-on), Docker, pip) refuses them on a
+component older than itself and says to update it, so every stable release
+asks its users for the matching component.
+
+Between releases the number cannot tell builds apart: an unreleased build
+(master, E2E, the dev environment) reports the last release's number while
+already carrying new code, and every development pre-release cut while a
+release is pending reports the same plain number. A change that needs a
+service or argument added since the last release therefore gates on its own
+signal, as `ha_write_file(edits=...)` does by finding `edit_file` in the
+service registry (`_assert_file_edits_supported`). Only an external server is
+affected; the in-process server runs the build its component release pins.
+This gap is accepted: pre-release users update the component from the
+Marketplace.
+
+## Compatibility
+
+The embedded server always runs the build its component release pins. An
+external server (app, Docker, standalone) updates on its own, and in practice
+before the component, so the skew that matters is a newer server meeting an
+older component. The capability handshake covers it: the server asks the
+component only for what it advertises, and says so in its answer when a
+capability is missing.
+
+Running an outdated component is not supported. When a capability is missing
+the server tells the user to update the component (or to install it when none
+answered) and returns what it has without it. Do not rebuild the missing
+behaviour on the server side to keep an older component working.
+
+A component that advertises a read command and then fails it (an error reply,
+a timeout or a malformed result) is treated as a missing component. The tool
+takes the route it takes without the component, and gives the same warning to
+install or update it where that route returns less. Do not add a separate
+error, code path or test for a failing read. A fallback that already exists
+stays; do not remove it. The logbook read is the one exception: apart from
+`unknown_command`, its bridge errors and timeouts surface instead of falling
+back, and a timed-out read is not run again as a second recorder query.
+
+This covers reads only. What a write does when its bridge command fails is
+that tool's own rule, because a write that may have run cannot simply be
+repeated; the
+[native contracts](native-core-contracts.md#choose-the-authoritative-path)
+describe `ha_call_event` and the todo bridge.
+
+A component newer than the external server that calls it is unlikely and does
+not shape a design. Do not keep a server-side fallback, a second code path or a
+frozen schema for it. An old command may stay registered while it costs
+nothing; remove it once it gets in the way.
+
+For component behavior changes, follow the
+[repository live-testing requirement](../../AGENTS.md#testing-and-verification)
+before merge, using the user's choice of the
+[live dev environment](../dev-ha-env.md) or another live Home Assistant.
+The dev environment runs a fork branch's component and server against a
+throwaway Home Assistant on a GitHub runner, so live
+validation does not require merging or publishing a release first. Start
+with the embedded server and File & YAML Tools entry, then exercise the
+other affected topologies described below. Follow the environment guide for
+setup, iteration, and cleanup when using it; this manually dispatched
+environment is separate from automated CI.
+
+## Dependencies shared with Core
+
+The embedded server installs into Home Assistant's Python environment using
+Core's `package_constraints.txt`. The standalone `uv.lock` is not the embedded
+installation contract. For libraries shared with HA, keep package requirements as
+bounded compatibility ranges that admit every Core release from the `hacs.json`
+minimum to the current beta. Preserve the
+standalone lock's selected versions when widening a range; widen or raise a
+floor only with compatibility evidence. Pydantic follows its major-version
+boundary; HTTPX is pre-1.0, so its minor-version boundary remains capped.
+
+Dependabot continues updating Pydantic and HTTPX for standalone, Docker, and
+app installations. Their standalone lock versions may advance independently
+of Core's pins while the package requirements still admit those pins. Review
+requirement changes against that range; an incompatible floor
+must fail alignment checks rather than silently strand embedded users.
+Renovate advances the Core E2E image, not these package requirements. Never
+fix an embedded resolver failure by dropping HA's constraints or eagerly
+upgrading its shared packages.
+
+Fast Checks verifies direct dependency alignment against both the current
+Core image and the `hacs.json` minimum, without adding E2E lanes. Existing
+current-Core embedded E2E on x64/ARM64 covers transitive installation and
+preinstall/runtime replacement of HA-governed packages; nightly beta E2E
+provides advance notice of upcoming Core regressions.
+
+The minimum-version check does not prove transitive installability or runtime
+behavior there. These checks also do not cover every intervening release,
+every installed third-party integration, or future API compatibility.
+Keep the `hacs.json` minimum honest; passing current-Core E2E alone does not justify
+raising a dependency floor past what older releases need.
+
+The `hacs.json` minimum is the oldest Core that HA-MCP installs and runs on, not
+a supported or tested version. Support follows the
+[repository's Home Assistant version policy](../../AGENTS.md#testing-and-verification):
+current stable, plus the active beta where a fallback keeps stable working.
+Releases between the minimum and current stable may lack features or behave
+differently; a user who keeps an older Home Assistant can install an older
+HA-MCP release. Do not add
+fallbacks or tests for them; an older release is tested only to verify an
+update path.
+
+## Two entries, one command surface
+
+The integration has two config-entry types:
+
+- **HA-MCP Server** runs the server in-process and exposes it through a Home
+  Assistant webhook.
+- **File & YAML Tools** registers privileged filesystem and YAML services.
+
+Both entries register the shared `ha_mcp_tools/*` WebSocket command surface.
+An external server therefore reaches in-process capabilities through the tools
+entry alone. Every shared handler must read live Home Assistant state rather
+than tools-entry `hass.data`, or a server-entry-only installation breaks.
+
+`async_register_command` is idempotent, and Home Assistant provides no
+unregister operation. Commands remain registered after an entry unload until
+Home Assistant restarts. Do not attempt to tear them down; do clear that
+entry's `hass.data` caches so the next setup reads storage again.
+
+Privileged filesystem and YAML services remain tools-entry-only. The
+`ha_mcp_tools/info` command answers for either entry, so the server gates
+those services on Home Assistant's live service registry—not the capability
+list.
+
+When changing component-backed behavior:
+
+- Update the component producer, server consumer and capability gate in the
+  same pull request, and the existing no-component fallback when the change
+  touches what it serves. A new component-backed feature needs no fallback;
+  the [native contracts](native-core-contracts.md#choose-the-authoritative-path)
+  say when one may grow.
+- Serve shared commands identically from both entry types.
+- Gate privileged or beta behavior on an explicit tools-entry signal.
+- Exercise both topologies, including the no-tools lanes described in
+  [`tests/AGENTS.md`](../../tests/AGENTS.md#no-tools-lanes-e2e_no_tools_entry1-2292).
+
+## Embedded server security
+
+The in-process server accepts active human Home Assistant administrators and
+makes upstream calls with an administrator's long-lived access token
+(`server_credentials.py`): one the user pastes, or one issued at setup from the
+login of an account the user chose, which the component revokes on a switch or
+removal. The component never creates an account: entries from older releases
+keep their provisioned pair while it works,
+and a missing or refused credential files the fixable `server_token_needed`
+repair instead. The token is passed in memory, not through the Home Assistant
+process environment; disabling the entry stops the server, and so does the
+entry's **Access** switch (disabled by default) while the entry stays loaded.
+Removing the entry deletes only an account an older release created, never the
+user's.
+
+The settings panel reverse-proxies the web UI through Home Assistant. Browser
+access uses a short-lived HttpOnly session cookie issued to an authenticated
+administrator. Every request revalidates that the session still maps to an
+active administrator. Never expose the loopback secret path or place a token or
+secret in a URL. The administrator's settings export is the one deliberate
+exception: a file download that carries the connection secrets, never a URL.
+
+The full threat model and route-ownership rules are in
+[`SECURITY.md`](../../SECURITY.md).
