@@ -1,66 +1,60 @@
-"""Config-resolution + reference-data reads over the ``ha_mcp_tools`` component gate.
+"""Config-resolution + reference reads over the ``ha_mcp_tools`` component gate.
 
-Two consumers in the automation/script/scene family pay for a whole-collection
-fetch to answer a single question:
+Two consumers in the automation/script/scene family read through the
+component:
 
-- The set/remove/post-write resolvers (``_resolve_scene_entity_id`` /
-  ``_resolve_automation_entity_id``) map a storage id (a scene's ``unique_id``,
-  an automation's config id) to its live ``entity_id`` — the scene resolver by
-  dumping the ENTIRE ``config/entity_registry/list`` (with a 0.2 s sleep + retry
-  to absorb post-upsert registration lag), the automation resolver by scanning
-  the WHOLE ``get_states()`` state machine. When the component advertises
-  ``entity_lookup``, a single ``ha_mcp_tools/entity_lookup(unique_id=, domain=)``
-  frame returns just the matching registry entries — a hit is authoritative the
-  instant it returns (no settle). An in-process read removes the network latency
-  but NOT HA's async entity-registration lag, so the scene resolver still
-  rechecks an EMPTY result ONCE after the same short delay before its naive
-  fallback (the automation resolver has no post-upsert lag exposure — its only
-  routed call site resolves an already-registered entity before a delete).
-- The reference validator (``validate_config_references``) fetches BOTH
-  ``client.get_services()`` and ``client.get_states()`` on every automation/script
-  write purely to build a name index. When the component advertises
-  ``reference_data``, one ``ha_mcp_tools/reference_data`` frame returns the
-  REST-shaped service catalog + the entity-id universe together.
+- Entity resolution maps storage keys to live registry entity IDs.
+  ``entity_registration.resolve_entity_id_after_write`` polls after scene/script
+  writes, and before a standalone activation of a stored scene key, against one
+  deadline and constructs no id when it finds none. When a scene's resolution
+  named no entity, ``_resolve_scene_entity_id`` uses a single retry for its
+  config read or before its removal.
+  ``entity_registration.lookup_entity_id`` is one strict lookup, which raises
+  on a failed read, for the script get, run and remove and for a standalone
+  scene activation by a bare id. ``scenes_with_id`` asks ``entity_lookup``,
+  for the REST client's ``_resolve_scene``, which ``homeassistant`` scene Core
+  registered under a bare id and whether Core loaded it (``loaded``, flag
+  ``entity_lookup_loaded``); without it that resolution falls back to the
+  registry entry of ``scene.<id>`` and the config API. The component's
+  ``entity_lookup`` returns only matching rows instead of a full
+  registry/state listing. A hit is authoritative at once,
+  but an empty read can precede HA's asynchronous entity registration even when
+  performed in-process, so post-write callers must continue polling.
+- The reference validator (``validate_config_references``) asks the
+  component's ``ha_mcp_tools/config_references`` for Core's own verdict on a
+  proposed config's references; Core serves nothing like it for an unsaved
+  config, so there is no legacy path and an absent component is reported.
 
-This module owns the caps-gated fetch so the routing discipline — probe caps,
-send one frame, invalidate on ``unknown_command``, fall back to the legacy path
-on any component error — lives in one place instead of being duplicated per
-consumer (the pattern ``component_devices`` established for the ``device_get`` /
-``device_list`` capabilities). Both helpers return ``None`` to mean "component
+This module owns the caps-gated fetches so the routing discipline — probe caps,
+send one frame, invalidate on ``unknown_command`` — lives in one place instead
+of being duplicated per consumer (the pattern ``component_devices`` established
+for the ``device_get`` / ``device_list`` capabilities).
+``fetch_entity_lookup_via_component`` returns ``None`` to mean "component
 unavailable — use the legacy path"; a component that answers authoritatively
-returns its payload (an entity_lookup with an EMPTY ``matches`` list is
-authoritative — "no registry entry with that unique_id" — kept distinct from the
-``None`` miss).
+returns its payload (an EMPTY ``matches`` list is authoritative — "no registry
+entry with that unique_id" — kept distinct from the ``None`` miss). It maps a
+transport failure (``HomeAssistantConnectionError`` off ``send_command`` or from
+a failed (re)build of the pooled socket, or ``HomeAssistantAuthError``) to
+``None`` too, NEVER propagating it: its consumers fall back to the legacy
+WebSocket registry bridge or REST state reads, which an escaping error would
+skip. The post-write resolver returns None when its budget ends and raises on
+a failed registry read; ``entity_registration.post_write_entity`` turns either
+into a warning and skips the wait, category and activation steps, unless a
+script write by ``script.<x>`` whose key differs from ``<x>`` falls back to
+that entity. Removal resolvers retain their own error policies.
 
-Both helpers apply the uniform transport-fallback taxonomy: a
-``HomeAssistantConnectionError`` off ``send_command`` — and the plain
-``Exception`` ``get_websocket_client()`` raises when ``WebSocketManager`` cannot
-(re)build the pooled socket — are caught and mapped to ``None`` so the legacy
-path runs, NEVER propagated out of the read. Neither consumer's legacy path dies
-identically on a pooled-WS drop, so propagating would abort work the legacy path
-still completes:
-
-- ``fetch_entity_lookup_via_component``'s consumers degrade gracefully. The scene
-  resolver's ``config/entity_registry/list`` dump rides
-  ``client.send_websocket_message``, which answers a command HA rejected with
-  ``{"success": False}``, so the resolver walks its retry loop to the naive
-  ``scene.{id}`` fallback (a dead transport raises there instead, #1947) - and
-  the automation resolver scans REST
-  ``get_states()`` and additionally catches broadly → ``None``. Its only routed
-  call sites run AFTER a scene/automation upsert commits or BEFORE a REST delete,
-  so an escaping transport error would report a landed write as failed / abort a
-  delete the REST path would have finished.
-- ``fetch_reference_data_via_component``'s legacy path is the REST
-  ``get_services()`` / ``get_states()`` pair; an escaping transport error would
-  make ``validate_config_references`` hit its swallow-all fetch guard and skip
-  EVERY reference warning even when REST is up.
-
-**GET-path invariant:** the automation/script/scene *config-get* tools must never
-route through the component — their in-process ``raw_config`` freshness lags the
-config file between a write and the next completed reload. The resolvers gate the
-whole component branch (caps probe included) behind an explicit ``allow_component``
-flag that only the set/remove/post-write call sites pass, so a get never even
-probes caps. ``TestConfigGetSeam`` pins this.
+**GET-path invariant:** the automation/script/scene *config-get* tools never
+read the config body through the component — its in-process ``raw_config``
+freshness lags the config file between a write and the next completed reload,
+so the body always comes from Core's REST config endpoint. Registry rows may
+come from the component: the scene get resolves a bare id through
+``entity_lookup``, while the scene entity resolver gates its component branch
+(caps probe included) behind ``allow_component`` for removals, and the
+dedicated post-write resolver is never called from a config-get; the script
+config-get looks up the entity of its category with
+``entity_registration.lookup_entity_id``.
+The automation tools resolve through ``component_automation.automation_lookup``
+instead, which reads the registry, never the body.
 """
 
 from __future__ import annotations
@@ -74,6 +68,8 @@ from ..client.rest_client import (
 )
 from ..client.websocket_client import get_websocket_client
 from .component_api import (
+    ENTITY_LOOKUP_LOADED,
+    component_serves,
     component_supports,
     get_component_caps,
     invalidate_caps,
@@ -83,7 +79,8 @@ from .component_api import (
 logger = logging.getLogger(__name__)
 
 WS_ENTITY_LOOKUP = "ha_mcp_tools/entity_lookup"
-WS_REFERENCE_DATA = "ha_mcp_tools/reference_data"
+WS_CONFIG_REFERENCES = "ha_mcp_tools/config_references"
+CONFIG_REFERENCES = "config_references"
 
 
 async def fetch_entity_lookup_via_component(
@@ -96,7 +93,8 @@ async def fetch_entity_lookup_via_component(
 
     Returns the component's ``matches`` list — every entity-registry entry whose
     ``unique_id`` equals ``unique_id`` (each ``{entity_id, unique_id, platform,
-    domain, config_entry_id, categories, disabled_by, hidden_by}``), optionally
+    domain, config_entry_id, categories, disabled_by, hidden_by, loaded}``;
+    ``loaded`` behind the ``entity_lookup_loaded`` flag), optionally
     narrowed by the entity's own ``domain``. Multiple matches (one ``unique_id``
     across platforms) are all returned — the caller picks. An AUTHORITATIVE empty
     list (no registry entry with that unique_id) is kept distinct from the
@@ -117,7 +115,11 @@ async def fetch_entity_lookup_via_component(
     if domain is not None:
         kwargs["domain"] = domain
     try:
-        ws = await get_websocket_client(url=client.base_url, token=client.token)
+        ws = await get_websocket_client(
+            url=client.base_url,
+            token=client.token,
+            verify_ssl=getattr(client, "verify_ssl", None),
+        )
         raw = await ws.send_command(WS_ENTITY_LOOKUP, **kwargs)
     except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
         if is_unknown_command(exc):
@@ -125,9 +127,9 @@ async def fetch_entity_lookup_via_component(
         else:
             logger.warning("%s failed; fell back to legacy: %r", WS_ENTITY_LOOKUP, exc)
         return None
-    except Exception as exc:
-        # HomeAssistantConnectionError: a pooled-WS drop or a failed
-        # (re)connect.
+    except Exception as exc:  # noqa: BLE001
+        # HomeAssistantConnectionError (a pooled-WS drop or a failed
+        # (re)connect) or any other error.
         # The resolvers' legacy paths do NOT die identically (see module docstring),
         # so route to legacy rather than escape.
         logger.warning(
@@ -145,67 +147,111 @@ async def fetch_entity_lookup_via_component(
     return matches
 
 
-async def fetch_reference_data_via_component(
-    client: Any, *, include_states: bool = True
-) -> dict[str, Any] | None:
-    """One ``ha_mcp_tools/reference_data`` read; ``None`` ⇒ use the legacy path.
+async def scenes_with_id(client: Any, scene_id: str) -> list[dict[str, Any]] | None:
+    """The ``homeassistant`` scenes Core registered under ``scene_id``, each
+    with ``loaded``; None when the component does not answer or lacks
+    ``entity_lookup_loaded``, also when a scene row of the answer lacks
+    ``loaded`` (an older component on a connection opened after the check)."""
+    if not await component_serves(client, ENTITY_LOOKUP_LOADED):
+        return None
+    matches = await fetch_entity_lookup_via_component(client, scene_id, domain="scene")
+    if matches is None:
+        return None
+    rows = [m for m in matches if m.get("platform") == "homeassistant"]
+    return None if any("loaded" not in m for m in rows) else rows
 
-    Returns ``{"services": <REST /api/services list shape>, "entity_ids":
-    [...]}`` — the service catalog ``build_service_index`` consumes verbatim and
-    the entity-id universe ``build_entity_set`` reduces to a set — replacing the
-    reference validator's ``asyncio.gather(get_services(), get_states())``.
-    ``include_states=False`` suppresses the entity-id half (services only).
 
-    ``None`` on capability miss, downgrade (``unknown_command`` → invalidate the
-    cached caps), command error/timeout (logged), a connection-establishment
-    failure (logged — see below), or a shape-drift payload (``services`` /
-    ``entity_ids`` not both lists) — the caller falls back to the legacy REST
-    fetches.
+_INSTALL_HINT = (
+    "install the ha_mcp_tools component via the Marketplace and restart Home Assistant"
+)
 
-    Like every component fetch helper, a transport failure routes to ``None``
-    (→ legacy REST) rather than escaping; the reference validator's legacy path is
-    the REST ``get_services()`` / ``get_states()`` pair. The catch stays broad
-    so no unexpected fault escapes: that would make ``validate_config_references``
-    hit its swallow-all fetch guard and skip ALL reference warnings even when
-    REST is up.
-    Mirrors ``get_component_caps``' own broad-catch precedent.
+
+def _unavailable(error: str) -> dict[str, Any]:
+    return {"status": "unavailable", "error": error}
+
+
+def _answer_shape_error(result: Any) -> str | None:
+    """Why *result* is not a ``config_references`` answer, or None if it is."""
+    if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+        return "no status"
+    if result["status"] != "ok":
+        return None if result.get("error") else "no error for a failed check"
+    fields = {
+        "missing": ("kind", "value"),
+        "mismatches": ("path", "kind", "name", "entity_id"),
+    }
+    for key, strings in fields.items():
+        items = result.get(key)
+        if not isinstance(items, list) or not all(
+            isinstance(item, dict)
+            and all(isinstance(item.get(k), str) for k in strings)
+            and (
+                key != "mismatches"
+                or (
+                    isinstance(item.get("offered"), list)
+                    and all(isinstance(o, str) for o in item["offered"])
+                )
+            )
+            for item in items
+        ):
+            return f"malformed {key}"
+    return None
+
+
+async def fetch_config_references_via_component(
+    client: Any, kind: str, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Core's verdict on *config*'s references, through ``ha_mcp_tools/config_references``.
+
+    The component validates *config* (an automation, script or scene, per
+    *kind*) with Core, collects its references with Core's helpers, checks them
+    against Core's registries and puts each entity target to Core's target
+    lookups. It answers ``{"status": "ok", "missing": [...], "mismatches":
+    [...]}``, ``{"status": "invalid", "error": ...}`` when Core's validator
+    refuses the config, or ``{"status": "unavailable", "error": ...}``. An
+    absent or outdated component, a command or transport failure and an answer
+    of the wrong shape are answered the same unavailable way, naming the cause:
+    the write goes on and the caller reports the references as unchecked. There
+    is no REST/WebSocket fallback by design: Core serves the target lookups,
+    ``validate_config`` for a config's trigger, condition and action lists, and
+    the registries over its API, but does not collect an unsaved config's
+    references, which is where the check starts; a server-side copy of that
+    part is the walker this replaced.
     """
     caps = await get_component_caps(client)
-    if not component_supports(caps, "reference_data"):
-        return None
-    kwargs: dict[str, Any] = {}
-    if not include_states:
-        kwargs["include_states"] = False
+    if caps is None:
+        return _unavailable(
+            "references were not checked: Home Assistant checks them through the "
+            "ha_mcp_tools component, which is not installed or did not answer; "
+            + _INSTALL_HINT
+        )
+    outdated = _unavailable(
+        "references were not checked: the installed ha_mcp_tools component "
+        "predates the reference check; update it via the Marketplace"
+    )
+    if not component_supports(caps, CONFIG_REFERENCES):
+        return outdated
     try:
-        ws = await get_websocket_client(url=client.base_url, token=client.token)
-        raw = await ws.send_command(WS_REFERENCE_DATA, **kwargs)
+        ws = await get_websocket_client(
+            url=client.base_url,
+            token=client.token,
+            verify_ssl=getattr(client, "verify_ssl", None),
+        )
+        raw = await ws.send_command(WS_CONFIG_REFERENCES, kind=kind, config=config)
     except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
         if is_unknown_command(exc):
             invalidate_caps(client)
-        else:
-            logger.warning("%s failed; fell back to legacy: %r", WS_REFERENCE_DATA, exc)
-        return None
+            return outdated
+        logger.warning("%s failed: %r", WS_CONFIG_REFERENCES, exc)
+        return _unavailable(str(exc) or type(exc).__name__)
     except Exception as exc:
-        # Legacy is REST (get_services/get_states), NOT the pooled WS, so a
-        # pooled-WS drop or a failed (re)connect must route to the REST fetch
-        # rather than escape into the validator's swallow-all guard (which would
-        # skip every reference warning).
-        logger.warning(
-            "%s connection error; falling back to REST legacy: %r",
-            WS_REFERENCE_DATA,
-            exc,
-        )
-        return None
+        # A soft check must never abort the write it accompanies.
+        logger.warning("%s connection error", WS_CONFIG_REFERENCES, exc_info=True)
+        return _unavailable(str(exc) or type(exc).__name__)
     result = raw.get("result")
-    if (
-        not isinstance(result, dict)
-        or not isinstance(result.get("services"), list)
-        or not isinstance(result.get("entity_ids"), list)
+    if (shape := _answer_shape_error(result)) is not None or not isinstance(
+        result, dict
     ):
-        logger.debug(
-            "%s returned a malformed result (services/entity_ids not both lists); "
-            "falling back to legacy",
-            WS_REFERENCE_DATA,
-        )
-        return None
+        logger.warning("%s answered with %s: %r", WS_CONFIG_REFERENCES, shape, result)
+        return _unavailable(f"{WS_CONFIG_REFERENCES} answered with {shape}")
     return result

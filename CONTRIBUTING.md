@@ -5,15 +5,19 @@ Thank you for your interest in contributing!
 ## 🚀 Quick Start
 
 1. **Fork and clone** the repository
-2. **Install**: `uv sync --group dev`
+2. **Install**: `uv sync --group dev`. Two of Home Assistant's integration requirements build from source, so this needs a C++ compiler (`g++` on Debian and Ubuntu, the Xcode command-line tools on macOS).
 3. **Install hooks**: `uv run lefthook install`
-4. **Test**: `uv run pytest tests/src/e2e/ -n2 --dist loadscope -v` (requires Docker)
+4. **Test**: `uv run pytest tests/src/e2e/ -n2 --dist loadscope -v` (requires Docker; the [test commands](docs/agents/development.md#test-commands) list what else the host needs)
 5. **Make changes** and commit
 6. **Open Pull Request**
 
 ## 🧪 Testing
 
-See **[tests/README.md](tests/README.md)**.
+See **[tests/README.md](tests/README.md)**. To try a branch against a live, throwaway Home Assistant (Docker or HAOS) from your fork, see **[docs/dev-ha-env.md](docs/dev-ha-env.md)**.
+
+Follow the [repository testing policy](AGENTS.md#testing-and-verification) and
+[live-review procedure](docs/agents/github-workflow.md#live-testing-in-pr-reviews)
+when preparing a PR's Testing section and reviewing its evidence.
 
 ## 🛠️ Development
 
@@ -29,10 +33,12 @@ uv run lefthook install    # Install git hooks
 uv run ruff format src/ tests/     # Format
 uv run ruff check --fix src/ tests/ # Lint
 uv run mypy src/                   # Type check
+uv run mypy tests/src/unit/ tests/addon/  # Type check the unit and app tests
 uv run ast-grep scan               # AST lint (error handling patterns)
+uv run python scripts/error_wording.py  # No decision by an error's wording
 ```
 
-On every commit, hooks run `ruff check --fix` (lint), `ast-grep scan` (AST lint), `mypy` (type check), and unit tests in parallel via [lefthook](https://github.com/evilmartians/lefthook). The **Ruff Lint** and **AST Lint** CI jobs also enforce these on pull requests; **Ruff Lint** additionally runs `ruff format --check` on changed Python files.
+On every commit, hooks run `ruff check --fix` (lint), `ast-grep scan` (AST lint), `mypy` (type check), and unit tests in parallel via [lefthook](https://github.com/evilmartians/lefthook). When issue-intake files change, they also run the issue-intake tests; when settings UI, consent form or site files change, they run the JSDOM-based UI tests. On pull requests the **Fast Checks** CI job re-runs the lint, AST lint and type checks, plus `ruff format --check` on changed Python files, the `uv.lock` sync check, the HA-core constraint-alignment check, the docs-size check, the check that no test is exempted from the real-Core checks, the check that no public name is used only by the tests, the check that no test reaches a private name through a string, the check that no test stands in for a real integration under its name, the check that no production code decides by the wording of an error, and HACS and Hassfest validation. Unit tests run in the separate **Unit Tests** job.
 
 ## 🔄 Migrating from pre-commit to lefthook
 
@@ -46,9 +52,18 @@ uv run lefthook install --reset-hooks-path
 
 ## 📋 Guidelines
 
-- **Code**: Follow existing patterns, add type hints, test new features
+- **Code**: Follow existing patterns, add type hints (under `tests/` only the Home Assistant fixtures a unit test takes need them), test new features
 - **Docs**: Update README.md for user-facing changes
 - **PRs**: Use the template, ensure tests pass
+- **Bot reviews**: Address every CodeRabbit finding, inline and top-level.
+  CodeRabbit nests some findings (Outside diff range, Nitpick) inside
+  collapsed sections of its review bodies rather than inline threads — read
+  the full bodies. See the [GitHub workflow reference](docs/agents/github-workflow.md#review-comments) for the sweep
+- **Translations**: A language ships on all four translated surfaces or not at
+  all. Read `src/ha_mcp/settings_ui/locales/README.md` first. Changing an
+  English string owes no translations — the post-merge locale-sync workflow
+  machine-fills them daily, and its verification rejects a catalog left
+  byte-identical to English
 
 ## 💤 Abandoned PRs
 
@@ -63,7 +78,7 @@ take over the PR (push to it or supersede it) or close it.
 
 ## 🏗️ Stuck?
 
-- Open an [Issue](../../issues).
+- Open an [Issue](../../issues). Bug and agent-behavior reports need the whole report the `ha_report_issue` tool generates, run in the session where the problem happened, or a `### Why there is no ha_report_issue report` section saying why there is none ("N/A" is accepted). Without either, the issue is labeled `missing bug report output` and closed after 24 hours. For a feature request, ask your agent to do what you want first and run the tool when it cannot: the report helps find gaps.
 - See **[AGENTS.md](AGENTS.md)** for additional tips.
 
 Thank you for contributing! 🎉

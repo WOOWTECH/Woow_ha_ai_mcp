@@ -220,14 +220,16 @@ class HomeAssistantTestEnvironment:
         cmd = [sys.executable, "-m", "pytest", "tests/src/e2e/", "-v", "--tb=short"]
 
         try:
-            result = subprocess.run(cmd, env=env, cwd=Path(__file__).parent.parent)
+            result = subprocess.run(
+                cmd, env=env, cwd=Path(__file__).parent.parent, check=False
+            )
             if result.returncode == 0:
                 logger.info("✅ All tests passed!")
             else:
                 logger.warning(f"⚠️ Tests completed with exit code: {result.returncode}")
         except KeyboardInterrupt:
             logger.info("🛑 Test run interrupted by user")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"❌ Error running tests: {e}")
 
     def print_status(self) -> None:
@@ -257,7 +259,7 @@ class HomeAssistantTestEnvironment:
                     print("✅ Ready")
                 else:
                     print(f"⚠️ Status {response.status_code}")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 print("❌ Not accessible")
         else:
             print("🐳 Container Status: Not running")
@@ -348,7 +350,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n🛑 Interrupted by user")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"❌ Error: {e}")
     finally:
         # Cleanup

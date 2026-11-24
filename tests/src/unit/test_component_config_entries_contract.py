@@ -1,166 +1,161 @@
-"""Cross-seam contract test for the ``config_entries`` capability.
+"""``ha_get_integration`` served by the component's ``config_entries`` command.
 
-Wires the REAL component ``_do_config_entries`` (plus its REAL async
-``_config_entries_prep``, which loads the secret-scrub set off the loop)
-underneath the mocked WS transport and drives the REAL ``ha_get_integration``
-tool over it — so a vocabulary/shape drift on either side of the seam fails here
-rather than shipping a component-served response the consumer mis-shapes. Mirrors
-``test_component_readapi_contract.py`` (which owns the other commands and must not
-be edited by parallel tasks); this file is the ``config_entries`` bridge.
-
-It pins three things beyond shape parity: (1) the single/list/include_subentries
-reads are served WITHOUT any OptionsFlow start/abort dance nor
-subentries/list WS call; (2) the resolved-``!secret`` options scrub survives the
-real prep end-to-end; (3) the options-shape caveat — the component path returns
-RAW persisted options (a field never set is absent), which differs from the
-OptionsFlow-derived shape that injects schema defaults.
+The tool runs on the server's own client against a real ``hass`` with the
+``ha_mcp_tools/*`` commands registered; entries are ``MockConfigEntry`` rows.
+Beyond the shape, three things hold: a single, list or subentry read sends none
+of the legacy reads (the REST entry list, ``config_entries/get_single``, an
+options flow started and aborted, ``config_entries/subentries/list``); a
+resolved ``!secret`` in options is redacted; and the options are the stored
+ones, so a field never set is absent, where an options flow's form would show
+its default.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import patch
 
+import probatio
 import pytest
-
-from ha_mcp.tools import component_api, tools_integrations
-from ha_mcp.tools.tools_integrations import options_from_form_flow
-
-from ._component_routing_helpers import patch_ws
-from .test_component_ws_search import (
-    FakeConfig,
-    FakeConfigEntry,
-    FakeHass,
-    FakeSubentry,
-    _FakeEnum,
-    wsapi,
+from homeassistant.config_entries import (
+    ConfigFlowResult,
+    ConfigSubentryDataWithId,
+    OptionsFlow,
 )
-from .test_ha_get_integration_component_routing import (
-    RoutingClient,
-    _build_get_integration,
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import selector
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    MockModule,
+    mock_config_flow,
+    mock_integration,
+    mock_platform,
+)
+from pytest_homeassistant.typing import MockHAClientWebSocket
+
+from ha_mcp.client.rest_client import HomeAssistantClient
+from ha_mcp.tools.component_config_entries import WS_CONFIG_ENTRIES
+from ha_mcp.tools.tools_integrations import (
+    IntegrationTools,
+    fetch_entry_options_with_status,
 )
 
+from ._component_core import ws_result
+from ._mock_flow_integration import options_only_config_flow
 
-def _real_component_ws(hass: FakeHass) -> AsyncMock:
-    """A WS mock whose commands are served by the REAL component functions.
 
-    ``info`` returns the real ``_do_info(hass)`` (so the caps probe sees the real
-    capability list, config_entries included), and ``config_entries`` runs the
-    real ``_config_entries_prep`` (secret load) then the real
-    ``_do_config_entries`` against ``hass``.
-    """
-    ws = AsyncMock()
+@pytest.fixture
+async def client(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> HomeAssistantClient:
+    """The component-served client; ``config`` and ``logger`` answer the legacy
+    reads and the log level."""
+    assert await async_setup_component(hass, "config", {})
+    assert await async_setup_component(hass, "logger", {})
+    return component_core_client
 
-    async def _send(command_type: str, **kwargs: Any) -> dict[str, Any]:
-        if command_type == "ha_mcp_tools/info":
-            return {"success": True, "result": wsapi._do_info(hass)}
-        assert command_type == wsapi.WS_CONFIG_ENTRIES, command_type
-        params = dict(kwargs)
-        extra = await wsapi._config_entries_prep(hass, params)
-        return {
-            "success": True,
-            "result": wsapi._do_config_entries(hass, params, **extra),
-        }
 
-    ws.send_command = AsyncMock(side_effect=_send)
-    return ws
+@pytest.fixture
+def tools(client: HomeAssistantClient) -> IntegrationTools:
+    return IntegrationTools(client)
 
 
 def _entry(
+    hass: HomeAssistant,
     entry_id: str = "cfg1",
     domain: str = "mqtt",
     *,
     options: dict[str, Any] | None = None,
-    subentries: dict[str, Any] | None = None,
-    **kw: Any,
-) -> FakeConfigEntry:
-    return FakeConfigEntry(
-        domain,
+    **kwargs: Any,
+) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=domain,
         title=f"Title {entry_id}",
         options=options if options is not None else {"discovery": True},
         data={"password": "DATA_SECRET"},
         entry_id=entry_id,
-        state=_FakeEnum("loaded"),
-        source="user",
-        supports_options=True,
-        supports_unload=True,
-        subentries=subentries or {},
-        **kw,
+        **kwargs,
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+@contextmanager
+def _legacy_reads(client: HomeAssistantClient) -> Iterator[list[str]]:
+    """The legacy reads the client makes meanwhile, by name."""
+    made: list[str] = []
+    with (
+        patch.object(
+            client, "get_config_entry", wraps=client.get_config_entry
+        ) as single,
+        patch.object(
+            client, "start_options_flow", wraps=client.start_options_flow
+        ) as flow,
+        patch.object(
+            client, "list_config_subentries", wraps=client.list_config_subentries
+        ) as subentries,
+        patch.object(
+            client.httpx_client, "request", wraps=client.httpx_client.request
+        ) as http,
+    ):
+        yield made
+    for name, spy in (
+        ("get_config_entry", single),
+        ("start_options_flow", flow),
+        ("list_config_subentries", subentries),
+    ):
+        made.extend([name] * spy.await_count)
+    made.extend(
+        "rest_entry_list"
+        for call in http.await_args_list
+        if "config_entries/entry" in str(call.args[1])
     )
 
 
-@pytest.fixture(autouse=True)
-def _clear_caps_cache() -> Any:
-    component_api._CAPS_CACHE.clear()
-    component_api._CAPS_LOCKS.clear()
-    component_api._NEGATIVE_CACHE_TS.clear()
-    yield
-    component_api._CAPS_CACHE.clear()
-    component_api._CAPS_LOCKS.clear()
-    component_api._NEGATIVE_CACHE_TS.clear()
+async def test_a_single_entry_is_read_without_a_legacy_read(
+    hass: HomeAssistant, client: HomeAssistantClient, tools: IntegrationTools
+) -> None:
+    _entry(hass)
 
-
-def _no_dance(client: RoutingClient) -> None:
-    """Assert the component read replaced every legacy round-trip."""
-    assert client.start_options_flow_calls == 0
-    assert client.abort_options_flow_calls == 0
-    assert client.get_config_entry_calls == 0
-    assert client.rest_list_calls == 0
-    assert client.list_config_subentries_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_single_entry_contract(tmp_path) -> None:
-    """A real component single-entry read flows through the tool with the entry
-    identity + options, and ZERO OptionsFlow dance."""
-    hass = FakeHass(config_entries=[_entry("cfg1", options={"discovery": True})])
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
-
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(entry_id="cfg1")
+    with _legacy_reads(client) as made:
+        resp = await tools.ha_get_integration(entry_id="cfg1")
 
     assert resp["success"] is True
-    assert resp["entry"]["entry_id"] == "cfg1"
-    assert resp["entry"]["domain"] == "mqtt"
-    assert resp["entry"]["state"] == "loaded"  # ConfigEntryState.value
-    assert resp["entry"]["options"] == {"discovery": True}
+    entry = resp["entry"]
+    assert (entry["entry_id"], entry["domain"], entry["state"]) == (
+        "cfg1",
+        "mqtt",
+        "not_loaded",
+    )
+    assert entry["options"] == {"discovery": True}
     assert resp["log_level"] == "DEFAULT"
     # entry.data (credentials) never leaves the component.
     assert "DATA_SECRET" not in str(resp)
-    _no_dance(client)
-    assert ws.send_command.await_count >= 1
+    assert made == []
 
 
-@pytest.mark.asyncio
-async def test_single_entry_include_subentries_contract(tmp_path) -> None:
-    """include_subentries surfaces the real component's subentry identity rows;
-    the legacy subentries/list WS call never runs."""
-    hass = FakeHass(
-        config_entries=[
-            _entry(
-                "cfg1",
-                subentries={
-                    "sub1": FakeSubentry(
-                        "sub1",
-                        "device",
-                        "Sub One",
-                        unique_id="u1",
-                        data={"k": "SUBSECRET"},
-                    )
-                },
+async def test_subentries_are_their_identity_rows_without_data(
+    hass: HomeAssistant, client: HomeAssistantClient, tools: IntegrationTools
+) -> None:
+    _entry(
+        hass,
+        subentries_data=[
+            ConfigSubentryDataWithId(
+                data={"k": "SUBSECRET"},
+                subentry_id="sub1",
+                subentry_type="device",
+                title="Sub One",
+                unique_id="u1",
             )
-        ]
+        ],
     )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
 
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(entry_id="cfg1", include_subentries=True)
+    with _legacy_reads(client) as made:
+        resp = await tools.ha_get_integration(entry_id="cfg1", include_subentries=True)
 
     assert resp["subentry_count"] == 1
     assert resp["subentries"] == [
@@ -171,203 +166,168 @@ async def test_single_entry_include_subentries_contract(tmp_path) -> None:
             "unique_id": "u1",
         }
     ]
-    # subentry.data is never emitted.
     assert "SUBSECRET" not in str(resp)
-    # subentries were lifted off the entry itself, not left nested.
+    # Lifted off the entry, not left nested in it.
     assert "subentries" not in resp["entry"]
-    _no_dance(client)
+    assert made == []
 
 
-@pytest.mark.asyncio
-async def test_list_contract(tmp_path) -> None:
-    """A real component list read flows through the tool with per-row options and
-    ZERO REST list / OptionsFlow probes."""
-    hass = FakeHass(
-        config_entries=[
-            _entry("c1", domain="mqtt", options={"discovery": True}),
-            _entry("c2", domain="hue", options={"bridge": "x"}),
-        ]
-    )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
+async def test_the_list_carries_each_entrys_options(
+    hass: HomeAssistant, client: HomeAssistantClient, tools: IntegrationTools
+) -> None:
+    _entry(hass, "c1", "mqtt", options={"discovery": True})
+    _entry(hass, "c2", "hue", options={"bridge": "x"})
 
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(include_options=True)
+    with _legacy_reads(client) as made:
+        resp = await tools.ha_get_integration(include_options=True)
 
     by_id = {e["entry_id"]: e for e in resp["entries"]}
     assert by_id["c1"]["options"] == {"discovery": True}
     assert by_id["c2"]["options"] == {"bridge": "x"}
-    assert resp["state_summary"] == {"loaded": 2}
-    _no_dance(client)
+    assert resp["state_summary"] == {"not_loaded": 2}
+    assert made == []
 
 
-@pytest.mark.asyncio
-async def test_list_domain_filter_contract(tmp_path) -> None:
-    """The tool's domain filter is applied server-side by the real component."""
-    hass = FakeHass(
-        config_entries=[
-            _entry("c1", domain="mqtt"),
-            _entry("c2", domain="hue"),
-        ]
-    )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
+async def test_the_domain_filter_is_applied_by_the_component(
+    hass: HomeAssistant, client: HomeAssistantClient, tools: IntegrationTools
+) -> None:
+    _entry(hass, "c1", "mqtt")
+    _entry(hass, "c2", "hue")
 
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(domain="mqtt")
+    with _legacy_reads(client) as made:
+        resp = await tools.ha_get_integration(domain="mqtt")
 
     assert [e["entry_id"] for e in resp["entries"]] == ["c1"]
     assert resp["domain_filter"] == "mqtt"
-    _no_dance(client)
+    assert made == []
 
 
-@pytest.mark.asyncio
-async def test_options_secret_scrub_end_to_end(tmp_path) -> None:
-    """A resolved ``!secret`` in options is redacted through the real prep +
-    _do_config_entries, end-to-end through the tool."""
-    (tmp_path / "secrets.yaml").write_text(
-        "api_password: sup3rsecret\n", encoding="utf-8"
-    )
-    hass = FakeHass(
-        config_entries=[_entry("cfg1", options={"password": "sup3rsecret", "keep": 1})]
-    )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
+async def test_a_resolved_secret_in_options_is_redacted(
+    hass: HomeAssistant, tools: IntegrationTools
+) -> None:
+    path = Path(hass.config.path("secrets.yaml"))
+    await hass.async_add_executor_job(path.write_text, "api_password: sup3rsecret\n")
+    _entry(hass, options={"password": "sup3rsecret", "keep": 1})
 
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(entry_id="cfg1")
+    resp = await tools.ha_get_integration(entry_id="cfg1")
 
     assert resp["entry"]["options"] == {"password": "**redacted**", "keep": 1}
     assert "sup3rsecret" not in str(resp)
 
 
-@pytest.mark.asyncio
-async def test_options_shape_caveat_raw_persisted(tmp_path) -> None:
-    """Options-shape caveat: the component path returns RAW persisted options — a
-    schema field never set is ABSENT — which differs from the OptionsFlow-derived
-    shape that injects the field's default. This pins that the component path is
-    the raw-persisted one (documented in the tool's OPTIONS note)."""
-    # ``enabled`` has a schema default but was never persisted; only
-    # ``scan_interval`` is stored.
-    hass = FakeHass(config_entries=[_entry("cfg1", options={"scan_interval": 30})])
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
+_FLOW_DOMAIN = "options_shape_probe"
 
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(entry_id="cfg1")
 
-    component_options = resp["entry"]["options"]
-    assert component_options == {"scan_interval": 30}
-    assert "enabled" not in component_options  # never-set field is absent
+class _OptionsWithADefault(OptionsFlow):
+    """An options form whose ``enabled`` field has a default."""
 
-    # The OptionsFlow-derived shape over the same entry WOULD inject the default
-    # for the unset field — a different shape. This is the caveat, made explicit.
-    # (The dict below is a synthetic flow-step shape, not a real flow captured
-    # from a live options flow — there's no flow machine in this unit test.)
-    flow_shape = options_from_form_flow(
-        {
-            "type": "form",
-            "data_schema": [
-                {"name": "scan_interval", "description": {"suggested_value": 30}},
-                {"name": "enabled", "default": True},
-            ],
-        }
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        schema = probatio.Schema(
+            {
+                probatio.Optional("scan_interval"): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=3600)
+                ),
+                probatio.Optional("enabled", default=True): selector.BooleanSelector(),
+            }
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                schema, self.config_entry.options
+            ),
+        )
+
+
+async def test_options_are_the_stored_ones_not_the_forms_defaults(
+    hass: HomeAssistant, client: HomeAssistantClient, tools: IntegrationTools
+) -> None:
+    """The tool documents this: a field never set is absent, where the options
+    flow's form, which the legacy read uses, shows its default."""
+    mock_integration(hass, MockModule(_FLOW_DOMAIN))
+    mock_platform(hass, f"{_FLOW_DOMAIN}.config_flow")
+    with mock_config_flow(_FLOW_DOMAIN, options_only_config_flow(_OptionsWithADefault)):
+        entry = _entry(hass, domain=_FLOW_DOMAIN, options={"scan_interval": 30})
+
+        resp = await tools.ha_get_integration(entry_id=entry.entry_id)
+        from_form, read = await fetch_entry_options_with_status(client, entry.entry_id)
+
+    assert resp["entry"]["options"] == {"scan_interval": 30}
+    assert read is True
+    assert from_form == {"scan_interval": 30, "enabled": True}
+
+
+# Stored options with nested dicts (issue #2538).
+_NESTED_OPTIONS = {
+    # DurationSelector values; both carry the same inner keys.
+    "no_data_grace": {"hours": 0, "minutes": 10, "seconds": 0},
+    "retry_timeout": {"hours": 0, "minutes": 5, "seconds": 0},
+    # An options-flow section holding DurationSelector values.
+    "event_durations": {
+        "emergency": {"hours": 1, "minutes": 0, "seconds": 0},
+        "warning": {"hours": 0, "minutes": 15, "seconds": 0},
+    },
+    # A per-platform sub-dict (System Monitor stores its processes this way).
+    "binary_sensor": {"process": ["python3"]},
+    # A stored None, which the options-flow read skips.
+    "fallback_group": None,
+}
+
+
+async def test_a_single_entry_returns_nested_options_where_they_are_stored(
+    hass: HomeAssistant, tools: IntegrationTools
+) -> None:
+    """None of a nested value is copied up to the top level (issue #2538)."""
+    _entry(hass, options=_NESTED_OPTIONS)
+
+    resp = await tools.ha_get_integration(entry_id="cfg1")
+
+    assert resp["entry"]["options"] == _NESTED_OPTIONS
+
+
+async def test_the_list_returns_nested_options_where_they_are_stored(
+    hass: HomeAssistant, tools: IntegrationTools
+) -> None:
+    _entry(hass, "c1", "demo", options=_NESTED_OPTIONS)
+
+    resp = await tools.ha_get_integration(include_options=True)
+
+    assert resp["entries"][0]["options"] == _NESTED_OPTIONS
+
+
+@pytest.mark.parametrize("domain", [None, "sun"])
+async def test_the_type_filter_is_cores_own_match_without_the_rest_list(
+    hass: HomeAssistant,
+    client: HomeAssistantClient,
+    tools: IntegrationTools,
+    domain: str | None,
+) -> None:
+    """``hue`` and ``deconz`` are hubs and ``sun`` a service in their manifests."""
+    _entry(hass, "h1", "hue")
+    _entry(hass, "s1", "sun", options={"elevation": 1})
+    _entry(hass, "d1", "deconz")
+
+    with _legacy_reads(client) as made:
+        resp = await tools.ha_get_integration(
+            domain=domain, integration_type="service", include_options=True
+        )
+
+    assert [e["entry_id"] for e in resp["entries"]] == ["s1"]
+    assert resp["entries"][0]["options"] == {"elevation": 1}
+    assert made == []
+
+
+async def test_a_single_entry_read_does_not_need_cores_type_match(
+    hass: HomeAssistant,
+    component_ws: MockHAClientWebSocket,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit entry_id wins over a mismatching integration type filter."""
+    _entry(hass, "h1", "hue")
+
+    result = await ws_result(
+        component_ws, WS_CONFIG_ENTRIES, entry_id="h1", type_filter=["service"]
     )
-    assert flow_shape == {"scan_interval": 30, "enabled": True}
-    assert flow_shape != component_options
 
-
-@pytest.mark.asyncio
-async def test_single_entry_flattens_option_sections(tmp_path) -> None:
-    """A nested option *section* (a template helper's ``advanced_options``) is
-    additively surfaced at the top level so a consumer can read
-    ``options["availability"]`` directly — while the raw nested section is kept
-    for fidelity. Mirrors the OptionsFlow-derived read's section flattening; the
-    e2e ``test_update_template_sensor_availability`` depends on this top-level
-    key."""
-    availability = "{{ has_value('sensor.demo_temperature') }}"
-    hass = FakeHass(
-        config_entries=[
-            _entry("cfg1", options={"advanced_options": {"availability": availability}})
-        ]
-    )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
-
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(entry_id="cfg1")
-
-    options = resp["entry"]["options"]
-    # Flattened leaf surfaced at the top level ...
-    assert options["availability"] == availability
-    # ... and the raw nested section preserved.
-    assert options["advanced_options"] == {"availability": availability}
-    _no_dance(client)
-
-
-@pytest.mark.asyncio
-async def test_option_section_flatten_no_clobber(tmp_path) -> None:
-    """The section flatten never overwrites an existing top-level option: a
-    nested leaf key colliding with a top-level key keeps the top-level value,
-    and the nested original is still present."""
-    hass = FakeHass(
-        config_entries=[
-            _entry(
-                "cfg1",
-                options={
-                    "availability": "top-level-wins",
-                    "advanced_options": {"availability": "nested-loses"},
-                },
-            )
-        ]
-    )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
-
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(entry_id="cfg1")
-
-    options = resp["entry"]["options"]
-    assert options["availability"] == "top-level-wins"
-    assert options["advanced_options"] == {"availability": "nested-loses"}
-    _no_dance(client)
-
-
-@pytest.mark.asyncio
-async def test_list_flattens_option_sections(tmp_path) -> None:
-    """The list path applies the same additive one-level section flatten per row
-    (raw nested section preserved)."""
-    availability = "{{ has_value('sensor.demo_temperature') }}"
-    hass = FakeHass(
-        config_entries=[
-            _entry(
-                "c1",
-                domain="template",
-                options={"advanced_options": {"availability": availability}},
-            )
-        ]
-    )
-    hass.config = FakeConfig(tmp_path)
-    ws = _real_component_ws(hass)
-    client = RoutingClient()
-    get_integration = _build_get_integration(client)
-
-    with patch_ws(ws, tools_integrations):
-        resp = await get_integration(include_options=True)
-
-    options = resp["entries"][0]["options"]
-    assert options["availability"] == availability
-    assert options["advanced_options"] == {"availability": availability}
-    _no_dance(client)
+    assert [row["entry_id"] for row in result["entries"]] == ["h1"]

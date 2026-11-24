@@ -33,7 +33,7 @@ Re-run the failed story up to 3 times. Agent behavior is non-deterministic, so a
 ```bash
 # Re-run specific story
 uv run python tests/uat/stories/run_story.py \
-  catalog/s01_automation_sunset_lights.yaml \
+  tests/uat/stories/catalog/s01_automation_sunset_lights.yaml \
   --agents gemini \
   --keep-container
 ```
@@ -49,7 +49,7 @@ Run the same story against the baseline version to confirm the regression is rea
 ```bash
 # Run against baseline version
 uv run python tests/uat/stories/run_story.py \
-  catalog/s01_automation_sunset_lights.yaml \
+  tests/uat/stories/catalog/s01_automation_sunset_lights.yaml \
   --agents gemini \
   --branch v6.6.1 \
   --keep-container
@@ -66,7 +66,7 @@ Run the same story with a different agent to determine if the regression is code
 ```bash
 # Run with different agent
 uv run python tests/uat/stories/run_story.py \
-  catalog/s01_automation_sunset_lights.yaml \
+  tests/uat/stories/catalog/s01_automation_sunset_lights.yaml \
   --agents claude \
   --keep-container
 ```
@@ -110,7 +110,7 @@ Look at changes in these files first:
 | Changed File | Impact |
 |-------------|--------|
 | `src/ha_mcp/tools/tools_*.py` | Tool behavior changes |
-| `src/ha_mcp/tools/smart_search.py` | Entity search behavior |
+| `src/ha_mcp/tools/smart_search/` | Entity search behavior |
 | `src/ha_mcp/tools/device_control.py` | Device control behavior |
 | `src/ha_mcp/client/rest_client.py` | API interaction changes |
 | `src/ha_mcp/errors.py` | Error message changes |
@@ -146,7 +146,7 @@ Document the regression finding:
 when the automation alias contains spaces, breaking the agent's retry logic.
 
 **Changed files:**
-- `src/ha_mcp/tools/tools_config_automation.py` (lines 45-60)
+- `src/ha_mcp/tools/tools_config_automations.py` (lines 45-60)
 
 **Suggested fix:** Update error message format to preserve backward compatibility.
 ```

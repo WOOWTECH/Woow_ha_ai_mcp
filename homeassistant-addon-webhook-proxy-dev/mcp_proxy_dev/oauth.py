@@ -36,12 +36,16 @@ import secrets
 import time
 from html import escape
 from pathlib import Path
-from typing import Protocol, TypedDict
-from urllib.parse import urlparse
+from typing import Any, TypedDict
+from urllib.parse import unquote_plus
 
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
+
+from .oauth_metadata import MetadataProvider as MetadataProvider
+from .oauth_redirect_allowlist import _is_valid_redirect_uri
+from .readonly_webhook import ENDPOINT_SUFFIXES, endpoint_suffix
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,12 +69,12 @@ SECRET_FILE = Path("/config/.mcp_proxy_dev_oauth_secret")
 DOMAIN = "mcp_proxy_dev"
 
 # TOP-LEVEL hass.data key (deliberately NOT under DOMAIN, so it survives
-# async_unload_entry's hass.data.pop(DOMAIN)) recording that the seven
+# async_unload_entry's hass.data.pop(DOMAIN)) recording that the six
 # discovery-document metadata views are bound to aiohttp for this HA session.
 # HA registers views with no route name and leaves the router unfrozen, so a
 # duplicate registration does NOT raise — aiohttp lets the first-registered
 # path win and silently shadows the later one; HA also can't unregister a bound
-# view until it restarts. So register_metadata_views must bind the seven at
+# view until it restarts. So register_metadata_views must bind the six at
 # most once: a same-mode ha_auth reload, a legacy->ha_auth switch, or a
 # ha_auth->legacy switch all reuse the already-bound views instead of stacking
 # silently-shadowed duplicate routes on every reload/switch.
@@ -82,6 +86,17 @@ DOMAIN = "mcp_proxy_dev"
 # once this dev code promotes to stable.
 _METADATA_VIEWS_REGISTERED_KEY = (
     f"webhook_proxy_oauth_metadata_views_registered_{DOMAIN}"
+)
+
+# Companion to the flag above: the webhook id the bound path-scoped
+# protected-resource view embeds in its URL. HA cannot rebind a view
+# mid-session, so when a later setup arrives with a DIFFERENT id (the operator
+# rotated /data/webhook_id.txt), the scoped URL for the new id cannot exist
+# until HA restarts — register_metadata_views reports that so the caller can
+# raise the restart Repair. Top-level (not under DOMAIN) for the same reason
+# as the flag: it must survive async_unload_entry's hass.data.pop(DOMAIN).
+_METADATA_VIEWS_BOUND_WEBHOOK_ID_KEY = (
+    f"webhook_proxy_oauth_metadata_views_webhook_id_{DOMAIN}"
 )
 
 # OAuth mode markers. Mirrored as auth_native.HA_AUTH_MODE and __init__.py's
@@ -106,6 +121,7 @@ REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60  # 30 days
 AUTH_CODE_TTL = 5 * 60  # 5 minutes
 TOKEN_KIND_ACCESS = "access"
 TOKEN_KIND_REFRESH = "refresh"
+_TOKEN_RESPONSE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 # RFC 7636 §4.1: code_verifier is 43-128 chars from the unreserved URL set.
 PKCE_VERIFIER_MIN = 43
@@ -113,7 +129,7 @@ PKCE_VERIFIER_MAX = 128
 # SHA-256 → 32 bytes → 43 base64url chars (no padding).
 PKCE_S256_CHALLENGE_LEN = 43
 _PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
-_PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_PKCE_CHALLENGE_RE = re.compile(rf"^[A-Za-z0-9_-]{{{PKCE_S256_CHALLENGE_LEN}}}$")
 
 # Pending-code dict cap. An attacker spamming /authorize with valid params
 # could grow the dict between the prune passes that run on each issuance.
@@ -280,68 +296,24 @@ def load_or_create_secret() -> bytes:
     return new_secret
 
 
-def _is_valid_redirect_uri(redirect_uri: str) -> bool:
-    """Spec-floor validation for OAuth redirect_uri: must be an https:// URL
-    with a non-empty host and no fragment. Single-tenant addon — we don't
-    maintain a per-client allowlist, but reject the obvious bad shapes that
-    would let an attacker direct the auth flow to an empty/malformed URL."""
-    if not redirect_uri:
-        return False
-    try:
-        parsed = urlparse(redirect_uri)
-    except ValueError:
-        return False
-    if parsed.scheme != "https":
-        return False
-    if not parsed.hostname:
-        return False
-    # Fragments are not allowed in OAuth redirect URIs (RFC 6749 §3.1.2).
-    return not parsed.fragment
-
-
 def _build_base_url(request: web.Request, public_base_url: str | None = None) -> str:
     """Build the public base URL used in OAuth metadata and redirects.
 
-    When `public_base_url` is provided (the operator-configured
-    `remote_url`/Nabu Casa URL written into proxy_config by start.py),
-    it wins and per-request headers are ignored. This pins canonical
-    URLs to the operator's intent and prevents an attacker who can hit
-    the addon via a forged Host header from poisoning the metadata.
+    When `public_base_url` is provided (the operator-configured `remote_url`/Nabu
+    Casa URL written into proxy_config by start.py) it wins and per-request headers
+    are ignored: canonical URLs follow the operator's intent, so a forged Host
+    header cannot poison the metadata.
 
-    Falls back to X-Forwarded-Proto/Host or request.scheme/Host when
-    no public base URL is configured (e.g. cloudflared/custom proxy
-    setups where start.py couldn't auto-detect the public URL).
+    Falls back to X-Forwarded-Proto/Host, else request.scheme/Host, when no public
+    base URL is configured; a relayed cloudhook MockRequest has no scheme (https).
     """
     if public_base_url:
         return public_base_url.rstrip("/")
     host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
-    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+    scheme = request.headers.get(
+        "X-Forwarded-Proto", getattr(request, "scheme", "https")
+    )
     return f"{scheme}://{host}"
-
-
-class MetadataProvider(Protocol):
-    """Interface the mode-aware discovery-document views need from a provider.
-
-    Satisfied structurally by both `OAuthProvider` (legacy) and
-    `auth_native.ResourceServer` (ha_auth). The views additionally read the
-    implementation's `_hass` via ``getattr`` (see `_active_oauth_mode` /
-    `_active_provider`), which a Protocol cannot express for a private
-    attribute — both implementations carry it.
-    """
-
-    @property
-    def webhook_id(self) -> str:
-        """This install's private webhook id."""
-
-    def resource_url(self, base_url: str) -> str:
-        """Absolute URL of the protected webhook resource under ``base_url``."""
-
-    def authorization_server_url(self, base_url: str) -> str:
-        """Issuer / authorization-server URL under ``base_url``."""
-
-    def base_url_for(self, request: web.Request) -> str:
-        """Public base URL for ``request`` per the provider's policy
-        (legacy: pinned to the configured URL; ha_auth: request-host-derived)."""
 
 
 def _active_oauth_mode(provider: object) -> str | None:
@@ -350,8 +322,10 @@ def _active_oauth_mode(provider: object) -> str | None:
     Read live from hass.data so the SAME registered view instances serve
     whichever mode is active now — e.g. a legacy-bound view after the operator
     switched the add-on to ha_auth, which Home Assistant cannot rebind without a
-    restart. Returns ``MODE_HA_AUTH`` or ``MODE_LEGACY``, or ``None`` when no
-    mode is live — the integration data is gone (the config entry was unloaded)
+    restart. Returns ``MODE_HA_AUTH``, ``MODE_LEGACY``, or
+    ``MODE_NONE_AUTOAPPROVE`` (none-mode auto-approve, issue #1969), or ``None``
+    when no mode is live — the integration data is gone (the config entry was
+    unloaded)
     or present without an ``oauth_mode`` key (reloaded with OAuth turned off) —
     so a stale view can 404 like an unregistered route; HA can't drop the bound
     views until a restart either way. A non-dict ``hass.data[DOMAIN]`` (only
@@ -365,6 +339,52 @@ def _active_oauth_mode(provider: object) -> str | None:
     if not isinstance(domain_data, dict):
         return MODE_LEGACY
     return domain_data.get("oauth_mode")
+
+
+# hass.data persists after the add-on stops (and the persisted proxy config
+# re-populates it at HA boot), so bound OAuth views must verify the add-on
+# itself is running. TCP-probing target_url cannot do that (#2218 review):
+# target_url is the INDEPENDENT ha-mcp server add-on, which keeps accepting
+# connections after this proxy add-on stops. The signal is proxy-owned
+# instead: start.py touches HEARTBEAT_FILE every keep-alive iteration (~30 s)
+# and deletes it on clean shutdown, so a fresh mtime means the add-on process
+# is alive right now — including after a crash bypassed cleanup, where the
+# file simply goes stale.
+HEARTBEAT_FILE = Path("/config/.mcp_proxy_dev_heartbeat")
+_HEARTBEAT_MAX_AGE = 90.0  # three missed 30-second touches
+# Only the NEGATIVE verdict is cached (#2218 review): a clean shutdown deletes
+# the heartbeat file but cannot clear a cache in the integration process, so a
+# cached True would keep the surface serving after the stop. A fresh stat per
+# request while alive is microseconds in the executor; the cache exists so an
+# anonymous flood against a STOPPED install does not stat per request.
+#
+# The lease MUST stay shorter than start.py's `_probe_oauth_active` delay
+# (2 s between 3 attempts): that probe drives a DESTRUCTIVE path — it tears
+# down a working webhook and demands an HA restart when the metadata endpoint
+# looks absent. A request arriving while the add-on was stopped would
+# otherwise leave a lease covering every probe of the next start, so a healthy
+# entry got removed on restart (#2219 codex review).
+_ADDON_DOWN_TTL = 1.0
+_addon_down_state = {"until": 0.0}
+
+
+def _heartbeat_fresh() -> bool:
+    """Blocking mtime check — run in the executor."""
+    try:
+        age = time.time() - HEARTBEAT_FILE.stat().st_mtime
+    except OSError:
+        return False
+    return age < _HEARTBEAT_MAX_AGE
+
+
+async def _addon_alive(hass: HomeAssistant) -> bool:
+    """Return whether the proxy add-on's heartbeat file is fresh."""
+    if time.monotonic() < _addon_down_state["until"]:
+        return False
+    alive = bool(await hass.async_add_executor_job(_heartbeat_fresh))
+    if not alive:
+        _addon_down_state["until"] = time.monotonic() + _ADDON_DOWN_TTL
+    return alive
 
 
 def _active_provider(bound_provider: MetadataProvider) -> MetadataProvider:
@@ -435,13 +455,23 @@ class PKCECodeStore:
         return code
 
     def consume_code(self, code: str, redirect_uri: str, code_verifier: str) -> bool:
-        """One-shot consume ``code``, verifying its PKCE S256 challenge."""
+        """One-shot consume ``code``, verifying its PKCE S256 challenge.
+
+        Returns True only for a live, unexpired code whose stored
+        ``redirect_uri`` matches and whose ``code_challenge`` equals
+        ``base64url(SHA-256(code_verifier))``. The code is popped (one-shot)
+        once the verifier clears the cheap RFC 7636 shape guard below, so every
+        well-formed attempt burns it — a wrong verifier, expired code, or
+        redirect mismatch still consumes the code. A malformed verifier is
+        rejected before the pop and does NOT burn the code, so a client that
+        sends a syntactically broken verifier can retry.
+        """
         # Validate the verifier shape per RFC 7636 §4.1 before doing any
         # crypto. A confused client passing an empty/short verifier should
         # be rejected explicitly rather than silently hashing junk.
         if not (PKCE_VERIFIER_MIN <= len(code_verifier) <= PKCE_VERIFIER_MAX):
             return False
-        if not _PKCE_VERIFIER_RE.match(code_verifier):
+        if not _PKCE_VERIFIER_RE.fullmatch(code_verifier):
             return False
         entry = self._codes.pop(code, None)
         if entry is None:
@@ -524,27 +554,26 @@ class OAuthProvider:
     # View registration
     # -----------------------------------------------------------------
 
-    def register_views(self) -> None:
+    def register_views(self) -> bool:
         """Register the legacy OAuth endpoints with HA's HTTP layer.
 
-        Delegates the seven discovery-document views to the shared,
+        Delegates the six discovery-document views to the shared,
         flag-guarded `register_metadata_views` (which binds them at most once
         per HA session — see `_METADATA_VIEWS_REGISTERED_KEY`), then registers
-        ONLY the two root views (`AuthorizeView` + `TokenView`). ha_auth mode
-        registers just the seven metadata views (HA core is the authorization
-        server, serving its own `/auth/authorize` + `/auth/token`, so the
-        add-on binds no root views); the bare `/authorize` + `/token` here are
-        this add-on's OWN legacy root views. Routing both modes through the same
-        registrar means a legacy<->ha_auth switch or a same-mode reload reuses
-        the already-bound seven instead of stacking silently-shadowed duplicate
-        routes (a duplicate registration does not raise — aiohttp lets the
-        first-registered path win — and HA can't unregister a bound view until
-        it restarts). The two root views stay gated by the caller's route-owner
-        / fingerprint logic in __init__.py.
+        ONLY the two root views (`AuthorizeView` + `TokenView`). The unified
+        scoped authorize/token views are bound separately for every mode and
+        dispatch through these handlers when legacy is live; the bare routes
+        remain compatibility aliases. Routing every mode through the shared
+        metadata registrar avoids silently-shadowed duplicate discovery views.
+        The two root aliases stay gated by the caller's route-owner/fingerprint
+        logic in __init__.py.
+
+        Returns `register_metadata_views`'s restart-needed verdict.
         """
-        register_metadata_views(self._hass, self)
+        restart_needed = register_metadata_views(self._hass, self)
         for view in (AuthorizeView(self), TokenView(self)):
             self._hass.http.register_view(view)
+        return restart_needed
 
     # -----------------------------------------------------------------
     # Token issuance / validation
@@ -644,57 +673,35 @@ class OAuthProvider:
             client_id.encode(), self._client_id.encode()
         ) and hmac.compare_digest(client_secret.encode(), self._client_secret.encode())
 
+    def validate_authorize_params(
+        self,
+        *,
+        response_type: str,
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        code_challenge_method: str,
+    ) -> web.Response | None:
+        """Return an error response when an authorization request is invalid."""
+        if response_type != "code":
+            return _text_error(400, "unsupported_response_type")
+        if code_challenge_method != "S256":
+            return _text_error(400, "invalid code_challenge_method (S256 required)")
+        if not _PKCE_CHALLENGE_RE.fullmatch(code_challenge):
+            return _text_error(
+                400,
+                f"invalid code_challenge (must be {PKCE_S256_CHALLENGE_LEN}-char base64url)",
+            )
+        if client_id != self._client_id:
+            return _text_error(400, "invalid client_id", restart_hint=True)
+        if not _is_valid_redirect_uri(redirect_uri):
+            return _text_error(400, "redirect_uri must be a valid OAuth callback")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
-
-
-class ProtectedResourceMetadataView(HomeAssistantView):
-    """RFC 9728 Protected Resource Metadata (fixed, guessable path)."""
-
-    requires_auth = False
-    cors_allowed = True
-    url = f"{OAUTH_BASE}/protected-resource"
-    name = "mcp_proxy_dev:oauth:protected-resource"
-
-    # SECURITY (#1976 review): this fixed path exposes ``resource:
-    # <base>/api/webhook/<id>``. In none-autoapprove mode the webhook id is the
-    # SOLE credential, so this ANONYMOUS, guessable path must NOT serve it there.
-    # The path-scoped subclass flips this True — its URL already embeds the id,
-    # so its caller must already know it (no leak).
-    _serves_in_none_mode = False
-
-    def __init__(self, provider: MetadataProvider) -> None:
-        self._provider = provider
-
-    async def get(self, request: web.Request) -> web.Response:
-        # The protected-resource document has the same shape in every OAuth
-        # mode; 404 when no mode is live (entry unloaded / OAuth off) so a
-        # stale-bound view acts like an unregistered route. URLs are built via
-        # the ACTIVE mode's provider, not the instance this view was bound with,
-        # so a live mode switch also switches the base-URL policy (legacy:
-        # pinned; ha_auth: host-derived).
-        mode = _active_oauth_mode(self._provider)
-        if mode is None:
-            return _json_not_found()
-        # In none-autoapprove mode only the path-scoped subclass may serve (see
-        # _serves_in_none_mode above); the fixed-path view 404s to avoid leaking
-        # the credential-bearing webhook id anonymously (#1976 review).
-        if mode == MODE_NONE_AUTOAPPROVE and not self._serves_in_none_mode:
-            return _json_not_found()
-        provider = _active_provider(self._provider)
-        base = provider.base_url_for(request)
-        return web.json_response(
-            {
-                "resource": provider.resource_url(base),
-                "authorization_servers": [provider.authorization_server_url(base)],
-                "bearer_methods_supported": ["header"],
-                "resource_documentation": (
-                    "https://github.com/homeassistant-ai/ha-mcp"
-                ),
-            }
-        )
 
 
 class AuthorizationServerMetadataView(HomeAssistantView):
@@ -709,6 +716,9 @@ class AuthorizationServerMetadataView(HomeAssistantView):
         self._provider = provider
 
     async def get(self, request: web.Request) -> web.Response:
+        hass = getattr(self._provider, "_hass", None)
+        if hass is None or not await _addon_alive(hass):
+            return _json_not_found()
         mode = _active_oauth_mode(self._provider)
         if mode is None:
             # No mode is live (entry unloaded / OAuth off) but HA can't drop
@@ -721,9 +731,8 @@ class AuthorizationServerMetadataView(HomeAssistantView):
         provider = _active_provider(self._provider)
         base = provider.base_url_for(request)
         if mode == MODE_HA_AUTH:
-            # HA core is the authorization server: advertise its /auth/* endpoints
-            # + CIMD. Built in auth_native, imported lazily to avoid an import
-            # cycle (auth_native imports this module at load).
+            # HA core authenticates the user behind proxy-owned scoped endpoints.
+            # Built in auth_native, imported lazily to avoid an import cycle.
             from .auth_native import authorization_server_document
 
             return web.json_response(authorization_server_document(base))
@@ -739,8 +748,12 @@ class AuthorizationServerMetadataView(HomeAssistantView):
         return web.json_response(
             {
                 "issuer": as_url,
-                "authorization_endpoint": f"{base}{AUTHORIZE_PATH}",
-                "token_endpoint": f"{base}{TOKEN_PATH}",
+                # RFC 9207 §3: authorization responses carry ``iss`` (the
+                # AuthorizeView redirects); omission reads as "not supported"
+                # to discovery clients.
+                "authorization_response_iss_parameter_supported": True,
+                "authorization_endpoint": f"{base}{OAUTH_BASE}/authorize",
+                "token_endpoint": f"{base}{OAUTH_BASE}/token",
                 "response_types_supported": ["code"],
                 "grant_types_supported": [
                     "authorization_code",
@@ -755,36 +768,85 @@ class AuthorizationServerMetadataView(HomeAssistantView):
         )
 
 
-class WellKnownProtectedResourceView(ProtectedResourceMetadataView):
-    """RFC 9728 §3.1 path-scoped Protected Resource Metadata.
+class WellKnownProtectedResourceView(HomeAssistantView):
+    """RFC 9728 §3.1 metadata for the webhook and its read-only alias.
 
-    Same document as `ProtectedResourceMetadataView`, served at the
-    well-known location derived from the webhook resource URL
-    (`/.well-known/oauth-protected-resource/api/webhook/<id>`). Captured
-    live in issue #1714: when the 401's `WWW-Authenticate`
-    `resource_metadata` pointer is missing (stripped by a proxy in front,
-    or a transient setup window), this path is claude.ai's FIRST fallback
-    probe — and when it 404s the client falls through to the HOST-ROOT
-    `/.well-known/oauth-protected-resource`, which HA core itself serves
-    whenever it can resolve an external URL, steering the flow into
-    HA-core native OAuth (`/auth/authorize`) where the proxy's client_id
-    can never work. Serving this view keeps discovery on the proxy even
-    without the pointer.
+    Served at the well-known location derived from the webhook resource URL
+    (`/.well-known/oauth-protected-resource/api/webhook/<id>`), which is also
+    where the webhook's 401 `resource_metadata` challenge points. Its caller
+    must already hold the id (it is part of the path), so the document never
+    discloses it — that is why there is no fixed-path variant: a fixed,
+    guessable path handed the id to any anonymous GET in ha_auth/legacy mode,
+    and a later switch to none mode then promoted that published value into
+    the sole credential.
+
+    Captured live in issue #1714: when the 401's pointer is missing (stripped
+    by a proxy in front, or a transient setup window), this path is claude.ai's
+    FIRST fallback probe — and when it 404s the client falls through to the
+    HOST-ROOT `/.well-known/oauth-protected-resource`, which HA core itself
+    serves, steering the flow into HA-core native OAuth where the proxy's
+    client_id can never work.
+
+    Exact-path bind, deliberately not a `{webhook_id}` route parameter: aiohttp's
+    `UrlDispatcher.resolve` walks the request path from the most specific
+    segment upwards and consults the resources indexed under each key in turn,
+    so an exact-path resource (indexed under the full path) is tried before a
+    `{webhook_id}` resource (indexed under the prefix) whatever their
+    registration order — registration order only breaks ties between resources
+    sharing one index key. That is what lets this view and the in-process
+    component's parameterised view coexist on one HA (each answers its own id);
+    `tests/src/unit/test_prm_route_precedence.py` pins it against the real
+    router. The cost is that HA cannot
+    rebind this URL when the operator rotates the webhook id mid-session, so
+    `get` 404s once the bound id is no longer the live one (the old URL must
+    not keep serving the NEW id to whoever held the old one), and
+    `register_metadata_views` reports the mismatch so setup raises the
+    click-to-restart Repair that binds the new id's URL.
     """
 
+    requires_auth = False
+    cors_allowed = True
     name = "mcp_proxy_dev:oauth:wellknown-protected-resource"
 
-    # Path-scoped: the URL already embeds the webhook id, so the caller must
-    # already know it — serving in none-autoapprove mode leaks nothing (#1976).
-    # This is the doc claude.ai's none-mode discovery actually uses.
-    _serves_in_none_mode = True
-
     def __init__(self, provider: MetadataProvider) -> None:
-        super().__init__(provider)
+        self._provider = provider
+        self._bound_webhook_id = provider.webhook_id
         # Instance-level URL: the well-known path embeds this install's
         # webhook id, which is only known at runtime.
-        self.url = (
+        self.url: str = (
             f"/.well-known/oauth-protected-resource/api/webhook/{provider.webhook_id}"
+        )
+        self.extra_urls = [f"{self.url}{suffix}" for suffix in ENDPOINT_SUFFIXES]
+
+    async def get(self, request: web.Request) -> web.Response:
+        hass = getattr(self._provider, "_hass", None)
+        if hass is None or not await _addon_alive(hass):
+            return _json_not_found()
+        # Same document shape in every OAuth mode; 404 when no mode is live
+        # (entry unloaded / OAuth off) so a stale-bound view acts like an
+        # unregistered route. URLs are built via the ACTIVE mode's provider,
+        # not the instance this view was bound with, so a live mode switch also
+        # switches the base-URL policy (legacy: pinned; ha_auth: host-derived).
+        if _active_oauth_mode(self._provider) is None:
+            return _json_not_found()
+        provider = _active_provider(self._provider)
+        # The id in this view's URL is no longer the live one: the operator
+        # rotated it. Anyone still holding the OLD id must not learn the new
+        # one here — 404 exactly as an unregistered route would.
+        if provider.webhook_id != self._bound_webhook_id:
+            return _json_not_found()
+        base = provider.base_url_for(request)
+        resource = provider.resource_url(base)
+        resource += endpoint_suffix(request.path, self.url)
+        return web.json_response(
+            {
+                "resource": resource,
+                "authorization_servers": [provider.authorization_server_url(base)],
+                "bearer_methods_supported": ["header"],
+                "resource_documentation": (
+                    "https://github.com/homeassistant-ai/ha-mcp"
+                ),
+            }
         )
 
 
@@ -814,58 +876,37 @@ class WellKnownAuthorizationServerMetadataView(AuthorizationServerMetadataView):
         self.name = name
 
 
-class AuthorizeView(HomeAssistantView):
-    """OAuth /authorize endpoint with a minimal consent page."""
+def _redirect_with_params(redirect_uri: str, **params: str) -> web.Response:
+    """Build a correctly encoded authorization redirect."""
+    import yarl
 
-    requires_auth = False
-    url = AUTHORIZE_PATH
-    name = "mcp_proxy_dev:oauth:authorize"
+    url = yarl.URL(redirect_uri).update_query(params)
+    return web.Response(status=302, headers={"Location": str(url)})
 
-    def __init__(self, provider: OAuthProvider) -> None:
-        self._provider = provider
 
-    @staticmethod
-    def _redirect_with(redirect_uri: str, **params: str) -> web.Response:
-        # yarl ships with aiohttp and handles existing-query-string merging
-        # plus parameter encoding correctly — safer than hand-rolling.
-        import yarl
+async def handle_legacy_authorize_get(
+    provider: OAuthProvider, request: web.Request
+) -> web.Response:
+    """Serve the proxy's legacy consent page from either authorize route."""
+    params = request.query
+    client_id = params.get("client_id", "")
+    redirect_uri = params.get("redirect_uri", "")
+    state = params.get("state", "")
+    code_challenge = params.get("code_challenge", "")
+    code_challenge_method = params.get("code_challenge_method", "")
+    response_type = params.get("response_type", "")
 
-        url = yarl.URL(redirect_uri).update_query(params)
-        return web.Response(
-            status=302,
-            headers={"Location": str(url)},
-        )
+    err = provider.validate_authorize_params(
+        response_type=response_type,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+    )
+    if err is not None:
+        return err
 
-    async def get(self, request: web.Request) -> web.Response:
-        if _active_oauth_mode(self._provider) != MODE_LEGACY:
-            # Serve ONLY when legacy is the live mode. Both ha_auth (HA core is
-            # the authorization server on its own /auth/authorize; this bare
-            # /authorize is the add-on's own legacy view) and None (entry
-            # unloaded / OAuth off) mean this stale-bound root view must not
-            # serve: HA can't rebind or drop root views without a restart, so a
-            # legacy->ha_auth switch OR an unload leaves it bound. Refuse it.
-            return _text_error(404, "not found")
-        params = request.query
-        client_id = params.get("client_id", "")
-        redirect_uri = params.get("redirect_uri", "")
-        state = params.get("state", "")
-        code_challenge = params.get("code_challenge", "")
-        code_challenge_method = params.get("code_challenge_method", "")
-        response_type = params.get("response_type", "")
-
-        err = self._validate_authorize_params(
-            response_type=response_type,
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method,
-        )
-        if err is not None:
-            return err
-
-        # Render minimal consent page. Showing the redirect_uri lets the user
-        # verify the flow goes back to a domain they recognize (claude.ai etc).
-        html = f"""<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -883,7 +924,7 @@ class AuthorizeView(HomeAssistantView):
   <p>An MCP client is requesting access to your Home Assistant MCP server.</p>
   <p>It will redirect to:<br><code>{escape(redirect_uri)}</code></p>
   <p>Only allow this if you started this connection yourself.</p>
-  <form method="POST" action="{AUTHORIZE_PATH}">
+  <form method="POST" action="{escape(request.path)}">
     <input type="hidden" name="client_id" value="{escape(client_id)}">
     <input type="hidden" name="redirect_uri" value="{escape(redirect_uri)}">
     <input type="hidden" name="state" value="{escape(state)}">
@@ -893,76 +934,195 @@ class AuthorizeView(HomeAssistantView):
   </form>
 </body>
 </html>"""
-        return web.Response(text=html, content_type="text/html")
+    return web.Response(text=html, content_type="text/html")
+
+
+async def handle_legacy_authorize_post(
+    provider: OAuthProvider, request: web.Request
+) -> web.Response:
+    """Consume legacy consent and redirect with a one-time authorization code."""
+    data = await read_form(request)
+    if data is None:
+        return _text_error(400, "Invalid form submission")
+    action = str(data.get("action", ""))
+    client_id = str(data.get("client_id", ""))
+    redirect_uri = str(data.get("redirect_uri", ""))
+    state = str(data.get("state", ""))
+    code_challenge = str(data.get("code_challenge", ""))
+
+    err = provider.validate_authorize_params(
+        response_type="code",
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
+    )
+    if err is not None:
+        return err
+
+    active_provider = _active_provider(provider)
+    iss = active_provider.authorization_server_url(
+        active_provider.base_url_for(request)
+    )
+    if action == "deny":
+        return _redirect_with_params(
+            redirect_uri, error="access_denied", state=state, iss=iss
+        )
+    if action != "approve":
+        return _text_error(400, "invalid action")
+
+    code = provider.issue_code(redirect_uri, code_challenge)
+    if code is None:
+        return _redirect_with_params(
+            redirect_uri, error="temporarily_unavailable", state=state, iss=iss
+        )
+    return _redirect_with_params(redirect_uri, code=code, state=state, iss=iss)
+
+
+async def read_form(request: web.Request) -> Any | None:
+    """Parse a form body, or None when the request body is undecodable.
+
+    aiohttp raises LookupError — NOT ValueError — when the Content-Type names
+    an unknown charset, and these views are ANONYMOUS, so an unguarded parse
+    turns one header into a 500 with a traceback (#2219 review round 3).
+    """
+    try:
+        return await request.post()
+    except (ValueError, LookupError):
+        return None
+
+
+def _extract_client_creds(
+    request: web.Request, form: dict
+) -> list[tuple[str | None, str | None]]:
+    """Candidate client credentials from Basic auth or the form body.
+
+    RFC 6749 §2.3.1 form-urlencodes Basic credentials before base64, but many
+    clients skip that step — and the add-on accepts arbitrary CONFIGURED
+    values (``oauth_client_id``/``oauth_client_secret``), so a raw ``+`` or
+    ``%XX`` in a real credential would be mangled by decoding (#2218 review).
+    Both the decoded and the raw split are offered; either may authenticate.
+    """
+    header = request.headers.get("Authorization", "")
+    if header.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(header[6:].strip(), validate=True).decode(
+                "utf-8"
+            )
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            return []
+        if ":" not in decoded:
+            return []
+        client_id, _, client_secret = decoded.partition(":")
+        candidates: list[tuple[str | None, str | None]] = [
+            (unquote_plus(client_id), unquote_plus(client_secret))
+        ]
+        if (client_id, client_secret) != candidates[0]:
+            candidates.append((client_id, client_secret))
+        return candidates
+    # str()-wrapped like every sibling site: request.post() yields
+    # str | bytes | FileField, and the non-str shapes are truthy, so they
+    # would slip past authenticate_client's emptiness guard and raise
+    # AttributeError on .encode() (#2219 review round 3).
+    return [(str(form.get("client_id", "")), str(form.get("client_secret", "")))]
+
+
+async def _handle_authorization_code(
+    provider: OAuthProvider, form: dict
+) -> web.Response:
+    code = str(form.get("code", ""))
+    redirect_uri = str(form.get("redirect_uri", ""))
+    code_verifier = str(form.get("code_verifier", ""))
+    if not (code and redirect_uri and code_verifier):
+        return _json_error("invalid_request", 400)
+    if not provider.consume_code(code, redirect_uri, code_verifier):
+        return _json_error("invalid_grant", 400)
+    return web.json_response(
+        {
+            "access_token": provider.issue_access_token(),
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL,
+            "refresh_token": provider.issue_refresh_token(),
+        },
+        headers=_TOKEN_RESPONSE_HEADERS,
+    )
+
+
+async def _handle_refresh(provider: OAuthProvider, form: dict) -> web.Response:
+    refresh = str(form.get("refresh_token", ""))
+    if not refresh or not provider.validate_refresh_token(refresh):
+        return _json_error("invalid_grant", 400)
+    return web.json_response(
+        {
+            "access_token": provider.issue_access_token(),
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL,
+            "refresh_token": provider.issue_refresh_token(),
+        },
+        headers=_TOKEN_RESPONSE_HEADERS,
+    )
+
+
+async def handle_legacy_token_post(
+    provider: OAuthProvider, request: web.Request
+) -> web.Response:
+    """Serve the proxy's legacy token exchange from either token route."""
+    raw_form = await read_form(request)
+    if raw_form is None:
+        return _json_error("invalid_request", 400)
+    form = dict(raw_form)
+    candidates = _extract_client_creds(request, form)
+    if not any(
+        provider.authenticate_client(client_id, client_secret)
+        for client_id, client_secret in candidates
+    ):
+        return _json_error(
+            "invalid_client",
+            401,
+            headers={"WWW-Authenticate": 'Basic realm="MCP Proxy OAuth"'},
+            restart_hint=True,
+        )
+    grant_type = form.get("grant_type", "")
+    if grant_type == "authorization_code":
+        return await _handle_authorization_code(provider, form)
+    if grant_type == "refresh_token":
+        return await _handle_refresh(provider, form)
+    return _json_error("unsupported_grant_type", 400)
+
+
+class AuthorizeView(HomeAssistantView):
+    """OAuth /authorize endpoint with a minimal consent page."""
+
+    requires_auth = False
+    url = AUTHORIZE_PATH
+    name = "mcp_proxy_dev:oauth:authorize"
+
+    def __init__(self, provider: OAuthProvider) -> None:
+        self._provider = provider
+
+    async def get(self, request: web.Request) -> web.Response:
+        if not await _addon_alive(self._provider._hass):
+            return _json_not_found()
+        if _active_oauth_mode(self._provider) != MODE_LEGACY:
+            # Serve ONLY when legacy is the live mode. Both ha_auth (HA core is
+            # the authorization server on its own /auth/authorize; this bare
+            # /authorize is the add-on's own legacy view) and None (entry
+            # unloaded / OAuth off) mean this stale-bound root view must not
+            # serve: HA can't rebind or drop root views without a restart, so a
+            # legacy->ha_auth switch OR an unload leaves it bound. Refuse it.
+            return _text_error(404, "not found")
+        return await handle_legacy_authorize_get(self._provider, request)
 
     async def post(self, request: web.Request) -> web.Response:
+        if not await _addon_alive(self._provider._hass):
+            return _json_not_found()
         if _active_oauth_mode(self._provider) != MODE_LEGACY:
             # Serve ONLY when legacy is live (see the GET defense above): ha_auth
             # (HA core is the authorization server on its own /auth/authorize;
             # this bare /authorize is the add-on's own legacy view) and the
             # unloaded/None case both 404.
             return _text_error(404, "not found")
-        data = await request.post()
-        action = str(data.get("action", ""))
-        client_id = str(data.get("client_id", ""))
-        redirect_uri = str(data.get("redirect_uri", ""))
-        state = str(data.get("state", ""))
-        code_challenge = str(data.get("code_challenge", ""))
-
-        # Re-validate everything from the form — never trust hidden fields.
-        # response_type/method aren't carried on the POST so we hard-code
-        # the spec values here; the validator still applies all the same
-        # rules to the user-influenceable fields.
-        err = self._validate_authorize_params(
-            response_type="code",
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
-            code_challenge_method="S256",
-        )
-        if err is not None:
-            return err
-
-        if action == "deny":
-            return self._redirect_with(redirect_uri, error="access_denied", state=state)
-        if action != "approve":
-            return _text_error(400, "invalid action")
-
-        code = self._provider.issue_code(redirect_uri, code_challenge)
-        if code is None:
-            # Pending-code store at cap → signal back to the client per
-            # RFC 6749 §4.1.2.1 instead of silently failing.
-            return self._redirect_with(
-                redirect_uri, error="temporarily_unavailable", state=state
-            )
-        return self._redirect_with(redirect_uri, code=code, state=state)
-
-    def _validate_authorize_params(
-        self,
-        *,
-        response_type: str,
-        client_id: str,
-        redirect_uri: str,
-        code_challenge: str,
-        code_challenge_method: str,
-    ) -> web.Response | None:
-        """Return a 400 web.Response if any /authorize param is invalid,
-        or None if all checks pass. Centralized so GET and POST share
-        identical validation — the POST path explicitly re-validates the
-        hidden form fields rather than trusting them."""
-        if response_type != "code":
-            return _text_error(400, "unsupported_response_type")
-        if code_challenge_method != "S256":
-            return _text_error(400, "invalid code_challenge_method (S256 required)")
-        if not _PKCE_CHALLENGE_RE.match(code_challenge):
-            return _text_error(
-                400, "invalid code_challenge (must be 43-char base64url)"
-            )
-        if client_id != self._provider.client_id:
-            return _text_error(400, "invalid client_id", restart_hint=True)
-        if not _is_valid_redirect_uri(redirect_uri):
-            return _text_error(400, "redirect_uri must be an https:// URL with a host")
-        return None
+        return await handle_legacy_authorize_post(self._provider, request)
 
 
 class TokenView(HomeAssistantView):
@@ -976,26 +1136,9 @@ class TokenView(HomeAssistantView):
     def __init__(self, provider: OAuthProvider) -> None:
         self._provider = provider
 
-    @staticmethod
-    def _extract_client_creds(
-        request: web.Request, form: dict
-    ) -> tuple[str | None, str | None]:
-        """Pull client_id/secret from Basic auth header OR form body."""
-        header = request.headers.get("Authorization", "")
-        if header.lower().startswith("basic "):
-            try:
-                decoded = base64.b64decode(header[6:].strip(), validate=True).decode(
-                    "utf-8"
-                )
-            except (ValueError, UnicodeDecodeError, binascii.Error):
-                return None, None
-            if ":" in decoded:
-                cid, _, sec = decoded.partition(":")
-                return cid, sec
-            return None, None
-        return form.get("client_id"), form.get("client_secret")
-
     async def post(self, request: web.Request) -> web.Response:
+        if not await _addon_alive(self._provider._hass):
+            return _json_not_found()
         if _active_oauth_mode(self._provider) != MODE_LEGACY:
             # Serve ONLY when legacy is live. Both ha_auth (HA core is the
             # authorization server on its own /auth/token; this bare /token is
@@ -1003,52 +1146,7 @@ class TokenView(HomeAssistantView):
             # mint tokens from this stale-bound view (see AuthorizeView for the
             # switch scenario).
             return _json_not_found()
-        form = dict(await request.post())
-        client_id, client_secret = self._extract_client_creds(request, form)
-        if not self._provider.authenticate_client(client_id, client_secret):
-            return _json_error(
-                "invalid_client",
-                401,
-                headers={"WWW-Authenticate": 'Basic realm="MCP Proxy OAuth"'},
-                restart_hint=True,
-            )
-
-        grant_type = form.get("grant_type", "")
-        if grant_type == "authorization_code":
-            return await self._handle_authorization_code(form)
-        if grant_type == "refresh_token":
-            return await self._handle_refresh(form)
-        return _json_error("unsupported_grant_type", 400)
-
-    async def _handle_authorization_code(self, form: dict) -> web.Response:
-        code = str(form.get("code", ""))
-        redirect_uri = str(form.get("redirect_uri", ""))
-        code_verifier = str(form.get("code_verifier", ""))
-        if not (code and redirect_uri and code_verifier):
-            return _json_error("invalid_request", 400)
-        if not self._provider.consume_code(code, redirect_uri, code_verifier):
-            return _json_error("invalid_grant", 400)
-        return web.json_response(
-            {
-                "access_token": self._provider.issue_access_token(),
-                "token_type": "Bearer",
-                "expires_in": ACCESS_TOKEN_TTL,
-                "refresh_token": self._provider.issue_refresh_token(),
-            }
-        )
-
-    async def _handle_refresh(self, form: dict) -> web.Response:
-        refresh = str(form.get("refresh_token", ""))
-        if not refresh or not self._provider.validate_refresh_token(refresh):
-            return _json_error("invalid_grant", 400)
-        return web.json_response(
-            {
-                "access_token": self._provider.issue_access_token(),
-                "token_type": "Bearer",
-                "expires_in": ACCESS_TOKEN_TTL,
-                "refresh_token": self._provider.issue_refresh_token(),
-            }
-        )
+        return await handle_legacy_token_post(self._provider, request)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,17 +1155,16 @@ class TokenView(HomeAssistantView):
 
 
 def _metadata_views(provider: MetadataProvider) -> list[HomeAssistantView]:
-    """Build the seven discovery-document views bound to ``provider``.
+    """Build the six discovery-document views bound to ``provider``.
 
-    The canonical protected-resource + authorization-server documents, the
-    path-scoped protected-resource document, and the four RFC 8414 / OIDC
-    well-known authorization-server locations (issue #1714). These serve the
-    same content in both OAuth modes (the AS view dispatches per-request); the
-    root `AuthorizeView` + `TokenView` are legacy-only and added by
-    `OAuthProvider.register_views`, never here.
+    The path-scoped protected-resource document, the authorization-server
+    document, and the four RFC 8414 / OIDC well-known authorization-server
+    locations (issue #1714). These serve the same content in both OAuth modes
+    (the AS view dispatches per-request); the root `AuthorizeView` +
+    `TokenView` are legacy-only and added by `OAuthProvider.register_views`,
+    never here.
     """
     views: list[HomeAssistantView] = [
-        ProtectedResourceMetadataView(provider),
         AuthorizationServerMetadataView(provider),
         WellKnownProtectedResourceView(provider),
     ]
@@ -1095,31 +1192,45 @@ def _metadata_views(provider: MetadataProvider) -> list[HomeAssistantView]:
     return views
 
 
-def register_metadata_views(hass: HomeAssistant, provider: MetadataProvider) -> None:
-    """Register ONLY the seven discovery-document views (ha_auth mode).
+def register_metadata_views(hass: HomeAssistant, provider: MetadataProvider) -> bool:
+    """Register the six shared OAuth discovery-document views.
 
-    ha_auth serves just these — Home Assistant core is the authorization server,
-    serving its own `/auth/authorize` + `/auth/token`, so the add-on binds no
-    root views (the bare `/authorize` + `/token` are the legacy flavor's own
-    root views) and no HA restart is ever needed to enable or disable the mode.
-    ``provider`` is an `auth_native.ResourceServer` (ha_auth) or an
-    `OAuthProvider` (legacy, which routes its seven views through here); the
-    views read its `base_url_for`, `resource_url`, `authorization_server_url`,
-    `webhook_id`, and `_hass` (read by `_active_oauth_mode` AND
-    `_active_provider` for per-request mode/provider dispatch).
+    ``provider`` is an `auth_native.ResourceServer` (ha_auth), an
+    `OAuthProvider` (legacy, which routes its views through here) or the
+    none-mode `AutoApproveProvider`; the views read its `base_url_for`,
+    `resource_url`, `authorization_server_url`, `webhook_id`, and `_hass`
+    (read by `_active_oauth_mode` AND `_active_provider` for per-request
+    mode/provider dispatch).
 
-    Idempotent per HA session: the seven views bind at most once — a same-mode
-    reload or a legacy<->ha_auth switch reuses the already-bound views rather
-    than stacking silently-shadowed duplicate routes (a duplicate registration
-    does not raise — aiohttp lets the first-registered path win — and HA can't
-    drop a bound view until it restarts). The guard flag lives at a top-level
-    hass.data key so it survives async_unload_entry's pop(DOMAIN).
+    Idempotent per HA session: the six views bind at most once — a same-mode
+    reload or a mode switch reuses the already-bound views rather than
+    stacking silently-shadowed duplicates (a duplicate registration does not
+    raise — aiohttp lets the first-registered path win — and HA can't drop a
+    bound view until it restarts). Both guard keys live at top-level
+    hass.data keys so they survive async_unload_entry's pop(DOMAIN).
+
+    Returns True when the already-bound path-scoped protected-resource view
+    embeds a DIFFERENT webhook id than ``provider`` carries — the operator
+    rotated the id mid-session, so the new id's discovery URL cannot be bound
+    until HA restarts (the old one already 404s). The caller surfaces that as
+    the restart Repair. False on a fresh bind or an unchanged id.
     """
     if hass.data.get(_METADATA_VIEWS_REGISTERED_KEY):
-        return
+        bound_id = hass.data.get(_METADATA_VIEWS_BOUND_WEBHOOK_ID_KEY)
+        if bound_id != provider.webhook_id:
+            _LOGGER.warning(
+                "MCP Proxy: the webhook id changed since the OAuth discovery "
+                "views were bound this session; the discovery URL for the new "
+                "id is served only after a Home Assistant restart (the old "
+                "id's URL no longer answers)."
+            )
+            return True
+        return False
     for view in _metadata_views(provider):
         hass.http.register_view(view)
     hass.data[_METADATA_VIEWS_REGISTERED_KEY] = True
+    hass.data[_METADATA_VIEWS_BOUND_WEBHOOK_ID_KEY] = provider.webhook_id
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1133,14 +1244,20 @@ def build_unauthorized_response(
     """Build the 401 + WWW-Authenticate response that MCP clients use to
     discover the OAuth endpoints.
 
-    Per RFC 9728 §5.1 / MCP 2025-06-18 spec: WWW-Authenticate's
-    resource_metadata parameter points to the protected-resource metadata
-    URL, where the client finds the authorization server URL. We use the
-    provider's configured public base URL (when set) so the metadata URL
-    isn't built from attacker-supplied Host headers.
+    Per RFC 9728 §5.1 / MCP 2026-07-28 Authorization Server Discovery:
+    WWW-Authenticate's resource_metadata parameter points to the
+    protected-resource metadata URL, where the client finds the authorization
+    server URL. We use the provider's configured public base URL (when set) so
+    the metadata URL isn't built from attacker-supplied Host headers.
     """
     base = provider.base_url_for(request)
-    metadata_url = f"{base}{OAUTH_BASE}/protected-resource"
+    # RFC 9728 §3.1 path-scoped location: the pointer names the id, but this
+    # 401 is only ever produced on a request TO /api/webhook/<id>, so the
+    # caller already holds it. There is no fixed-path document to point at —
+    # see WellKnownProtectedResourceView for why.
+    path = f"/api/webhook/{provider.webhook_id}"
+    suffix = endpoint_suffix(getattr(request, "path", ""), path)
+    metadata_url = f"{base}/.well-known/oauth-protected-resource{path}{suffix}"
     return web.Response(
         status=401,
         text="Unauthorized",

@@ -2,9 +2,9 @@
 """Build the HAOS test image used by the HAOS E2E tier (#1281).
 
 The script boots a vanilla HAOS qcow2 inside QEMU/KVM, runs first-user
-onboarding to obtain a long-lived access token, registers the ha-mcp addon
-repository, installs the addons listed in ``ADDONS``, performs the HACS
-bootstrap, then powers HAOS off and emits an uncompressed qcow2 image.
+onboarding to obtain OAuth credentials, registers the ha-mcp app (add-on)
+repository, installs the apps listed in ``ADDONS``, then powers HAOS off and
+emits an uncompressed qcow2 image.
 
 Invoke from a Linux host with /dev/kvm available — both the local developer
 flow and the build-haos-test-image.yml workflow follow the same path. The
@@ -19,28 +19,46 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from websockets.sync.client import ClientConnection
+if TYPE_CHECKING or __package__:  # imported by the unit tests (and mypy)
+    from .dev_addon_tree import stage_dev_addon_tree
+    from .python_base import copy_addon_tree
+    from .supervisor_logs import log_supervisor_tail
+else:  # python3 tests/haos_image_build/build_image.py
+    from dev_addon_tree import stage_dev_addon_tree
+    from python_base import copy_addon_tree
+    from supervisor_logs import log_supervisor_tail
 
 LOG = logging.getLogger("haos_image_build")
 
-# Pin both the HAOS release and the addon set. Renovate watches the comment
-# annotation below for the HAOS bump; the addon list is hand-curated in #1281
-# and intentionally short for v1. Once the canary is stable, follow-up PRs can
-# expand the list and migrate more existing E2E tests over.
-#
-# renovate: datasource=github-releases depName=home-assistant/operating-system
-HAOS_VERSION = "18.1"
+# Stable image inputs are Renovate-managed; changing any pin invalidates the
+# shared image cache. Beta lanes explicitly override all three at build time.
+# renovate: datasource=custom.ha-os-stable depName=home-assistant/operating-system
+STABLE_HAOS_VERSION = "18.4"
+# renovate: datasource=custom.ha-supervisor-stable depName=home-assistant/supervisor
+STABLE_SUPERVISOR_VERSION = "2026.11.0"
+# renovate: datasource=docker depName=ghcr.io/home-assistant/home-assistant
+STABLE_CORE_VERSION = "2026.11.3"
+
+HAOS_VERSION = os.environ.get("HAOS_BUILD_OS_VERSION", STABLE_HAOS_VERSION)
+if re.fullmatch(r"[0-9]+\.[0-9]+(?:\.rc[0-9]+)?", HAOS_VERSION) is None:
+    raise ValueError(f"Invalid HAOS version: {HAOS_VERSION!r}")
 HAOS_QCOW2_URL = (
     f"https://github.com/home-assistant/operating-system/releases/download/"
     f"{HAOS_VERSION}/haos_ova-{HAOS_VERSION}.qcow2.xz"
@@ -61,6 +79,13 @@ ONBOARDING_NAME = "HA-MCP CI"
 # discover), and CI jobs run single-threaded so collision risk is low.
 # Configurable via env var for the rare parallel-build scenario.
 HA_HOST_PORT = int(os.environ.get("HAOS_BUILD_HA_PORT", "18123"))
+# Forward of guest port 80: HA 2026.8 changed the Supervisor-managed
+# DEFAULT HTTP port from 8123 to 80 (http.config.default_server_port),
+# so a FRESH boot - before bake_test_state seeds the .storage/http
+# store that pins server_port 8123 - answers on 80. The bake probes
+# both. (configuration.yaml deliberately carries no http: block; a YAML
+# block becomes a self-reverting trial on 2026.8.)
+HA_ALT_HOST_PORT = int(os.environ.get("HAOS_BUILD_HA_ALT_PORT", "18124"))
 SSH_HOST_PORT = int(os.environ.get("HAOS_BUILD_SSH_PORT", "12222"))
 
 # OVMF firmware path varies by distribution. Default matches the
@@ -69,6 +94,14 @@ SSH_HOST_PORT = int(os.environ.get("HAOS_BUILD_SSH_PORT", "12222"))
 # HAOS_BUILD_OVMF on other distros (Fedora ships it under /usr/share/edk2,
 # Arch under /usr/share/edk2-ovmf).
 OVMF_CODE_PATH = os.environ.get("HAOS_BUILD_OVMF", "/usr/share/OVMF/OVMF_CODE.fd")
+
+# Stable uses the tracked Supervisor minimum and exact Core pin. Supervisor
+# may self-update past that minimum; beta lanes supply their channel's values.
+SUPERVISOR_CHANNEL = os.environ.get("HAOS_BUILD_SUPERVISOR_CHANNEL", "stable")
+SUPERVISOR_MIN_VERSION = os.environ.get(
+    "HAOS_BUILD_SUPERVISOR_MIN_VERSION", STABLE_SUPERVISOR_VERSION
+)
+CORE_VERSION = os.environ.get("HAOS_BUILD_CORE_VERSION", STABLE_CORE_VERSION)
 
 
 @dataclass(frozen=True)
@@ -94,7 +127,7 @@ class Addon:
 
 
 # HAOS addon set — chosen for minimum image size while covering every
-# ``ha_manage_addon`` access shape exercised by the E2E tier (closes
+# ``ha_manage_app`` access shape exercised by the E2E tier (closes
 # #1350). Each entry below names the unique shape it contributes; if a
 # new addon doesn't add a shape that no other entry covers, it does not
 # belong here.
@@ -136,12 +169,12 @@ ADDONS: tuple[Addon, ...] = (
     ),
     # Matter Server is in the official ``core`` repo (no repo URL needed) and
     # is one of the very few addons that ship with ``ingress_panel=false``,
-    # which is the canonical "hidden sidebar" shape that ``ha_get_addon``
+    # which is the canonical "hidden sidebar" shape that ``ha_get_app``
     # detail needs coverage for.
     Addon(repo=None, name="Matter Server"),
     # AppDaemon contributes the ``ingress=false`` + ``webui`` shape: a port-
     # based UI advertised through the Supervisor ``webui`` field rather than
-    # Ingress. The wire contract for ``ha_get_addon`` reading ``webui`` and
+    # Ingress. The wire contract for ``ha_get_app`` reading ``webui`` and
     # rendering it as a clickable URL is otherwise uncovered.
     Addon(repo="https://github.com/hassio-addons/repository", name="AppDaemon"),
     # MQTT IO replaces Zigbee2MQTT for start-fail coverage. Its schema
@@ -150,16 +183,6 @@ ADDONS: tuple[Addon, ...] = (
     Addon(
         repo="https://github.com/hassio-addons/repository", name="MQTT IO", start=False
     ),
-)
-
-# Get HACS addon — bootstraps HACS into /config/custom_components/.
-# Has to start so it can do its one-shot install before we restart HA Core.
-# Explicit ``start=True`` for visual symmetry with the ADDONS tuple
-# entries; matches Addon's field default but reads more obviously.
-GET_HACS_ADDON = Addon(
-    repo="https://github.com/hacs/addons",
-    name="Get HACS",
-    start=True,
 )
 
 # Advanced SSH & Web Terminal — used by the inaddon CI tier for network
@@ -200,7 +223,7 @@ HA_MCP_TEST_SECRET_PATH = "/mcp_e2e_test_path"
 # session that runs the embedded-server test (the
 # ``tests/src/e2e/haos_only/test_embedded_server_haos.py`` fixture enables it via
 # the ``config_entries/disable`` WS command). The ``pip_spec`` is a placeholder
-# here; the conftest HAOS branch overwrites it with a ``file://`` URL to a wheel
+# here; the _conftest_haos.py HAOS branch overwrites it with a ``file://`` URL to a wheel
 # built from the checkout before boot (haos_runtime.stage_embedded_server_wheel_in_qcow2).
 #
 # These constants MUST stay in sync with tests/src/haos_runtime.py's copies
@@ -216,7 +239,7 @@ HA_MCP_SERVER_WEBHOOK_ID = "mcp_e2e_ha_mcp_server_haos"
 HA_MCP_SERVER_SECRET_PATH = "/private_e2e_ha_mcp_server_haos"
 HA_MCP_SERVER_PORT = 9584
 # Placeholder file:// wheel spec — deliberately points at a nonexistent wheel so
-# that if the conftest delivery step ever fails to overwrite it, the entry's
+# that if the _conftest_haos.py delivery step ever fails to overwrite it, the entry's
 # bring-up fails cleanly (repair issue, webhook never registers) and only the
 # embedded-server test times out, rather than silently installing wrong code.
 HA_MCP_SERVER_PLACEHOLDER_PIP_SPEC = (
@@ -265,7 +288,7 @@ def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=True, text=True, **kwargs)
 
 
-def _http(
+def http(
     method: str,
     url: str,
     *,
@@ -302,7 +325,7 @@ def _http(
         err_body: str = ""
         try:
             err_body = e.read().decode()
-        except (OSError, UnicodeDecodeError):
+        except OSError, UnicodeDecodeError:
             # Closed socket or non-utf8 body — best-effort only; never hide
             # the original HTTPError, which is re-raised below.
             pass
@@ -311,32 +334,97 @@ def _http(
     return json.loads(raw) if raw else {}
 
 
-def _wait_port(port: int, host: str = "127.0.0.1", timeout: float = 180.0) -> None:
+def _attempt_budget(deadline: float, want: float) -> float:
+    """Cap one poll attempt so the loop cannot overrun its own deadline.
+
+    Without this a helper documented as "180s" can run 180 + connect-timeout
+    + sleep, because both are spent AFTER the deadline check. Floored at
+    0.1s: a zero timeout puts the socket into non-blocking mode, turning a
+    legitimate final attempt into an instant spurious failure.
+    """
+    return max(0.1, min(want, deadline - time.monotonic()))
+
+
+def _remaining_deadline_budget(deadline: float, operation: str) -> float:
+    """Return positive time remaining or fail before starting an operation."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"{operation} exceeded its deadline")
+    return remaining
+
+
+def wait_any_port(
+    ports: tuple[int, ...], host: str = "127.0.0.1", timeout: float = 180.0
+) -> int:
+    """Return the first of ``ports`` to accept a connection.
+
+    HA 2026.8 serves guest port 80 under Supervisor and older cores serve
+    8123, and both are forwarded — so gating the boot on ONE of them would
+    burn the whole budget and fail before the base-URL discovery below ever
+    got to look at the other.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2.0)
-            try:
-                s.connect((host, port))
-                return
-            except OSError:
-                time.sleep(2.0)
-    raise TimeoutError(f"{host}:{port} did not open within {timeout}s")
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(_attempt_budget(deadline, 2.0))
+                try:
+                    s.connect((host, port))
+                    return port
+                except OSError:
+                    continue
+        time.sleep(max(0.0, min(2.0, deadline - time.monotonic())))
+    raise TimeoutError(f"none of {host}:{list(ports)} opened within {timeout}s")
 
 
-def _wait_http_ok(url: str, timeout: float = 300.0) -> None:
+def wait_http_ok(url: str, timeout: float = 300.0) -> None:
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=5.0) as resp:
+            with urllib.request.urlopen(
+                url, timeout=_attempt_budget(deadline, 5.0)
+            ) as resp:
                 if resp.status == 200:
                     return
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
             last_err = e
-        time.sleep(3.0)
+        time.sleep(max(0.0, min(3.0, deadline - time.monotonic())))
     raise TimeoutError(
         f"{url} did not become ready within {timeout}s (last: {last_err})"
+    )
+
+
+def discover_ha_base_url(timeout: float = 600.0) -> str:
+    """Return the base URL of whichever forwarded port HA answers on.
+
+    HA 2026.8 changed the Supervisor-managed default HTTP port from 8123 to
+    80 ("Supervisor fronts Core on the standard HTTP port"), so a FRESH
+    boot — before the seeded .storage/http store pinning server_port 8123
+    exists — serves guest port 80, while older cores serve 8123. Probe both
+    forwards and lock onto the responder; every later phase of the bake
+    talks to that base URL.
+    """
+    deadline = time.monotonic() + timeout
+    candidates = (
+        f"http://127.0.0.1:{HA_HOST_PORT}",
+        f"http://127.0.0.1:{HA_ALT_HOST_PORT}",
+    )
+    last_errors: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        for base in candidates:
+            try:
+                with urllib.request.urlopen(
+                    f"{base}/manifest.json", timeout=_attempt_budget(deadline, 5.0)
+                ) as resp:
+                    if resp.status == 200:
+                        LOG.info("HA is answering on %s", base)
+                        return base
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+                last_errors[base] = repr(e)
+        time.sleep(max(0.0, min(3.0, deadline - time.monotonic())))
+    raise TimeoutError(
+        f"HA did not answer on any forwarded port within {timeout}s: {last_errors}"
     )
 
 
@@ -382,6 +470,7 @@ def start_qemu(qcow2: Path, work_dir: Path) -> subprocess.Popen[bytes]:
         f"if=virtio,file={qcow2},format=qcow2",
         "-netdev",
         f"user,id=net0,hostfwd=tcp:127.0.0.1:{HA_HOST_PORT}-:8123,"
+        f"hostfwd=tcp:127.0.0.1:{HA_ALT_HOST_PORT}-:80,"
         f"hostfwd=tcp:127.0.0.1:{SSH_HOST_PORT}-:22",
         "-device",
         "virtio-net-pci,netdev=net0",
@@ -399,7 +488,7 @@ def stop_qemu(proc: subprocess.Popen[bytes], ws: HAWebSocket | None) -> None:
     if ws is not None:
         try:
             ws.supervisor_api("/host/shutdown", method="post", timeout=10.0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             # %r so the exception type is visible — bare %s loses it for
             # most exception subclasses and a future maintainer reading
             # this in CI logs needs to know whether it was a timeout, a
@@ -421,17 +510,22 @@ def stop_qemu(proc: subprocess.Popen[bytes], ws: HAWebSocket | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def onboard(base_url: str) -> str:
-    """Create the first user and return a short-lived access token.
+@dataclass(repr=False)
+class OAuthCredentials:
+    """Refreshable credentials used throughout a potentially long image build."""
 
-    The token only needs to live for the duration of the build session
-    (addon installs, HACS bootstrap, shutdown). The canary test re-derives
-    its own token at runtime by logging in with the known username/password
-    via /auth/login_flow — that way no token needs to be baked into the
-    pre-built qcow2.
+    access_token: str
+    refresh_token: str
+
+
+def onboard(base_url: str) -> OAuthCredentials:
+    """Create the first user and return refreshable OAuth credentials.
+
+    The canary logs in at runtime using the known CI account, so the build does
+    not copy an OAuth access or refresh token value into the emitted qcow2.
     """
     LOG.info("Onboarding first user")
-    resp = _http(
+    resp = http(
         "POST",
         f"{base_url}/api/onboarding/users",
         body={
@@ -443,7 +537,7 @@ def onboard(base_url: str) -> str:
         },
     )
     auth_code = resp["auth_code"]
-    token_resp = _http(
+    token_resp = http(
         "POST",
         f"{base_url}/auth/token",
         # /auth/token uses await request.post() — must be form-encoded.
@@ -455,7 +549,12 @@ def onboard(base_url: str) -> str:
             "code": auth_code,
         },
     )
-    return token_resp["access_token"]
+    # Core answers an authorization code it accepted with both tokens; a code
+    # it refuses is an HTTP error, raised by ``http``.
+    return OAuthCredentials(
+        access_token=token_resp["access_token"],
+        refresh_token=token_resp["refresh_token"],
+    )
 
 
 class HAWebSocket:
@@ -474,28 +573,55 @@ class HAWebSocket:
     procedural build flow doesn't need an asyncio rewrite.
     """
 
-    def __init__(self, base_url: str, token: str) -> None:
+    def __init__(self, base_url: str, credentials: OAuthCredentials) -> None:
+        self._base_url = base_url
         self._ws_url = (
             base_url.replace("http://", "ws://").replace("https://", "wss://")
             + "/api/websocket"
         )
-        self._token = token
-        self._ws = None  # type: ignore[var-annotated]
+        self._credentials = credentials
+        self._ws: ClientConnection | None = None
         self._next_id = 0
 
     def __enter__(self) -> HAWebSocket:
+        self.connect()
+        return self
+
+    def connect(self, *, deadline: float | None = None) -> None:
+        """Open and authenticate a WebSocket within an optional deadline."""
         # Imported lazily so the module still imports on systems without the
         # websockets package (e.g. local lint without the build venv).
         from websockets.sync.client import connect
 
-        self._ws = connect(self._ws_url, open_timeout=30, close_timeout=10)
+        if deadline is None:
+            open_timeout: float = 30
+            close_timeout: float = 10
+        else:
+            remaining = _remaining_deadline_budget(deadline, "WebSocket connect")
+            open_timeout = min(30.0, remaining)
+            close_timeout = min(10.0, remaining)
+        self._ws = connect(
+            self._ws_url,
+            open_timeout=open_timeout,
+            close_timeout=close_timeout,
+        )
         # HA WS handshake: server sends auth_required → client sends auth →
         # server replies auth_ok or auth_invalid.
-        auth_req = json.loads(self._ws.recv())
+        auth_req = json.loads(self._recv_auth_frame(deadline))
         if auth_req.get("type") != "auth_required":
             raise RuntimeError(f"Unexpected WS handshake message: {auth_req}")
-        self._ws.send(json.dumps({"type": "auth", "access_token": self._token}))
-        auth_resp = json.loads(self._ws.recv())
+        auth_message = json.dumps(
+            {"type": "auth", "access_token": self._credentials.access_token}
+        )
+        if deadline is None:
+            self._ws.send(auth_message)
+        else:
+            self.send_with_deadline(
+                auth_message,
+                deadline=deadline,
+                operation="WebSocket authentication send",
+            )
+        auth_resp = json.loads(self._recv_auth_frame(deadline))
         if auth_resp.get("type") != "auth_ok":
             raise RuntimeError(f"WS auth rejected: {auth_resp}")
         LOG.info(
@@ -503,7 +629,15 @@ class HAWebSocket:
             self._ws_url,
             auth_resp.get("ha_version"),
         )
-        return self
+
+    def _recv_auth_frame(self, deadline: float | None) -> str | bytes:
+        """Receive one authentication frame within an optional deadline."""
+        if self._ws is None:
+            raise ConnectionError("WebSocket is not connected for authentication")
+        if deadline is None:
+            return self._ws.recv()
+        budget = _remaining_deadline_budget(deadline, "WebSocket authentication")
+        return self._ws.recv(timeout=budget)
 
     def __exit__(self, *_: object) -> None:
         if self._ws is not None:
@@ -512,14 +646,39 @@ class HAWebSocket:
             except (OSError, RuntimeError) as e:
                 LOG.debug("WS close error (already-closed or transport): %r", e)
 
-    def reconnect(self) -> None:
+    def refresh_access_token(self, *, timeout: float | None = None) -> None:
+        """Exchange the refresh token before opening a replacement WebSocket."""
+        form = {
+            "client_id": self._base_url,
+            "grant_type": "refresh_token",
+            "refresh_token": self._credentials.refresh_token,
+        }
+        if timeout is None:
+            token_resp = http("POST", f"{self._base_url}/auth/token", form=form)
+        else:
+            token_resp = http(
+                "POST",
+                f"{self._base_url}/auth/token",
+                form=form,
+                timeout=timeout,
+            )
+        # Core answers a refresh with a new access token and keeps the refresh
+        # token; a revoked refresh token is an HTTP error, raised by ``http``.
+        self._credentials.access_token = token_resp["access_token"]
+
+    def reconnect(self, *, deadline: float | None = None) -> None:
         """Tear down the current WS and re-establish + re-auth.
 
-        Used after /core/restart: HA Core kicks every WS connection on
-        restart, so any subsequent supervisor_api call needs a fresh
-        connection (the access_token survives the restart).
+        Used after /core/restart: HA Core kicks every WS connection on restart.
+        The initial OAuth access token expires after 30 minutes, so reconnects
+        exchange the retained refresh token before opening and authenticating
+        the replacement socket.
 
-        ``_wait_http_ok(/manifest.json)`` confirms HA Core's HTTP layer
+        When a deadline is supplied, token refresh, socket connection and
+        authentication, readiness probes, and backoff sleeps all share that
+        absolute deadline.
+
+        ``wait_http_ok(/manifest.json)`` confirms HA Core's HTTP layer
         is up before we get here, but Core's WS layer can be accepting
         connections while the ``hassio`` integration is still loading —
         and the ``supervisor/api`` WS command is registered by that
@@ -532,6 +691,8 @@ class HAWebSocket:
         registered, so callers can fire-and-trust their next
         supervisor_api call.
         """
+        if deadline is not None:
+            _remaining_deadline_budget(deadline, "WebSocket reconnect")
         if self._ws is not None:
             try:
                 self._ws.close()
@@ -539,10 +700,20 @@ class HAWebSocket:
                 LOG.debug("WS close error during reconnect: %r", e)
             self._ws = None
         self._next_id = 0
-        self.__enter__()
-        self._wait_supervisor_api_ready()
+        if deadline is None:
+            self.refresh_access_token()
+            self.connect()
+            self.wait_supervisor_api_ready()
+            return
+        self.refresh_access_token(
+            timeout=_remaining_deadline_budget(deadline, "OAuth token refresh")
+        )
+        self.connect(deadline=deadline)
+        self.wait_supervisor_api_ready(
+            timeout=_remaining_deadline_budget(deadline, "Supervisor API readiness")
+        )
 
-    def _wait_supervisor_api_ready(self, timeout: float = 60.0) -> None:
+    def wait_supervisor_api_ready(self, timeout: float = 60.0) -> None:
         """Poll ``supervisor/api`` until Core's dispatcher accepts it.
 
         Probe with the cheapest read-only Supervisor endpoint
@@ -553,12 +724,20 @@ class HAWebSocket:
         keeps a wedged restart from hanging the whole build.
         """
         start = time.monotonic()
+        deadline = start + timeout
         delay = 1.0
         attempts = 0
-        while True:
+        last_error: WSCommandError | None = None
+        while (remaining := deadline - time.monotonic()) > 0:
             attempts += 1
             try:
-                self.supervisor_api("/supervisor/info", method="get", timeout=10.0)
+                self.supervisor_api(
+                    "/supervisor/info",
+                    method="get",
+                    timeout=min(10.0, remaining),
+                )
+                if time.monotonic() >= deadline:
+                    break
                 if attempts > 1:
                     LOG.info(
                         "supervisor/api ready after %d attempts (%.1fs)",
@@ -572,21 +751,86 @@ class HAWebSocket:
                     # renamed endpoint, etc.) — propagate so a regression
                     # isn't masked as "still booting".
                     raise
+                last_error = e
                 elapsed = time.monotonic() - start
-                if elapsed >= timeout:
-                    raise RuntimeError(
-                        f"hassio supervisor/api WS handler did not register "
-                        f"within {timeout:.0f}s after Core restart "
-                        f"(attempts={attempts})"
-                    ) from e
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    break
                 LOG.debug(
                     "Waiting for hassio supervisor/api handler "
                     "(attempt %d, elapsed %.1fs)",
                     attempts,
                     elapsed,
                 )
-                time.sleep(delay)
+                time.sleep(min(delay, remaining))
                 delay = min(delay * 1.5, 5.0)
+        raise TimeoutError(
+            f"hassio supervisor/api WS handler did not register "
+            f"within {timeout:.0f}s after Core restart (attempts={attempts})"
+        ) from last_error
+
+    def _raise_unknown_send_outcome(self, connection: Any, *, operation: str) -> None:
+        """Invalidate a socket after a timed-out send may have been dispatched."""
+        try:
+            connection.close_socket()
+        except (OSError, RuntimeError) as exc:
+            LOG.debug("WS close error after timed-out send: %r", exc)
+        finally:
+            if self._ws is connection:
+                self._ws = None
+        raise TimeoutError(
+            f"{operation} exceeded its deadline after dispatch; "
+            "command outcome is unknown"
+        )
+
+    def send_with_deadline(
+        self,
+        message: str,
+        *,
+        deadline: float,
+        operation: str,
+    ) -> None:
+        """Send one frame within a deadline, cancelling a stalled socket write."""
+        connection = self._ws
+        if connection is None:
+            raise ConnectionError(f"WebSocket is not connected for {operation}")
+        _remaining_deadline_budget(deadline, operation)
+        send_errors: list[Exception] = []
+        dispatch_lock = threading.Lock()
+        send_state = {"cancelled": False, "started": False}
+
+        def send() -> None:
+            try:
+                with dispatch_lock:
+                    if send_state["cancelled"]:
+                        return
+                    _remaining_deadline_budget(deadline, operation)
+                    send_state["started"] = True
+                connection.send(message)
+            except Exception as exc:  # noqa: BLE001
+                send_errors.append(exc)
+
+        worker = threading.Thread(target=send, name="haos-ws-send", daemon=True)
+        worker.start()
+        worker.join(max(0.0, deadline - time.monotonic()))
+        timed_out_after_dispatch = worker.is_alive()
+        if timed_out_after_dispatch:
+            with dispatch_lock:
+                if not send_state["started"]:
+                    send_state["cancelled"] = True
+                    raise TimeoutError(
+                        f"{operation} exceeded its deadline before dispatch"
+                    )
+        elif send_errors:
+            raise send_errors[0]
+        else:
+            with dispatch_lock:
+                timed_out_after_dispatch = (
+                    send_state["started"] and time.monotonic() >= deadline
+                )
+
+        if timed_out_after_dispatch:
+            self._raise_unknown_send_outcome(connection, operation=operation)
 
     def supervisor_api(
         self,
@@ -600,7 +844,11 @@ class HAWebSocket:
         Raises RuntimeError on a non-success response (HA's WS contract uses
         ``{"id": N, "type": "result", "success": false, "error": {...}}``).
         """
-        assert self._ws is not None
+        if self._ws is None:
+            raise ConnectionError(
+                f"WebSocket is not connected for supervisor/api {method} {endpoint}"
+            )
+        deadline = time.monotonic() + timeout
         self._next_id += 1
         msg_id = self._next_id
         msg: dict[str, Any] = {
@@ -612,34 +860,84 @@ class HAWebSocket:
         }
         if data is not None:
             msg["data"] = data
-        self._ws.send(json.dumps(msg))
+        message = json.dumps(msg)
+        self.send_with_deadline(
+            message,
+            deadline=deadline,
+            operation=f"supervisor/api {method} {endpoint} send",
+        )
         # Skip any out-of-band messages (events on subscriptions etc.) and
         # match by id.
         while True:
-            resp = json.loads(self._ws.recv())
-            if resp.get("id") != msg_id:
-                continue
-            if not resp.get("success", True):
-                err = resp.get("error") or {}
-                code = err.get("code") if isinstance(err, dict) else None
-                raise WSCommandError(
-                    f"supervisor/api {method} {endpoint} failed: {err}",
-                    code=code,
+            result = _parse_supervisor_api_frame(
+                self._ws.recv(
+                    timeout=_remaining_deadline_budget(
+                        deadline,
+                        f"supervisor/api {method} {endpoint} receive",
+                    )
+                ),
+                msg_id=msg_id,
+                method=method,
+                endpoint=endpoint,
+            )
+            if result is not None:
+                _remaining_deadline_budget(
+                    deadline,
+                    f"supervisor/api {method} {endpoint} receive",
                 )
-            return resp.get("result", {}) or {}
+                return result
 
 
 class WSCommandError(RuntimeError):
     """Supervisor/Core WS-level failure with the structured error code.
 
-    Carries the ``error.code`` field from the WS response so callers can
-    branch on it (e.g. retry on ``"unknown_command"`` after a Core
-    restart) without parsing the str() representation of the exception.
+    Carries the ``error.code`` and raw ``error.message`` fields from the WS
+    response so callers can distinguish a proxy interruption from a permanent
+    Supervisor rejection without parsing the exception string.
     """
 
-    def __init__(self, message: str, *, code: str | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None,
+        supervisor_message: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.supervisor_message = supervisor_message
+
+
+def _parse_supervisor_api_frame(
+    raw: str | bytes,
+    *,
+    msg_id: int,
+    method: str,
+    endpoint: str,
+) -> dict[str, Any] | None:
+    """Return the command's result from one of Core's frames, or None for another.
+
+    Core sends every frame as a JSON object, and the one for a command as
+    ``{"id": N, "type": "result", "success": bool, ...}``: on success
+    ``result`` is Supervisor's data object, on failure ``error`` carries
+    Core's ``code`` and ``message``.
+    """
+    resp = json.loads(raw)
+    if resp.get("id") != msg_id:
+        return None
+    if not resp["success"]:
+        err = resp["error"]
+        raise WSCommandError(
+            f"supervisor/api {method} {endpoint} failed: {err}",
+            code=err["code"],
+            supervisor_message=err["message"],
+        )
+    result: dict[str, Any] = resp["result"]
+    return result
+
+
+class _SupervisorReadinessTimeout(TimeoutError):
+    """Supervisor readiness exhausted its deadline before all constraints held."""
 
 
 def _add_repository(ws: HAWebSocket, repo_url: str) -> None:
@@ -674,7 +972,7 @@ def _reload_store(ws: HAWebSocket) -> None:
 _ADDON_INSTALL_RETRY_DELAY = 20.0
 
 # Transient errors while the Supervisor restarts to apply its self-update (see
-# _wait_supervisor_ready). Supervisor self-update restarts Supervisor, and Core
+# wait_supervisor_ready). Supervisor self-update restarts Supervisor, and Core
 # may return a structured WSCommandError OR drop the WS transport during that
 # restart window. websockets lives only in the build venv, so fold its drop
 # exception in lazily.
@@ -687,6 +985,7 @@ try:
         TimeoutError,
         _WebSocketException,
     )
+
 except ImportError:
     _SUPERVISOR_WAIT_TRANSIENT_ERRORS = (WSCommandError, OSError, TimeoutError)
 
@@ -708,20 +1007,7 @@ def _install_addon_with_retry(
     retrying so a dead connection doesn't doom the retry, rather than failing the
     whole ~25 min bake. A genuinely broken add-on fails again and propagates.
     """
-    # websockets lives only in the build venv (imported lazily elsewhere for the
-    # same reason), so fold its drop exception into the retry tuple lazily.
-    try:
-        from websockets.exceptions import WebSocketException
-
-        transient: tuple[type[BaseException], ...] = (
-            WSCommandError,
-            OSError,
-            TimeoutError,
-            WebSocketException,
-        )
-    except ImportError:
-        transient = (WSCommandError, OSError, TimeoutError)
-
+    transient = _SUPERVISOR_WAIT_TRANSIENT_ERRORS
     for attempt in range(1, attempts + 1):
         try:
             ws.supervisor_api(
@@ -729,6 +1015,7 @@ def _install_addon_with_retry(
             )
             return
         except transient as e:
+            log_supervisor_tail(ws._base_url, ws._credentials.access_token)
             if attempt >= attempts:
                 raise
             LOG.warning(
@@ -818,15 +1105,15 @@ _ADDON_OPTION_OVERRIDES: dict[str, dict[str, Any]] = {
             # https://raw.githubusercontent.com/hassio-addons/addon-node-red/main/node-red/config.yaml ).
             "ssl": False,
             # ``leave_front_door_open: true`` is required for
-            # ``ha_manage_addon``'s proxy mode to work against this
+            # ``ha_manage_app``'s proxy mode to work against this
             # addon. The proxy path goes Supervisor →
             # ``/addons/{slug}/api/...`` → the addon's DIRECT port,
             # which is fronted by nginx with an ``auth_request``
             # directive that demands HA Supervisor authentication.
-            # The default (false) blocks ha_manage_addon's calls with
+            # The default (false) blocks ha_manage_app's calls with
             # 401; ``true`` removes the auth_request and lets the
             # proxy path through. Aligning the bake's options with
-            # what real users hit when they reach for ha_manage_addon
+            # what real users hit when they reach for ha_manage_app
             # — see node-red/rootfs/etc/nginx/templates/direct.gtpl
             # for the ``{{ if not .leave_front_door_open }}`` block.
             "leave_front_door_open": True,
@@ -931,7 +1218,7 @@ def _check_core_auth(base_url: str, token: str) -> None:
     we know auth itself is sound and can fail fast on it.
     """
     try:
-        cfg = _http("GET", f"{base_url}/api/config", token=token, timeout=10.0)
+        cfg = http("GET", f"{base_url}/api/config", token=token, timeout=10.0)
         LOG.info(
             "AUTH OK: /api/config version=%s state=%s",
             cfg.get("version"),
@@ -943,7 +1230,7 @@ def _check_core_auth(base_url: str, token: str) -> None:
             "Auth middleware did not parse the bearer token — token exchange is broken."
         ) from e
     try:
-        states = _http("GET", f"{base_url}/api/states", token=token, timeout=10.0)
+        states = http("GET", f"{base_url}/api/states", token=token, timeout=10.0)
         LOG.info(
             "AUTH OK: /api/states returned %d entities",
             len(states) if isinstance(states, list) else 0,
@@ -952,6 +1239,26 @@ def _check_core_auth(base_url: str, token: str) -> None:
         raise RuntimeError(
             f"HA Core rejected the access token at /api/states ({e.code})."
         ) from e
+
+
+def _tar_in_local_addon(qcow2: Path, workdir: Path, name: str) -> None:
+    """Copy ``workdir/name`` into the qcow2's /supervisor/addons/local/ as root-owned files."""
+    seed_tar = workdir / f"{name}.tar"
+    tar = ["tar", "--numeric-owner", "--owner=0", "--group=0", "-C", str(workdir)]
+    _run([*tar, "-cf", str(seed_tar), name])
+    guestfish = [
+        "guestfish",
+        "--rw",
+        "-a",
+        str(qcow2),
+        "run",
+        ":",
+        "mount",
+        "/dev/sda8",
+        "/",
+    ]
+    local = "/supervisor/addons/local"
+    _run([*guestfish, ":", "mkdir-p", local, ":", "tar-in", str(seed_tar), local])
 
 
 def stage_dev_addon_source(qcow2: Path) -> None:
@@ -964,11 +1271,10 @@ def stage_dev_addon_source(qcow2: Path) -> None:
     of an ``addons/{slug}/update`` (Docker layer cache hit, ~20-30s) instead
     of a full first-install (~5 min).
 
-    The dev addon's Dockerfile expects ``start.py``, ``pyproject.toml``,
-    ``uv.lock``, and ``src/`` at the build-context root — same shape as the
-    addon-repo-branch flow used for manual fork testing (see
-    ``~/ha-mcp-fork/FORK-DEV.md``). We mirror that prep here so the
-    in-HAOS build succeeds without any additional setup at install time.
+    The dev addon's Dockerfile expects ``start.py``, ``src/`` and the
+    ``DEV_ADDON_REPO_FILES`` at the build-context root, which
+    ``dev_addon_tree.stage_dev_addon_tree`` lays out, so the in-HAOS build
+    succeeds without any additional setup at install time.
     """
     repo_root = Path(__file__).resolve().parent.parent.parent
     dev_addon_src = repo_root / "homeassistant-addon-dev"
@@ -984,110 +1290,11 @@ def stage_dev_addon_source(qcow2: Path) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="haos-dev-addon-"))
     try:
         staging = workdir / "ha_mcp_dev"
-        shutil.copytree(dev_addon_src, staging)
-
-        # Files outside the addon dir that the Dockerfile COPYs from.
-        # Mirrors the addon-repo-branch manual steps.
-        shutil.copy(
-            repo_root / "homeassistant-addon" / "start.py", staging / "start.py"
-        )
-        shutil.copy(repo_root / "pyproject.toml", staging / "pyproject.toml")
-        shutil.copy(repo_root / "uv.lock", staging / "uv.lock")
-        # src/ha_mcp: nuke + copy fresh so a stale tree (e.g. left over from
-        # a prior local run) doesn't shadow the current version.
-        addon_src_dir = staging / "src"
-        if addon_src_dir.exists():
-            shutil.rmtree(addon_src_dir)
-        addon_src_dir.mkdir()
-        shutil.copytree(repo_root / "src" / "ha_mcp", addon_src_dir / "ha_mcp")
-
-        # Dockerfile in homeassistant-addon-dev/ uses
-        # ``COPY homeassistant-addon/start.py /`` because it's authored to
-        # be built from the repo root context. Inside /supervisor/addons/local/ the
-        # build context is the addon dir itself, so the path needs to be
-        # ``COPY start.py /``. Same patch the FORK-DEV.md flow applies.
-        dockerfile = staging / "Dockerfile"
-        original = dockerfile.read_text()
-        patched = original.replace(
-            "COPY homeassistant-addon/start.py /",
-            "COPY start.py /",
-        )
-        if patched == original:
-            # Fail fast — silently writing the unpatched Dockerfile would
-            # cause an opaque addon-build failure 5+ min later during
-            # ``addons/{slug}/install``. Better to point at the patch line
-            # directly.
-            raise RuntimeError(
-                f"Dockerfile patch failed: expected line "
-                f"'COPY homeassistant-addon/start.py /' not found in "
-                f"{dockerfile}. The dev addon's Dockerfile may have been "
-                f"restructured; update the patch in stage_dev_addon_source "
-                f"to match the new shape."
-            )
-        dockerfile.write_text(patched)
-
-        # Strip the ``image:`` field from config.yaml. Production dev-addon
-        # ships built images at ghcr.io/homeassistant-ai/ha-mcp-addon-dev-{arch};
-        # when Supervisor sees ``image:``, it tries to PULL from GHCR rather
-        # than build from the local Dockerfile. Per-PR version bumps produce
-        # tags that don't exist in GHCR → 404 → addon update fails.
-        # Removing the field forces Supervisor to build locally from the
-        # Dockerfile it sees in /supervisor/addons/local/ha_mcp_dev/.
-        config_yaml = staging / "config.yaml"
-        config_lines = [
-            ln
-            for ln in config_yaml.read_text().splitlines(keepends=True)
-            if not ln.startswith("image:")
-        ]
-        config_yaml.write_text("".join(config_lines))
-        # Verify the strip: a future restructure that indents the field
-        # under a parent key would make the line-prefix filter a no-op,
-        # silently re-introducing GHCR-pull behavior.
-        post_strip = config_yaml.read_text()
-        if "\nimage:" in post_strip or post_strip.startswith("image:"):
-            raise RuntimeError(
-                f"config.yaml ``image:`` strip did not remove the field "
-                f"from {config_yaml}; Supervisor will pull from GHCR and "
-                f"the per-PR version bump will 404. The field may now be "
-                f"indented under a parent — update the filter accordingly."
-            )
+        stage_dev_addon_tree(repo_root, staging)
 
         # tar root-owned, root-mode files into /supervisor/addons/local/ on the qcow2's
         # hassos-data partition. Same approach as bake_test_state's seed-tar.
-        seed_tar = workdir / "ha_mcp_dev.tar"
-        _run(
-            [
-                "tar",
-                "--numeric-owner",
-                "--owner=0",
-                "--group=0",
-                "-C",
-                str(workdir),
-                "-cf",
-                str(seed_tar),
-                "ha_mcp_dev",
-            ]
-        )
-        _run(
-            [
-                "guestfish",
-                "--rw",
-                "-a",
-                str(qcow2),
-                "run",
-                ":",
-                "mount",
-                "/dev/sda8",
-                "/",
-                ":",
-                "mkdir-p",
-                "/supervisor/addons/local",
-                ":",
-                "tar-in",
-                str(seed_tar),
-                "/supervisor/addons/local",
-            ]
-        )
+        _tar_in_local_addon(qcow2, workdir, "ha_mcp_dev")
         LOG.info("Dev addon source staged at /supervisor/addons/local/ha_mcp_dev/")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -1148,42 +1355,9 @@ def stage_webhook_proxy_addon_source(qcow2: Path) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="haos-webhook-proxy-addon-"))
     try:
         staging = workdir / "ha_mcp_webhook_proxy"
-        shutil.copytree(src_dir, staging)
+        copy_addon_tree(src_dir, staging)
 
-        seed_tar = workdir / "ha_mcp_webhook_proxy.tar"
-        _run(
-            [
-                "tar",
-                "--numeric-owner",
-                "--owner=0",
-                "--group=0",
-                "-C",
-                str(workdir),
-                "-cf",
-                str(seed_tar),
-                "ha_mcp_webhook_proxy",
-            ]
-        )
-        _run(
-            [
-                "guestfish",
-                "--rw",
-                "-a",
-                str(qcow2),
-                "run",
-                ":",
-                "mount",
-                "/dev/sda8",
-                "/",
-                ":",
-                "mkdir-p",
-                "/supervisor/addons/local",
-                ":",
-                "tar-in",
-                str(seed_tar),
-                "/supervisor/addons/local",
-            ]
-        )
+        _tar_in_local_addon(qcow2, workdir, "ha_mcp_webhook_proxy")
         LOG.info(
             "Webhook-proxy addon source staged at "
             "/supervisor/addons/local/ha_mcp_webhook_proxy/"
@@ -1199,7 +1373,7 @@ def stage_screenshot_engine_source(qcow2: Path) -> None:
     Supervisor's local store (slug ``local_puppet``). The source is the in-repo
     ``screenshot_engine_mock/`` directory, copied verbatim: its config.yaml has
     no ``image:`` field (so Supervisor builds from the local Dockerfile) and the
-    Dockerfile (``python:3.13-slim`` + a stdlib server) needs no patch or
+    Dockerfile (``python:3.14-slim`` + a stdlib server) needs no patch or
     ``image:`` strip. ``install_screenshot_engine`` builds it during the running
     phase — a fast, reliable build (unlike balloob's Chromium image, which broke
     the bake under floating Supervisor versions).
@@ -1218,42 +1392,9 @@ def stage_screenshot_engine_source(qcow2: Path) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="haos-screenshot-engine-"))
     try:
         staging = workdir / "puppet"
-        shutil.copytree(src, staging, ignore=shutil.ignore_patterns("__pycache__"))
+        copy_addon_tree(src, staging, ignore=shutil.ignore_patterns("__pycache__"))
 
-        seed_tar = workdir / "puppet.tar"
-        _run(
-            [
-                "tar",
-                "--numeric-owner",
-                "--owner=0",
-                "--group=0",
-                "-C",
-                str(workdir),
-                "-cf",
-                str(seed_tar),
-                "puppet",
-            ]
-        )
-        _run(
-            [
-                "guestfish",
-                "--rw",
-                "-a",
-                str(qcow2),
-                "run",
-                ":",
-                "mount",
-                "/dev/sda8",
-                "/",
-                ":",
-                "mkdir-p",
-                "/supervisor/addons/local",
-                ":",
-                "tar-in",
-                str(seed_tar),
-                "/supervisor/addons/local",
-            ]
-        )
+        _tar_in_local_addon(qcow2, workdir, "puppet")
         LOG.info("Mock screenshot engine staged at /supervisor/addons/local/puppet/")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -1356,20 +1497,17 @@ def install_ha_mcp_dev_addon(ws: HAWebSocket) -> str:
     _install_addon_with_retry(ws, slug, timeout=900.0)
 
     # Pre-set every dev-channel flag the test suite relies on so the addon
-    # exposes the full tool surface (mirrors the env-var setup in conftest's
+    # exposes the full tool surface (mirrors the env-var setup in _conftest_haos.py's
     # external-HAOS branch). The schema in homeassistant-addon-dev/config.yaml
     # lists every flag we toggle here.
     LOG.info("Setting ha-mcp dev addon options (preset secret_path + all dev flags on)")
-    # Supervisor's options POST replaces the full options dict, so we must
-    # include every field with a non-optional schema entry in the dev addon's
-    # homeassistant-addon-dev/config.yaml. Verified live: omitting
-    # ``backup_hint`` returns "Missing option 'backup_hint' in root".
+    # Supervisor's options POST replaces the full options dict: a field left
+    # out here falls back to its default in homeassistant-addon-dev/config.yaml.
     ws.supervisor_api(
         f"/addons/{slug}/options",
         method="post",
         data={
             "options": {
-                "backup_hint": "normal",
                 "secret_path": HA_MCP_TEST_SECRET_PATH,
                 "enable_tool_search": False,
                 "enable_yaml_config_editing": True,
@@ -1454,7 +1592,7 @@ def install_webhook_proxy_addon(ws: HAWebSocket) -> str:
     )
     # 900s matches the dev-addon timeout. Webhook-proxy build is much
     # cheaper (no uv sync, stdlib-only start.py) but keep the headroom in
-    # case the python:3.13-slim base layer pull is slow on first install.
+    # case the python:3.14-slim base layer pull is slow on first install.
     _install_addon_with_retry(ws, slug, timeout=900.0)
 
     # Pin mcp_server_url to the dev addon's host-network URL so the
@@ -1494,7 +1632,7 @@ def install_screenshot_engine(ws: HAWebSocket) -> str:
     The add-on source is staged into /supervisor/addons/local/puppet/ before
     first boot (``stage_screenshot_engine_source``), so Supervisor's local-store
     scanner picks it up as ``local_puppet``. We reload the store to be explicit,
-    then install — which builds the mock's small python:3.13-slim image into the
+    then install — which builds the mock's small python:3.14-slim image into the
     cached qcow2. No balloob repo or submodule is involved; the in-repo
     ``screenshot_engine_mock/`` dir is the only source.
 
@@ -1512,7 +1650,7 @@ def install_screenshot_engine(ws: HAWebSocket) -> str:
     slug = SCREENSHOT_ENGINE_SLUG
     LOG.info(
         "Installing mock screenshot engine (slug=%s) — building its small "
-        "python:3.13-slim image into the qcow2...",
+        "python:3.14-slim image into the qcow2...",
         slug,
     )
     _install_addon_with_retry(ws, slug, timeout=300.0)
@@ -1537,85 +1675,502 @@ def install_screenshot_engine(ws: HAWebSocket) -> str:
     return slug
 
 
-def _wait_supervisor_ready(ws: HAWebSocket, *, update_timeout: float = 600.0) -> None:
-    """Wait for the Supervisor to respond AND finish self-updating.
+_CORE_VERSION_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d+(?:\.dev\d+|b\d+)?$")
 
-    HAOS pins only the OS version (HAOS_VERSION); the Supervisor it bundles
-    self-updates asynchronously after boot to the latest version on its
-    channel. Until that finishes, ``need_update`` is True and every store
-    operation guarded by ``JobCondition.SUPERVISOR_UPDATED`` (the first one
-    here is ``_add_repository`` -> POST /store/repositories, right after this
-    call) is rejected with "supervisor needs to be updated first". That race
-    is what broke the publish bake intermittently: a run that hit the store
-    before the self-update landed failed at add_repository; a run that caught
-    a later channel version sailed past it and failed elsewhere.
 
-    Poll /supervisor/info until ``update_available`` clears (the running
-    version reaches ``version_latest``) so the caller's store calls run
-    against an up-to-date Supervisor. The Supervisor version still floats to
-    the channel head per build: there is no clean way to pin the bundled
-    Supervisor offline (it ships as a container layer in the HAOS image, and
-    ``need_update`` is evaluated against the live channel), so this makes the
-    bake deterministic in outcome, not in the Supervisor version it lands on.
+def _supervisor_version_key(version: object) -> tuple[int, int, int, int, int]:
+    """Return a comparable key for Supervisor's calendar version."""
+    if not isinstance(version, str):
+        raise RuntimeError(f"Supervisor returned an invalid version: {version!r}")
+    match = re.fullmatch(
+        r"(\d{4})\.(\d{1,2})\.(\d+)(?:\.dev(\d+))?",
+        version,
+    )
+    if match is None:
+        raise RuntimeError(f"Supervisor returned an invalid version: {version!r}")
+    year, month, patch, dev = match.groups()
+    # A final release sorts after its development builds.
+    return (
+        int(year),
+        int(month),
+        int(patch),
+        int(dev is None),
+        int(dev or 0),
+    )
+
+
+def _is_transient_supervisor_error(exc: BaseException) -> bool:
+    """Return whether a Supervisor restart can plausibly produce ``exc``."""
+    if not isinstance(exc, WSCommandError):
+        return True
+    if exc.code == "unknown_command":
+        return True
+    return exc.code == "unknown_error" and exc.supervisor_message == ""
+
+
+def _is_transient_supervisor_readiness_error(exc: BaseException) -> bool:
+    """Return whether readiness polling can retry a Supervisor failure.
+
+    Mutation responses stay strict because their outcome can be ambiguous. A
+    read during a known restart window may also observe Supervisor's setup
+    state before the API becomes ready again.
     """
-    info = ws.supervisor_api("/supervisor/info", method="get", timeout=30.0)
-    LOG.info(
-        "Supervisor ready: version=%s version_latest=%s arch=%s",
-        info.get("version"),
-        info.get("version_latest"),
-        info.get("arch"),
+    return _is_transient_supervisor_error(exc) or (
+        isinstance(exc, WSCommandError)
+        and exc.code == "unknown_error"
+        and (exc.supervisor_message or "").startswith(
+            "System is not ready with state: "
+        )
     )
-    if not info.get("update_available") and info.get("version_latest"):
-        return
 
-    LOG.info(
-        "Supervisor self-update pending (%s -> %s); waiting before store ops...",
-        info.get("version"),
-        info.get("version_latest"),
+
+def _supervisor_info_ready(
+    info: dict[str, Any],
+    *,
+    expected_channel: str | None,
+    minimum_version: str | None,
+) -> bool:
+    """Return whether Supervisor meets the requested channel and version floor."""
+    if expected_channel is not None and info.get("channel") != expected_channel:
+        return False
+    if info.get("update_available") or not info.get("version_latest"):
+        return False
+    if minimum_version is None:
+        return True
+    return _supervisor_version_key(info.get("version")) >= _supervisor_version_key(
+        minimum_version
     )
+
+
+def _reconnect_supervisor_during_wait(
+    ws: HAWebSocket, *, deadline: float
+) -> BaseException | None:
+    """Best-effort reconnect while Supervisor/Core restarts."""
+    try:
+        ws.reconnect(deadline=deadline)
+    except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as reconnect_err:
+        if not _is_transient_supervisor_readiness_error(reconnect_err):
+            raise
+        # Handler-start timeouts and transport failures are expected while
+        # Supervisor/Core restarts; keep them visible in CI logs.
+        LOG.warning("reconnect during update wait failed: %r", reconnect_err)
+        return reconnect_err
+    return None
+
+
+def _supervisor_readiness_probe_budget(deadline: float, *, delay: bool) -> float | None:
+    """Return the next readiness request budget within the deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    if delay:
+        time.sleep(min(10.0, remaining))
+        remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return min(30.0, remaining)
+
+
+def wait_supervisor_ready(
+    ws: HAWebSocket,
+    *,
+    update_timeout: float = 600.0,
+    expected_channel: str | None = None,
+    minimum_version: str | None = None,
+) -> dict[str, Any]:
+    """Wait until Supervisor satisfies update and image-variant constraints.
+
+    HAOS pins only the OS version; its bundled Supervisor self-updates
+    asynchronously after boot. A ready response must advertise
+    ``version_latest`` and have no pending update. When supplied,
+    ``expected_channel`` and ``minimum_version`` further constrain the running
+    Supervisor.
+
+    ``install_addons`` relies on this readiness before its first store
+    operation. Beta image configuration uses the same predicate after channel
+    selection and update.
+    """
     deadline = time.monotonic() + update_timeout
-    last_version = info.get("version")
+    info: dict[str, Any] = {}
+    last_version: object = None
     last_error: BaseException | None = None
-    while time.monotonic() < deadline:
-        time.sleep(10.0)
+    first_success = True
+    first_probe = True
+    while (
+        request_timeout := _supervisor_readiness_probe_budget(
+            deadline, delay=not first_probe
+        )
+    ) is not None:
+        first_probe = False
         try:
-            info = ws.supervisor_api("/supervisor/info", method="get", timeout=30.0)
+            info = ws.supervisor_api(
+                "/supervisor/info",
+                method="get",
+                timeout=request_timeout,
+            )
         except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as e:
-            # A Supervisor self-update restarts Supervisor; Core may return a
-            # structured WSCommandError OR drop the WS transport during that
-            # restart window. Record the error so a persistent failure is
-            # reported in the timeout message, then best-effort reconnect and
-            # keep polling.
+            if not _is_transient_supervisor_readiness_error(e):
+                raise
+            # A Supervisor self-update can return a transient command error or
+            # drop the WebSocket. Preserve the failure for timeout diagnostics,
+            # then best-effort reconnect and keep polling.
             last_error = e
             LOG.debug("Transient error polling /supervisor/info: %r", e)
-            try:
-                ws.reconnect()
-            except _SUPERVISOR_WAIT_TRANSIENT_ERRORS + (RuntimeError,) as reconnect_err:
-                # Handshake-stage WS errors (InvalidStatus / InvalidHandshake /
-                # ConnectionClosed) raise WebSocketException, which is NOT a
-                # subclass of OSError / RuntimeError / TimeoutError — covered
-                # here via _SUPERVISOR_WAIT_TRANSIENT_ERRORS. RuntimeError stays
-                # for symmetry with the poll-catch above (generic Supervisor
-                # restart-window RuntimeError that isn't a WSCommandError).
-                # WARNING level: surface the reconnect failure in CI logs. A
-                # one-off failure is harmless (the loop keeps polling until the
-                # deadline); a persistent one would otherwise only show up as
-                # the *poll* error in the final TimeoutError, so WARNING makes
-                # the reconnect pattern visible.
-                LOG.warning("reconnect during update wait failed: %r", reconnect_err)
+            reconnect_err = _reconnect_supervisor_during_wait(ws, deadline=deadline)
+            if reconnect_err is not None:
+                last_error = reconnect_err
             continue
+        if time.monotonic() >= deadline:
+            break
         version = info.get("version")
-        if version != last_version:
+        ready = _supervisor_info_ready(
+            info,
+            expected_channel=expected_channel,
+            minimum_version=minimum_version,
+        )
+        if first_success:
+            LOG.info(
+                "Supervisor ready: version=%s version_latest=%s arch=%s",
+                info.get("version"),
+                info.get("version_latest"),
+                info.get("arch"),
+            )
+            first_success = False
+            if ready:
+                return info
+            LOG.info(
+                "Supervisor self-update pending (%s -> %s); waiting before store ops...",
+                info.get("version"),
+                info.get("version_latest"),
+            )
+        elif version != last_version:
             LOG.info("Supervisor version changed: %s -> %s", last_version, version)
-            last_version = version
-        if not info.get("update_available") and info.get("version_latest"):
+        last_version = version
+        if ready:
             LOG.info("Supervisor self-update complete: version=%s", version)
-            return
+            return info
     last_err_suffix = f"; last error: {last_error!r}" if last_error else ""
-    raise TimeoutError(
+    raise _SupervisorReadinessTimeout(
         f"Supervisor did not finish self-updating within {update_timeout:.0f}s "
         f"(last version={last_version}, "
         f"latest={info.get('version_latest')}{last_err_suffix})"
+    )
+
+
+def _wait_supervisor_running(
+    ws: HAWebSocket, *, timeout: float = 300.0
+) -> dict[str, Any]:
+    """Wait until Supervisor's core state is ``running``.
+
+    Supervisor 2026.09.3+ (home-assistant/supervisor#7194) rejects app
+    install/start/restart/rebuild/update and Core update with a 503 until it
+    has finished its own boot sequence, which continues after Core answers its
+    API and restarts after every Supervisor self-update. ``/supervisor/info``
+    does not carry the state; the root ``/info`` does. Same transient handling
+    as ``wait_supervisor_ready``.
+    """
+    deadline = time.monotonic() + timeout
+    last_state: object = None
+    last_error: BaseException | None = None
+    first_probe = True
+    while (
+        request_timeout := _supervisor_readiness_probe_budget(
+            deadline, delay=not first_probe
+        )
+    ) is not None:
+        first_probe = False
+        try:
+            info = ws.supervisor_api("/info", method="get", timeout=request_timeout)
+        except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as e:
+            if not _is_transient_supervisor_readiness_error(e):
+                raise
+            last_error = e
+            LOG.debug("Transient error polling /info: %r", e)
+            reconnect_err = _reconnect_supervisor_during_wait(ws, deadline=deadline)
+            if reconnect_err is not None:
+                last_error = reconnect_err
+            continue
+        if time.monotonic() >= deadline:
+            break
+        state = info.get("state")
+        if state == "running":
+            LOG.info("Supervisor core state is running")
+            return info
+        if state != last_state:
+            LOG.info("Supervisor core state is %r; waiting before app ops...", state)
+        last_state = state
+    last_err_suffix = f"; last error: {last_error!r}" if last_error else ""
+    raise _SupervisorReadinessTimeout(
+        f"Supervisor did not reach the running state within {timeout:.0f}s "
+        f"(last state={last_state!r}{last_err_suffix})"
+    )
+
+
+def wait_core_version(
+    ws: HAWebSocket,
+    expected_version: str,
+    *,
+    timeout: float = 600.0,
+) -> dict[str, Any]:
+    """Reconnect until Supervisor reports the requested Core version."""
+    deadline = time.monotonic() + timeout
+    last_info: dict[str, Any] | None = None
+    last_error: BaseException | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            ws.reconnect(deadline=deadline)
+            request_timeout = min(
+                30.0,
+                _remaining_deadline_budget(deadline, "Core version check"),
+            )
+            last_info = ws.supervisor_api(
+                "/core/info", method="get", timeout=request_timeout
+            )
+        except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as exc:
+            if not _is_transient_supervisor_readiness_error(exc):
+                raise
+            last_error = exc
+            LOG.debug("Core still restarting after update: %r", exc)
+        else:
+            if last_info.get("version") == expected_version:
+                return last_info
+            LOG.info(
+                "Core update still settling: running=%s expected=%s",
+                last_info.get("version"),
+                expected_version,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(5.0, remaining))
+
+    last_err_suffix = f"; last error: {last_error!r}" if last_error else ""
+    raise TimeoutError(
+        "Core did not install the requested version within "
+        f"{timeout:.0f}s (expected={expected_version!r}, "
+        f"info={last_info!r}{last_err_suffix})"
+    )
+
+
+def _reconnect_during_supervisor_update(
+    ws: HAWebSocket,
+    *,
+    context: str,
+    deadline: float,
+) -> BaseException | None:
+    """Best-effort reconnect during a Supervisor restart window."""
+    try:
+        ws.reconnect(deadline=deadline)
+    except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as exc:
+        if not _is_transient_supervisor_readiness_error(exc):
+            raise
+        LOG.warning("Reconnect %s failed: %r", context, exc)
+        return exc
+    return None
+
+
+def _wait_supervisor_channel_metadata(
+    ws: HAWebSocket,
+    *,
+    channel: str,
+    minimum_version: str | None,
+    deadline: float,
+) -> bool:
+    """Wait for channel metadata and return whether Supervisor needs updating."""
+    last_info: dict[str, Any] | None = None
+    last_error: BaseException | None = None
+    while (request_timeout := deadline - time.monotonic()) > 0:
+        try:
+            last_info = ws.supervisor_api(
+                "/supervisor/info", method="get", timeout=min(30.0, request_timeout)
+            )
+        except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as exc:
+            if not _is_transient_supervisor_readiness_error(exc):
+                raise
+            last_error = exc
+            LOG.debug("Transient Supervisor reload failure: %r", exc)
+            reconnect_error = _reconnect_during_supervisor_update(
+                ws,
+                context="during Supervisor channel reload",
+                deadline=deadline,
+            )
+            if reconnect_error is not None:
+                last_error = reconnect_error
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(5.0, remaining))
+            continue
+
+        latest = last_info.get("version_latest")
+        latest_is_usable = minimum_version is None or (
+            isinstance(latest, str)
+            and _supervisor_version_key(latest)
+            >= _supervisor_version_key(minimum_version)
+        )
+        if last_info.get("channel") == channel and latest_is_usable:
+            if _supervisor_info_ready(
+                last_info,
+                expected_channel=channel,
+                minimum_version=minimum_version,
+            ):
+                return False
+            if last_info.get("update_available"):
+                return True
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(5.0, remaining))
+
+    last_err_suffix = f"; last error: {last_error!r}" if last_error else ""
+    raise TimeoutError(
+        "Supervisor channel metadata did not become ready before the "
+        f"image-build deadline: channel={channel!r}, "
+        f"minimum={minimum_version!r}, info={last_info!r}{last_err_suffix}"
+    )
+
+
+def _apply_supervisor_image_update(
+    ws: HAWebSocket,
+    *,
+    channel: str,
+    minimum_version: str | None,
+    deadline: float,
+    timeout: float,
+) -> None:
+    """Install and wait for the Supervisor version advertised by its channel."""
+    try:
+        ws.supervisor_api("/supervisor/update", method="post", timeout=timeout)
+    except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as exc:
+        if not _is_transient_supervisor_error(exc):
+            raise
+        # Selected bridge/transport errors are inconclusive during a Supervisor
+        # restart; readiness polling below establishes the actual outcome.
+        LOG.info("Supervisor update outcome inconclusive during restart: %r", exc)
+
+    # The readiness wait rides out the restart itself (reconnects included).
+    wait_supervisor_ready(
+        ws,
+        update_timeout=max(deadline - time.monotonic(), 0.0),
+        expected_channel=channel,
+        minimum_version=minimum_version,
+    )
+
+
+def _request_core_image_update(ws: HAWebSocket, core_version: str) -> None:
+    """Retry only Core-job rejections, with a bounded admission deadline."""
+    deadline = time.monotonic() + 600.0
+    while True:
+        _remaining_deadline_budget(deadline, "Core job admission")
+        try:
+            ws.supervisor_api(
+                "/core/update",
+                method="post",
+                data={"version": core_version, "backup": False},
+                timeout=1800.0,
+            )
+        except _SUPERVISOR_WAIT_TRANSIENT_ERRORS as exc:
+            # Supervisor's GROUP_REJECT guard raises before the update starts.
+            # Do not retry ambiguous transport failures or other semantic errors.
+            if (
+                isinstance(exc, WSCommandError)
+                and exc.code == "unknown_error"
+                and exc.supervisor_message
+                == "Another job is running for job group home_assistant_core"
+            ):
+                LOG.info("Core job busy during image setup; waiting to request update")
+                remaining = _remaining_deadline_budget(deadline, "Core job admission")
+                time.sleep(min(5.0, remaining))
+                continue
+            if not _is_transient_supervisor_error(exc):
+                raise
+            LOG.info("Core update outcome inconclusive; polling version: %r", exc)
+        return
+
+
+def _configure_core_image_variant(
+    ws: HAWebSocket,
+    *,
+    base_url: str,
+    core_version: str,
+) -> None:
+    """Install and verify the requested Home Assistant Core version."""
+    core_info = ws.supervisor_api("/core/info", method="get", timeout=30.0)
+    if core_info.get("version") == core_version:
+        LOG.info("Requested Core already installed: version=%s", core_version)
+        return
+
+    LOG.info(
+        "Updating Core for test image: %s -> %s",
+        core_info.get("version"),
+        core_version,
+    )
+    _request_core_image_update(ws, core_version)
+    # Updating Core may close the transport after dispatch. Exact-version polling
+    # establishes the outcome without blindly retrying an accepted request.
+
+    wait_http_ok(f"{base_url}/manifest.json", timeout=600.0)
+    wait_core_version(ws, core_version, timeout=600.0)
+    LOG.info("Requested Core installed: version=%s", core_version)
+
+
+def _configure_supervisor_image_variant(
+    ws: HAWebSocket,
+    *,
+    base_url: str | None = None,
+    channel: str | None,
+    minimum_version: str | None,
+    core_version: str | None = None,
+    timeout: float = 600.0,
+) -> None:
+    """Configure a Supervisor channel/minimum and exact Core image variant."""
+    if channel is None and minimum_version is None and core_version is None:
+        return
+    if channel is None:
+        raise ValueError("Image variant settings require a Supervisor channel")
+    if channel not in {"stable", "beta"}:
+        raise ValueError(f"Unsupported Supervisor channel: {channel!r}")
+    if minimum_version is not None:
+        _supervisor_version_key(minimum_version)
+    if core_version is not None and _CORE_VERSION_RE.fullmatch(core_version) is None:
+        raise ValueError(f"Invalid Core version: {core_version!r}")
+    if core_version is not None and base_url is None:
+        raise ValueError("A Core image variant requires the Home Assistant base URL")
+
+    LOG.info(
+        "Configuring Supervisor image variant: channel=%s minimum=%s",
+        channel,
+        minimum_version or "any",
+    )
+    ws.supervisor_api(
+        "/supervisor/options",
+        method="post",
+        data={"channel": channel},
+        timeout=30.0,
+    )
+    ws.supervisor_api("/supervisor/reload", method="post", timeout=120.0)
+
+    deadline = time.monotonic() + timeout
+    if _wait_supervisor_channel_metadata(
+        ws,
+        channel=channel,
+        minimum_version=minimum_version,
+        deadline=deadline,
+    ):
+        _apply_supervisor_image_update(
+            ws,
+            channel=channel,
+            minimum_version=minimum_version,
+            deadline=deadline,
+            timeout=timeout,
+        )
+
+    if core_version is None or base_url is None:
+        return
+
+    _wait_supervisor_running(ws)
+    _configure_core_image_variant(
+        ws,
+        base_url=base_url,
+        core_version=core_version,
     )
 
 
@@ -1629,7 +2184,7 @@ def _stage_embedded_server_integration(staging: Path) -> None:
     embedded-server E2E addresses. The entry is ``disabled_by="user"`` so the
     multi-minute server bring-up only fires when the test enables it — every
     other HAOS session boots with the entry present but inert. The ``pip_spec``
-    is a placeholder; the conftest HAOS branch rewrites it to a ``file://`` wheel
+    is a placeholder; the _conftest_haos.py HAOS branch rewrites it to a ``file://`` wheel
     built from the checkout before boot.
     """
     ce_path = staging / ".storage" / "core.config_entries"
@@ -1666,10 +2221,10 @@ def _stage_embedded_server_integration(staging: Path) -> None:
                 "discovery_keys": {},
                 "domain": HA_MCP_SERVER_DOMAIN,
                 "entry_id": HA_MCP_SERVER_ENTRY_ID,
-                "minor_version": 1,
+                "minor_version": 2,  # past the one-time pip_spec clear
                 "modified_at": "2025-09-07T23:56:28.040747+00:00",
                 "options": {
-                    # Overwritten with the checkout wheel by the conftest HAOS
+                    # Overwritten with the checkout wheel by the _conftest_haos.py HAOS
                     # branch before boot; placeholder points at a nonexistent
                     # wheel so an un-delivered entry fails loudly rather than
                     # installing wrong code.
@@ -1718,13 +2273,13 @@ def bake_test_state(qcow2: Path) -> None:
     LOG.info("Baking seed state into qcow2 via libguestfs from %s", initial_state_path)
     workdir = Path(tempfile.mkdtemp(prefix="haos-bake-"))
     try:
-        # Stage the seed under a temp dir so we can normalise the recorder
-        # DB and inject custom components before tarring (see below).
+        # Stage the seed under a temp dir so we can inject custom components
+        # before tarring (see below).
         staging = workdir / "config"
         shutil.copytree(initial_state_path, staging)
 
         # Inject custom components matched to what the testcontainer fixture
-        # installs via _install_custom_component in tests/src/e2e/conftest.py.
+        # installs via _install_custom_component in tests/src/e2e/_conftest_seed.py.
         # Both are config_flow-only integrations, so HA won't pick them up
         # from YAML — a synthetic entry in .storage/core.config_entries is
         # how HA Core learns to set them up on boot.
@@ -1760,13 +2315,13 @@ def bake_test_state(qcow2: Path) -> None:
             LOG.info("Staged custom component %s ← %s", domain, src_rel)
 
             # Inject a config entry so HA loads the integration on boot.
-            # Shape matches the testcontainer path in conftest.py:
+            # Shape matches the testcontainer path in _conftest_seed.py:
             # _install_custom_component (entry_id, source=import, version=1).
             ce_path = staging / ".storage" / "core.config_entries"
             ce_data = json.loads(ce_path.read_text())
             # Shape guard: silently creating ``data.entries`` on a malformed
             # file would near-empty-wipe core.config_entries on the next
-            # write — losing the seed integrations (HACS, demo, etc.).
+            # write — losing the seed integrations (Marketplace, demo, etc.).
             # If the storage schema ever bumps and breaks this expectation,
             # fail loudly so we update the bake instead of shipping a
             # broken image.
@@ -1824,29 +2379,6 @@ def bake_test_state(qcow2: Path) -> None:
             )
         )
 
-        # Recorder DB normalisation. initial_test_state ships
-        # home-assistant_v2.db in WAL journal mode but WITHOUT the
-        # companion .wal/.shm files — when HAOS opens it, SQLite finds
-        # the main DB inconsistent (last shutdown didn't checkpoint) and
-        # logs "database disk image is malformed", which crashes the
-        # recorder executor. VACUUM INTO a new file produces a single-
-        # file, journal-mode, fully consistent DB with the same data —
-        # no WAL dependency.
-        db_src = staging / "home-assistant_v2.db"
-        if db_src.exists():
-            import sqlite3
-
-            vacuumed = workdir / "home-assistant_v2.db"
-            con = sqlite3.connect(str(db_src))
-            try:
-                con.execute(f"VACUUM INTO '{vacuumed}'")
-            finally:
-                con.close()
-            shutil.move(str(vacuumed), str(db_src))
-            LOG.info(
-                "Vacuumed recorder DB → %s (size %d B)", db_src, db_src.stat().st_size
-            )
-
         seed_tar = workdir / "seed.tar"
         # --owner=0 --group=0 + --numeric-owner forces the archived files
         # to root:root regardless of the source UID on the build runner
@@ -1878,6 +2410,7 @@ def bake_test_state(qcow2: Path) -> None:
             capture_output=True,
             text=True,
             timeout=120,
+            check=False,
         )
         LOG.info("guestfish filesystems on qcow2:\n%s", probe.stdout)
         if probe.returncode != 0:
@@ -1922,42 +2455,14 @@ def install_addons(ws: HAWebSocket) -> dict[str, str]:
     Returns a mapping of addon display name → installed slug for downstream
     steps (e.g. canary tests that need to address a specific addon).
     """
-    _wait_supervisor_ready(ws)
+    wait_supervisor_ready(ws)
+    _wait_supervisor_running(ws)
     _add_repository(ws, HA_MCP_ADDON_REPO)
     _reload_store(ws)
     installed: dict[str, str] = {}
     for addon in ADDONS:
         installed[addon.name] = _install_one(ws, addon)
     return installed
-
-
-def install_hacs(ws: HAWebSocket, base_url: str) -> None:
-    """Bootstrap HACS via the Get HACS addon.
-
-    The supported HAOS install path: register the Get HACS repo, install +
-    run the addon, which writes HACS files into /config/custom_components/.
-    A core restart picks up the new component; the HACS config flow then
-    completes on first boot of the canary test.
-
-    HACS-driven custom-component churn is the largest source of E2E flake
-    the testcontainer suite cannot reproduce (#1281), so it must be in the
-    pre-baked image rather than installed per-test-run.
-    """
-    LOG.info("Installing HACS via Get HACS addon")
-    _install_one(ws, GET_HACS_ADDON)
-    # /core/restart kicks every WebSocket connection as part of the restart,
-    # so our recv() raises ConnectionClosedOK before any response arrives.
-    # That's the success signal — the restart got initiated.
-    LOG.info("Restarting HA Core so HACS custom component loads")
-    from websockets.exceptions import ConnectionClosed
-
-    try:
-        ws.supervisor_api("/core/restart", method="post", timeout=300.0)
-    except ConnectionClosed:
-        LOG.info("WS closed during core restart (expected)")
-    _wait_http_ok(f"{base_url}/manifest.json", timeout=300.0)
-    # Reconnect for any subsequent supervisor_api calls (e.g. stop_qemu).
-    ws.reconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -1981,20 +2486,25 @@ def build(work_dir: Path, output: Path) -> None:
     stage_webhook_proxy_addon_source(qcow2)
     # The screenshot engine is a tiny in-repo MOCK (screenshot_engine_mock/)
     # staged as a local add-on; install_screenshot_engine builds it (a fast
-    # python:3.13-slim image) into the cached qcow2 during the running phase
+    # python:3.14-slim image) into the cached qcow2 during the running phase
     # below. See SCREENSHOT_ENGINE_MOCK_DIR for why the mock replaced balloob's
     # heavy Chromium Puppet add-on.
     stage_screenshot_engine_source(qcow2)
     qemu = start_qemu(qcow2, work_dir)
-    base_url = f"http://127.0.0.1:{HA_HOST_PORT}"
     try:
-        _wait_port(HA_HOST_PORT, timeout=180)
-        _wait_http_ok(f"{base_url}/manifest.json", timeout=600)
-        token = onboard(base_url)
-        _check_core_auth(base_url, token)
-        with HAWebSocket(base_url, token) as ws:
+        wait_any_port((HA_HOST_PORT, HA_ALT_HOST_PORT), timeout=180)
+        base_url = discover_ha_base_url(timeout=600)
+        credentials = onboard(base_url)
+        _check_core_auth(base_url, credentials.access_token)
+        with HAWebSocket(base_url, credentials) as ws:
+            _configure_supervisor_image_variant(
+                ws,
+                base_url=base_url,
+                channel=SUPERVISOR_CHANNEL,
+                minimum_version=SUPERVISOR_MIN_VERSION,
+                core_version=CORE_VERSION,
+            )
             install_addons(ws)
-            install_hacs(ws, base_url)
             install_ha_mcp_dev_addon(ws)
             # Webhook-proxy must install AFTER the dev addon so its
             # Supervisor auto-discovery (slug-suffix match on _ha_mcp_dev)
@@ -2005,9 +2515,6 @@ def build(work_dir: Path, output: Path) -> None:
             # access token and starts it).
             install_screenshot_engine(ws)
             install_advanced_ssh(ws)
-            # TODO(#1281 follow-up): integrations (ESPHome companion, Node-RED
-            # companion, Local Calendar, Sun verification) and mock RTSP/MQTT
-            # feeders. The canary test only needs addon lifecycle for now.
             stop_qemu(qemu, ws)
     except Exception:
         LOG.exception("Image build failed — leaving qcow2 in %s for inspection", qcow2)

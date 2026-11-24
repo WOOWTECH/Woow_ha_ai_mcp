@@ -16,16 +16,14 @@ firmware installs).
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from ...errors import ErrorCode, create_error_response
+from ..component_config_entries import fetch_config_entries
 from ..component_devices import fetch_device_entities_via_component
 from ..helpers import raise_tool_error
-from ..tools_integrations import _fetch_entries_via_component
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -66,22 +64,61 @@ def require(args: dict[str, Any], spec: ActionSpec, radio: str, action: str) -> 
 
 
 async def ws_call(
-    client: Any, ws_type: str, *, context: dict[str, Any] | None = None, **fields: Any
+    client: Any,
+    ws_type: str,
+    *,
+    context: dict[str, Any] | None = None,
+    on_error: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+    **fields: Any,
 ) -> Any:
     """Send a WebSocket command and return its ``result``; raise on failure.
 
     Mirrors the ``send_websocket_message`` usage in the ``ha_get_device``
-    enrichers. Raises ToolError (SERVICE_CALL_FAILED) when HA reports the
-    command failed, attaching the command type and any caller context.
+    enrichers. Failed replies retain HA's error code, command type and caller
+    context, with recovery suggestions for common failures. ``on_error`` may
+    raise a command-specific error before the shared mapping runs.
     """
     message = {"type": ws_type, **{k: v for k, v in fields.items() if v is not None}}
     result = await client.send_websocket_message(message)
     if not result.get("success"):
+        ha_code = result.get("error_code")
+        error_context = {"ws_type": ws_type, **(context or {})}
+        if ha_code is not None:
+            error_context["ha_error_code"] = ha_code
+        if on_error is not None:
+            on_error(result, error_context)
+        domain = ws_type.split("/", 1)[0]
+        recovery = {
+            "unauthorized": (
+                ErrorCode.AUTH_INSUFFICIENT_PERMISSIONS,
+                "Use a Home Assistant administrator connection for this radio command",
+            ),
+            "not_found": (
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "Verify the device or config-entry ID using ha_get_device or ha_get_integration",
+            ),
+            "not_loaded": (
+                ErrorCode.SERVICE_CALL_FAILED,
+                f"Load/configure the {domain} integration and check that its driver is ready",
+            ),
+            "unknown_command": (
+                ErrorCode.SERVICE_CALL_FAILED,
+                f"Check that the {domain} integration is configured and this Home Assistant version supports the command",
+            ),
+        }.get(ha_code)
+        error_message = result.get("error", f"WebSocket command '{ws_type}' failed")
+        if ha_code == "not_loaded":
+            error_message = f"The {domain} integration is not loaded: {error_message}"
+        elif ha_code == "unknown_command":
+            error_message = (
+                f"The {domain} integration or command is unavailable: {error_message}"
+            )
         raise_tool_error(
             create_error_response(
-                ErrorCode.SERVICE_CALL_FAILED,
-                result.get("error", f"WebSocket command '{ws_type}' failed"),
-                context={"ws_type": ws_type, **(context or {})},
+                recovery[0] if recovery else ErrorCode.SERVICE_CALL_FAILED,
+                error_message,
+                context=error_context,
+                suggestions=[recovery[1]] if recovery else result.get("suggestions"),
             )
         )
     return result.get("result")
@@ -97,8 +134,10 @@ async def resolve_entry_id(client: Any, domain: str) -> str | None:
     slash form is rejected as "Unknown command") on capability miss / component
     error. Returns None when the integration is not configured.
     """
-    entries = await _fetch_entries_via_component(client, domain=domain)
-    if entries is None:
+    read = await fetch_config_entries(client, domain=domain)
+    if read is not None:
+        entries = read.rows
+    else:
         entries = await ws_call(
             client, "config_entries/get", context={"domain": domain}
         )

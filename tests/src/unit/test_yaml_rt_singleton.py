@@ -2,44 +2,20 @@
 
 from __future__ import annotations
 
-import sys
 import threading
 from io import StringIO
-from unittest.mock import MagicMock
 
-import pytest
+from ruamel.yaml import YAML
 
-# Mock Home Assistant imports so the package __init__ can be loaded.
-sys.modules["voluptuous"] = MagicMock()
-homeassistant = MagicMock()
-sys.modules["homeassistant"] = homeassistant
-sys.modules["homeassistant.components"] = homeassistant.components
-sys.modules["homeassistant.config"] = homeassistant.config
-sys.modules["homeassistant.config_entries"] = homeassistant.config_entries
-# setdefault (not =): other test modules stub homeassistant.core with a real
-# `callback` identity function (production code decorates real closures with
-# it - a clobbered auto-mock attribute would silently replace them). This
-# file doesn't care what's already there, only that something importable is.
-sys.modules.setdefault("homeassistant.core", homeassistant.core)
-sys.modules["homeassistant.helpers"] = homeassistant.helpers
-sys.modules["homeassistant.helpers.config_validation"] = (
-    homeassistant.helpers.config_validation
-)
-
-from custom_components.ha_mcp_tools.yaml_rt import (  # noqa: E402
-    _STORAGE,
-    make_yaml,
-)
+from custom_components.ha_mcp_tools.yaml_rt import make_yaml
 
 
-@pytest.fixture(autouse=True)
-def clear_thread_local():
-    """Ensure the thread-local storage is clean before each test."""
-    if hasattr(_STORAGE, "yaml"):
-        del _STORAGE.yaml
-    yield
-    if hasattr(_STORAGE, "yaml"):
-        del _STORAGE.yaml
+def _keeps_quotes(ry: YAML) -> bool:
+    buf = StringIO()
+    # A plain string holding quote characters is quoted on dump either way; a
+    # loaded double-quoted scalar keeps its quotes only with preserve_quotes.
+    ry.dump(ry.load('key: "quoted_value"\n'), buf)
+    return 'key: "quoted_value"' in buf.getvalue()
 
 
 def test_make_yaml_singleton_in_same_thread():
@@ -49,13 +25,11 @@ def test_make_yaml_singleton_in_same_thread():
 
     assert y1 is y2
     # Round-trip a quoted scalar to confirm preserve_quotes is set
-    buf = StringIO()
-    y1.dump({"key": '"quoted_value"'}, buf)
-    assert '"quoted_value"' in buf.getvalue()
+    assert _keeps_quotes(y1)
 
 
 def test_make_yaml_singleton_per_thread():
-    """Verify that make_yaml returns different instances for different threads."""
+    """Each thread builds its own instance, and a freshly built one keeps quotes."""
     instances = {}
 
     def worker(name):
@@ -72,17 +46,7 @@ def test_make_yaml_singleton_per_thread():
     assert "t1" in instances
     assert "t2" in instances
     assert instances["t1"] is not instances["t2"]
-
-
-def test_make_yaml_rebuilds_after_storage_cleared():
-    """Verify that make_yaml rebuilds the instance after thread-local storage is cleared."""
-    y1 = make_yaml()
-    del _STORAGE.yaml
-    y2 = make_yaml()
-
-    assert y2 is not y1
-    assert y2.preserve_quotes is True
-    # Round-trip a quoted scalar to confirm preserve_quotes actually took effect
-    buf = StringIO()
-    y2.dump({"key": '"quoted_value"'}, buf)
-    assert '"quoted_value"' in buf.getvalue()
+    # Each new thread starts without a cached instance, so these were built
+    # fresh rather than handed down from another test's thread.
+    assert instances["t1"].preserve_quotes is True
+    assert _keeps_quotes(instances["t1"])

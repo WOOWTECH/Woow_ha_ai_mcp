@@ -2,53 +2,98 @@
 Dashboard resource hosting tools for Home Assistant MCP server.
 
 Provides tools for managing dashboard resources (custom cards, CSS, JS):
-- Inline resources: Code embedded in URL via Cloudflare Worker
-- External resources: URLs to /local/, /hacsfiles/, or external CDNs
+- Inline resources: Code embedded directly in the resource URL as a
+  ``data:`` URI — stored in HA's own resource registry, served by nothing
+- External resources: URLs to /local/ (incl. /local/community/), /hacsfiles/, or CDNs
 
-See: https://github.com/homeassistant-ai/ha-mcp/issues/266
+Inline resources were previously served by a Cloudflare Worker that decoded
+base64 content embedded in its URL, based on issue #71's claim that browsers
+reject ``data:`` URIs for ES6 modules. That claim was wrong — HA's WS API
+applies no URL-scheme validation, HA ships no CSP, and every layer loads
+``data:`` modules and stylesheets fine (verified live; see #2060). Inline
+content now goes straight into a ``data:`` URI: same storage location
+(the resource registry), no third-party hop on dashboard loads.
 """
 
-import base64
 import logging
-from typing import Annotated, Any, Literal, NoReturn
+from typing import Annotated, Any, NoReturn
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
 
 from ..errors import ErrorCode, create_error_response
 from .auto_backup import with_auto_backup
+from .coercion import JSON_STRING_COERCION
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
     raise_tool_error,
     register_tool_methods,
     validate_identifier_not_empty,
+    ws_failure_code,
 )
-from .util_helpers import build_pagination_metadata
+from .resource_codec import (
+    _DATA_URI_MIME,
+    _MAX_CONTENT_BUDGET,
+    MAX_CONTENT_SIZE,
+    _check_ws_error,
+    _data_uri_for,
+    _decode_inline_content,
+    _is_data_url,
+    _is_preview_of,
+    _looks_like_preview,
+    _process_resource_list,
+    content_sha256,
+    summarize_resources,
+)
+from .resource_patch import (
+    MAX_EDITS,
+    ResourceEdit,
+    ResourceLookupError,
+    apply_resource_edits,
+    check_config_hash,
+    find_resource,
+    load_inline_resource,
+)
+from .response_helpers import build_pagination_metadata
+from .tool_hints import read_only_hints, write_hints
 
 logger = logging.getLogger(__name__)
 
-# Cloudflare Worker URL for resource hosting
-WORKER_BASE_URL = "https://ha-mcp-resources.rapid-math-bbad.workers.dev"
+# Core validates res_type against its RESOURCE_TYPES; a copy here would reject
+# a type Core adds before Core sees it, so the parameter is a plain string.
+_RESOURCE_TYPE = str
 
-# Maximum base64-encoded URL path length (tested limit: 32KB)
-MAX_ENCODED_LENGTH = 32000
+# Core registers lovelace/resources/{create,update,delete} only in storage
+# resource mode; in YAML mode they answer unknown_command.
+_YAML_MODE_MESSAGE = (
+    "Dashboard resources are YAML-managed on this instance (lovelace: "
+    "resources: in configuration.yaml), so they cannot be changed through the API"
+)
 
-# Maximum content size (~24KB before base64 encoding)
-# Base64 encoding increases size by ~33%, so 24KB * 1.33 ≈ 32KB
-MAX_CONTENT_SIZE = 24000
+# Emitted once per response (not per resource) when any listed resource
+# still lives on the legacy worker.
+_LEGACY_MIGRATION_HINT = (
+    "Resources flagged '_legacy_worker' are still hosted on the legacy "
+    "Cloudflare worker. To convert one: fetch its FULL code with "
+    "ha_config_list_dashboard_resources(include_content=True), then re-save "
+    "it with ha_config_set_dashboard_resource(content=..., resource_id=...). "
+    "Never pass '_preview' as content — it is truncated and would destroy "
+    "the resource."
+)
 
 # Top-level HA-config YAML keys that LLMs sometimes emit when they pick this
 # tool (`ha_config_set_dashboard_resource`) to "create a scene/automation/...".
 # This tool only stores Lovelace JS/CSS resources — the YAML payload would land
 # as a Lovelace module, creating orphaned, unreachable HA entities (see #1072).
-# Map: top-level key → suggested replacement tool (None where no direct tool
-# exists yet — e.g. scenes are tracked in #995).
-_HA_CONFIG_YAML_MARKERS: dict[str, str | None] = {
+# Map: top-level key → the ha-mcp tool that creates that kind of config without
+# YAML (None where only YAML configuration can).
+HA_CONFIG_YAML_MARKERS: dict[str, str | None] = {
     "automation": "ha_config_set_automation",
     "script": "ha_config_set_script",
-    "scene": None,  # Tracked in #995 — scene CRUD tools not yet shipped
+    "scene": "ha_config_set_scene",
     "group": "ha_config_set_group",
     "input_boolean": "ha_config_set_helper(helper_type='input_boolean', ...)",
     "input_number": "ha_config_set_helper(helper_type='input_number', ...)",
@@ -56,7 +101,9 @@ _HA_CONFIG_YAML_MARKERS: dict[str, str | None] = {
     "input_text": "ha_config_set_helper(helper_type='input_text', ...)",
     "input_datetime": "ha_config_set_helper(helper_type='input_datetime', ...)",
     "input_button": "ha_config_set_helper(helper_type='input_button', ...)",
-    "template": None,
+    "template": "ha_config_set_helper(helper_type='template', ...) "
+    "(trigger-based templates are YAML-only: ha_config_set_yaml when YAML "
+    "config editing is enabled, otherwise the HA UI or YAML packages)",
     "homeassistant": None,
     "sensor": None,
     "binary_sensor": None,
@@ -97,7 +144,7 @@ def _detect_ha_config_yaml(content: str) -> str | None:
         break
     if not first_line:
         return None
-    for domain in _HA_CONFIG_YAML_MARKERS:
+    for domain in HA_CONFIG_YAML_MARKERS:
         prefix = f"{domain}:"
         if first_line == prefix:
             # Block-form `automation:` exactly — unambiguous.
@@ -113,30 +160,6 @@ def _detect_ha_config_yaml(content: str) -> str | None:
     return None
 
 
-def _encode_content(content: str) -> tuple[str, int, int]:
-    """Encode content to URL-safe base64. Returns (encoded, content_size, encoded_size)."""
-    content_bytes = content.encode("utf-8")
-    encoded = base64.urlsafe_b64encode(content_bytes).decode("ascii")
-    return encoded, len(content_bytes), len(encoded)
-
-
-def _decode_inline_url(url: str) -> str | None:
-    """Decode an inline resource URL back to content. Returns None if not an inline URL."""
-    if WORKER_BASE_URL not in url:
-        return None
-    try:
-        # Extract base64 part: https://worker.dev/{base64}?type=module
-        encoded = url.replace(f"{WORKER_BASE_URL}/", "").split("?")[0]
-        return base64.urlsafe_b64decode(encoded).decode("utf-8")
-    except Exception:
-        return None
-
-
-def _is_inline_url(url: str) -> bool:
-    """Check if a URL is an inline resource URL."""
-    return WORKER_BASE_URL in url
-
-
 class ResourceTools:
     """Dashboard resource hosting tools for Home Assistant."""
 
@@ -146,12 +169,7 @@ class ResourceTools:
     @tool(
         name="ha_config_list_dashboard_resources",
         tags={"Dashboards"},
-        annotations={
-            "openWorldHint": True,
-            "idempotentHint": True,
-            "readOnlyHint": True,
-            "title": "List Dashboard Resources",
-        },
+        annotations=read_only_hints("List Dashboard Resources", open_world=True),
     )
     @log_tool_usage
     async def ha_config_list_dashboard_resources(
@@ -159,8 +177,19 @@ class ResourceTools:
         include_content: Annotated[
             bool,
             Field(
-                description="Include full decoded content for inline resources. "
-                "Default False to save tokens (shows 150-char preview instead)."
+                description='Include full decoded content for inline resources in the "_content" '
+                "field. When False, a 150-char preview is shown instead. Rows past the "
+                "per-response content budget carry '_content_truncated': True instead "
+                "of '_content'; request a smaller page before copying content into an "
+                "update."
+            ),
+        ] = False,
+        include_hash: Annotated[
+            bool,
+            Field(
+                description='Add "_config_hash" (SHA-256 hex digest of the decoded '
+                "UTF-8 content) to each inline resource, e.g. to verify an edit or "
+                "to pass as config_hash without fetching the content."
             ),
         ] = False,
         limit: Annotated[
@@ -169,7 +198,7 @@ class ResourceTools:
                 default=100,
                 ge=1,
                 le=500,
-                description="Max resources to return per page (default: 100)",
+                description="Max resources to return per page",
             ),
         ] = 100,
         offset: Annotated[
@@ -177,38 +206,28 @@ class ResourceTools:
             Field(
                 default=0,
                 ge=0,
-                description="Number of resources to skip for pagination (default: 0)",
+                description="Number of resources to skip for pagination",
             ),
         ] = 0,
     ) -> dict[str, Any]:
-        """
-        List Lovelace dashboard resources (custom cards, themes, CSS/JS).
+        """List Lovelace dashboard resources (custom cards, themes, CSS/JS).
 
         Returns one page of registered resources; `total_count` and `has_more`
-        report the full set. For inline resources (created with
-        ha_config_set_dashboard_resource(content=...)), shows a preview of the content
-        instead of the full encoded URL to save tokens.
-
-        `inline_count` and `by_type` summarise every resource, not just this page.
-
-        Args:
-            include_content: If True, includes full decoded content for inline
-                resources in "_content" field. Default False (150-char preview only).
-
-        Resource types:
-        - module: ES6 JavaScript modules (modern custom cards)
-        - js: Legacy JavaScript files
-        - css: CSS stylesheets
-
-        Each resource has a unique ID for update/delete operations.
+        report the full set, and `inline_count` and `by_type` summarise every
+        resource, not just this page. Each resource has a unique ID for
+        update/delete operations. For inline resources (created with
+        ha_config_set_dashboard_resource(content=...)), shows a preview of the
+        content instead of the full encoded URL to save tokens.
+        `resource_mode` is Core's lovelace resource mode; in 'yaml' mode
+        resources cannot be created, updated or deleted through the API.
 
         EXAMPLES:
-        - First page of resources: ha_config_list_dashboard_resources()
         - Next page: ha_config_list_dashboard_resources(offset=100)
         - List with full content: ha_config_list_dashboard_resources(include_content=True)
+        - Verify an edit by hash: ha_config_list_dashboard_resources(include_hash=True)
 
-        Note: Home Assistant 2026.6+ exposes resource management in the UI by
-        default, and API access works regardless of UI availability.
+        Home Assistant exposes resource management in the UI by default;
+        API access works regardless of UI availability.
         """
         try:
             result = await self._client.send_websocket_message(
@@ -223,59 +242,61 @@ class ResourceTools:
             else:
                 resources = []
 
-            # Process resources - decode inline URLs for preview
-            processed = _process_resource_list(resources, include_content)
+            by_type_counts, inline_count, decoded_by_index = summarize_resources(
+                resources, offset, offset + limit
+            )
 
-            # Categorize resources by type
-            categorized: dict[str, list[Any]] = {"module": [], "js": [], "css": []}
-            inline_count = 0
-            for res in processed:
-                res_type = res.get("type", "unknown")
-                if res_type in categorized:
-                    categorized[res_type].append(res)
-                if res.get("_inline"):
-                    inline_count += 1
+            total_count = len(resources)
+            page = resources[offset : offset + limit]
+            page_decoded = [decoded_by_index.get(offset + i) for i in range(len(page))]
+            paginated, truncated_count = _process_resource_list(
+                page, page_decoded, include_content, include_hash=include_hash
+            )
 
-            total_count = len(processed)
-            paginated = processed[offset : offset + limit]
-
-            return {
+            response: dict[str, Any] = {
                 "success": True,
                 "action": "list",
                 "resources": paginated,
                 **build_pagination_metadata(total_count, offset, limit, len(paginated)),
                 "inline_count": inline_count,
-                "by_type": {
-                    "module": len(categorized["module"]),
-                    "js": len(categorized["js"]),
-                    "css": len(categorized["css"]),
-                },
+                "by_type": by_type_counts,
             }
+            if truncated_count:
+                response["content_truncated"] = truncated_count
+                response["content_truncation_note"] = (
+                    f"{truncated_count} resource(s) exceeded the "
+                    f"{_MAX_CONTENT_BUDGET:,}-byte per-response content budget and "
+                    "carry '_content_truncated': True. Re-request them with a "
+                    "smaller limit (e.g. limit=1 plus offset) to get their full "
+                    "content — never save a truncated value back."
+                )
+            if any(r.get("_legacy_worker") for r in paginated):
+                response["migration_hint"] = _LEGACY_MIGRATION_HINT
+            resource_mode = await self._resource_mode()
+            if resource_mode:
+                response["resource_mode"] = resource_mode
+                if resource_mode == "yaml":
+                    response["note"] = _YAML_MODE_MESSAGE
+            return response
         except ToolError:
             raise
         except Exception as e:
             logger.error(f"Error listing dashboard resources: {e}")
             exception_to_structured_error(
-                e,
-                context={"tool": "ha_config_list_dashboard_resources"},
-                suggestions=[
-                    "Ensure Home Assistant is running and accessible",
-                    "Check that you have admin permissions",
-                ],
+                e, context={"tool": "ha_config_list_dashboard_resources"}
             )
-            # ``exception_to_structured_error`` always raises (NoReturn); this
-            # explicit raise makes the function's exit unambiguous (no implicit
-            # ``return None`` fall-through) and is never reached at runtime.
+            # Unreachable (exception_to_structured_error is NoReturn).
             raise
 
     @tool(
         name="ha_config_set_dashboard_resource",
         tags={"Dashboards"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "title": "Set Dashboard Resource",
-        },
+        annotations=write_hints(
+            "Set Dashboard Resource",
+            destructive=True,
+            idempotent=False,
+            open_world=False,
+        ),
     )
     @with_auto_backup(domain="dashboard_resource", id_param="resource_id")
     @log_tool_usage
@@ -283,27 +304,18 @@ class ResourceTools:
         self,
         content: Annotated[
             str | None,
-            Field(
-                description="JavaScript or CSS code to host inline (max ~24KB). "
-                "The code is embedded in the URL via Cloudflare Worker - no file storage needed. "
-                "Mutually exclusive with url. Supports 'module' and 'css' types only."
-            ),
+            Field(description="JavaScript or CSS code to host inline."),
         ] = None,
         url: Annotated[
             str | None,
-            Field(
-                description="URL of the resource. Can be: "
-                "/local/file.js (www/ directory), "
-                "/hacsfiles/component/file.js (HACS), "
-                "https://cdn.example.com/card.js (external). "
-                "Mutually exclusive with content."
-            ),
+            Field(description="URL of the resource."),
         ] = None,
         resource_type: Annotated[
-            Literal["module", "js", "css"],
+            _RESOURCE_TYPE,
             Field(
-                description="Resource type: 'module' for ES6 modules (modern cards, default), "
-                "'js' for legacy JavaScript (url mode only), 'css' for stylesheets"
+                description="Resource type, validated by Home Assistant: 'module' for ES6 "
+                "modules (modern cards), 'js' for legacy JavaScript (older custom cards), "
+                "'css' for stylesheets (themes, global styles), 'html' for HTML imports"
             ),
         ] = "module",
         resource_id: Annotated[
@@ -313,70 +325,80 @@ class ResourceTools:
                 "Get IDs from ha_config_list_dashboard_resources()"
             ),
         ] = None,
+        edits: Annotated[
+            # Bounds on the list, not the union: there they render as
+            # minItems/maxItems instead of string-only minLength/maxLength.
+            Annotated[list[ResourceEdit], Field(min_length=1, max_length=MAX_EDITS)]
+            | None,
+            JSON_STRING_COERCION,
+            Field(
+                description="Search/replace edits for an existing inline resource, "
+                "applied in order. Requires resource_id; resource_type is ignored "
+                "and the stored type is kept.",
+            ),
+        ] = None,
+        config_hash: Annotated[
+            str | None,
+            Field(
+                description="With edits: refuse the patch unless the stored content "
+                "has this hash when read, just before the write (the list's "
+                "_config_hash with include_hash=True, or a previous write "
+                "response's config_hash). A preflight "
+                "check only: a change made by another client after that read is "
+                "not detected and can be overwritten."
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        """
-        Create or update a dashboard resource (inline code or external URL).
+        """Create or update a dashboard resource (inline code or external URL).
 
         Provide exactly one of:
-        - content: Inline JavaScript or CSS code (embedded in URL, no file storage needed)
-        - url: External resource URL (/local/, /hacsfiles/, or https://...)
-
-        INLINE MODE (content=):
-        - Custom card code written inline
-        - CSS styling for dashboards
-        - Small utility modules (<24KB)
-        - URLs are deterministic (same content = same URL)
-        - Supports 'module' and 'css' types only (not 'js')
-
-        URL MODE (url=):
-        - Files in /config/www/ directory (/local/...)
-        - HACS-installed cards (/hacsfiles/...)
-        - External CDN resources (https://...)
-        - Supports all types: 'module', 'js', 'css'
-
-        RESOURCE TYPES:
-        - module: ES6 JavaScript modules (recommended for custom cards)
-        - js: Legacy JavaScript files (older custom cards, url mode only)
-        - css: CSS stylesheets (themes, global styles)
+        - edits: Search/replace edits on an existing inline resource. Any
+          failing edit (or a config_hash mismatch) aborts the whole call
+          and saves nothing. Prefer this over content= for small changes to a
+          large card: only the changed text is sent.
+        - content: Inline JavaScript or CSS code (embedded in the resource URL
+          as a data: URI — no file storage or external hosting involved).
+          Supports 'module' and 'css' types only; URLs are
+          deterministic (same content = same URL); up to ~128KB. Content must be
+          self-contained: a data: URI has no base URL, so relative imports inside
+          a module and relative url() references inside CSS cannot resolve (use
+          fully-qualified URLs instead). If Home Assistant is behind a reverse
+          proxy that injects a Content-Security-Policy without 'data:' in
+          script-src/style-src, the browser blocks these resources: this call
+          still succeeds and the card simply never renders. Register the code as
+          a file and use url='/local/...' on such a deployment. (HA itself ships
+          no CSP.)
+        - url: External resource URL — /local/... (/config/www/; Marketplace
+          cards: /local/community/...), /hacsfiles/... (the older path
+          for the same folder) or https://... (CDN). Supports all types:
+          'module', 'js', 'css', 'html'.
 
         EXAMPLES:
+        - Inline: ha_config_set_dashboard_resource(content="class MyCard extends HTMLElement { ... } customElements.define('my-card', MyCard);", resource_type="module")
+        - Store cards need no call: in storage mode the Marketplace registers the resource on install (adding it again duplicates it); with YAML-mode resources, list it under lovelace: resources: in configuration.yaml instead.
+        - Update: ha_config_set_dashboard_resource(url="/local/my-card-v2.js", resource_type="module", resource_id="abc123")
+        - Patch: ha_config_set_dashboard_resource(resource_id="abc123", edits=[{"old": "color: red", "new": "color: blue"}], config_hash="<_config_hash from the list>")
 
-        Inline custom card:
-        ha_config_set_dashboard_resource(
-            content=\"\"\"
-            class MyCard extends HTMLElement {
-              setConfig(config) { this.config = config; }
-              set hass(hass) {
-                this.innerHTML = `<ha-card>Hello ${hass.states[this.config.entity]?.state}</ha-card>`;
-              }
-            }
-            customElements.define('my-card', MyCard);
-            \"\"\",
-            resource_type="module"
-        )
+        Inline writes return the stored content's config_hash.
 
-        Add custom card from www/ directory:
-        ha_config_set_dashboard_resource(
-            url="/local/my-custom-card.js",
-            resource_type="module"
-        )
-
-        Add HACS card (after installing via ha_manage_hacs(action='download')):
-        ha_config_set_dashboard_resource(
-            url="/hacsfiles/lovelace-mushroom/mushroom.js",
-            resource_type="module"
-        )
-
-        Update existing resource:
-        ha_config_set_dashboard_resource(
-            url="/local/my-card-v2.js",
-            resource_type="module",
-            resource_id="abc123"
-        )
-
-        Note: After adding a resource, clear browser cache or hard refresh
-        (Ctrl+Shift+R) to load changes.
+        After adding a resource, a browser cache clear or hard refresh
+        (Ctrl+Shift+R) is needed to load it.
         """
+        if edits is not None:
+            return await self._patch_inline_resource(
+                resource_id, edits, config_hash, other_modes=(content, url)
+            )
+        if config_hash is not None:
+            raise_tool_error(
+                create_error_response(
+                    code=ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    message="config_hash only applies together with edits",
+                    suggestions=[
+                        "Pass edits=[...] with resource_id, or drop config_hash"
+                    ],
+                )
+            )
+
         # Validate: exactly one of content or url must be provided
         if content is not None and url is not None:
             raise_tool_error(
@@ -402,6 +424,35 @@ class ResourceTools:
                 )
             )
 
+        # Hand-built data: URLs would bypass every inline-mode guard (empty /
+        # size / type checks and the #1072 YAML-misroute rejection) now that
+        # the inline format is documented in this docstring. Route callers to
+        # content=, where those guards run.
+        if url is not None and _is_data_url(url):
+            raise_tool_error(
+                create_error_response(
+                    code=ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    message="data: URLs cannot be registered via url= — "
+                    "pass the code itself via content= instead",
+                    suggestions=[
+                        "Use content=<your JS/CSS source> (the tool builds the data: URI)",
+                        "url= is for /local/, /hacsfiles/, and https:// resources",
+                    ],
+                )
+            )
+        # ``None`` stays the documented "create-new" sentinel; an explicit
+        # empty/whitespace ``resource_id`` would route to the create branch
+        # of ``_upsert_resource`` and lose update intent.
+        if resource_id is not None:
+            validate_identifier_not_empty(
+                resource_id,
+                "resource_id",
+                suggestions=[
+                    "Omit resource_id entirely to create a new resource",
+                    "Pass a valid resource_id to update an existing resource",
+                ],
+                context={"action": "set"},
+            )
         if content is not None:
             return await self._set_inline_resource(content, resource_type, resource_id)
         return await self._set_url_resource(url, resource_type, resource_id)
@@ -410,33 +461,23 @@ class ResourceTools:
         self, detected_yaml: str, resource_type: str
     ) -> NoReturn:
         """Raise the structured error for HA-config YAML misrouted as inline resource content."""
-        right_tool = _HA_CONFIG_YAML_MARKERS[detected_yaml]
-        suggestions = ["This tool stores Lovelace JavaScript/CSS resources only"]
+        right_tool = HA_CONFIG_YAML_MARKERS[detected_yaml]
         if right_tool:
-            suggestions.insert(
-                0,
-                f"For `{detected_yaml}:` configuration, use {right_tool} instead",
-            )
-        elif detected_yaml == "scene":
-            suggestions.insert(
-                0,
-                "Scene configuration tools are tracked in #995; "
-                "until they ship, scenes can only be created via the HA UI",
-            )
+            first = f"For `{detected_yaml}:` configuration, use {right_tool} instead"
         else:
-            suggestions.insert(
-                0,
-                f"No direct tool exists for `{detected_yaml}:` config; "
-                "configure it via the HA UI or YAML packages",
+            first = (
+                f"`{detected_yaml}:` is YAML configuration: ha_config_set_yaml "
+                "writes the keys it allows when YAML config editing is enabled; "
+                "otherwise use the HA UI or YAML packages"
             )
+        suggestions = [first, "This tool stores Lovelace JavaScript/CSS resources only"]
         raise_tool_error(
             create_error_response(
                 code=ErrorCode.VALIDATION_INVALID_PARAMETER,
                 message=(
-                    f"Content starts with HA-configuration YAML "
+                    "Content starts with HA-configuration YAML "
                     f"(`{detected_yaml}:`) — this tool only accepts Lovelace "
-                    f"JavaScript or CSS resources, not Home Assistant config "
-                    f"(see issue #1072)."
+                    "JavaScript or CSS resources, not Home Assistant config."
                 ),
                 context={
                     "detected_marker": f"{detected_yaml}:",
@@ -449,10 +490,18 @@ class ResourceTools:
     async def _set_inline_resource(
         self,
         content: str,
-        resource_type: str,
+        resource_type: _RESOURCE_TYPE,
         resource_id: str | None,
+        *,
+        check_preview: bool = True,
     ) -> dict[str, Any]:
-        """Create or update an inline dashboard resource."""
+        """Create or update an inline dashboard resource.
+
+        ``check_preview=False`` skips the truncated-preview guard. Only edit
+        results pass it: they are derived from the stored content, not
+        copied from a list response, so a preview-shaped result (e.g. a
+        suffix deletion leaving ``_PREVIEW_LENGTH`` characters) is intended.
+        """
         if not content.strip():
             raise_tool_error(
                 create_error_response(
@@ -461,14 +510,14 @@ class ResourceTools:
                 )
             )
 
-        if resource_type == "js":
+        if resource_type not in _DATA_URI_MIME:
             raise_tool_error(
                 create_error_response(
                     code=ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    message="Inline content does not support resource_type='js'",
+                    message=f"Inline content does not support resource_type={resource_type!r}",
                     suggestions=[
                         "Use resource_type='module' for ES6 JavaScript (recommended)",
-                        "Use url= mode with resource_type='js' for legacy files",
+                        "Use url= mode for a file of another resource type",
                     ],
                 )
             )
@@ -489,7 +538,7 @@ class ResourceTools:
                 create_error_response(
                     code=ErrorCode.VALIDATION_INVALID_PARAMETER,
                     message=f"Content too large: {content_size:,} bytes (max {MAX_CONTENT_SIZE:,})",
-                    context={"size": content_size},
+                    context={"size": content_size, "limit": MAX_CONTENT_SIZE},
                     suggestions=[
                         "Minify the code to reduce size",
                         "Split into multiple smaller modules",
@@ -498,35 +547,23 @@ class ResourceTools:
                 )
             )
 
-        encoded, _, encoded_size = _encode_content(content)
+        if resource_id is not None and check_preview:
+            await self._reject_truncated_preview_resave(content, resource_id)
 
-        if encoded_size > MAX_ENCODED_LENGTH:
-            raise_tool_error(
-                create_error_response(
-                    code=ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    message=f"Encoded content too large: {encoded_size:,} chars (max {MAX_ENCODED_LENGTH:,})",
-                    context={"size": content_size},
-                )
-            )
-
-        resource_url = f"{WORKER_BASE_URL}/{encoded}?type={resource_type}"
+        resource_url = _data_uri_for(content, resource_type)
 
         try:
             result, action = await self._upsert_resource(
                 resource_id, resource_url, resource_type
             )
 
-            error_msg = _check_ws_error(result)
-            if error_msg:
-                raise_tool_error(
-                    create_error_response(
-                        code=ErrorCode.SERVICE_CALL_FAILED,
-                        message=str(error_msg),
-                        context={"action": action},
-                    )
+            if _check_ws_error(result):
+                await self._raise_write_error(
+                    result, {"action": action, "resource_id": resource_id}
                 )
 
             new_resource_id = _extract_resource_id(result, resource_id)
+            _require_created_resource_id(new_resource_id, action)
 
             logger.info(
                 f"Inline dashboard resource {action}: id={new_resource_id}, "
@@ -539,6 +576,7 @@ class ResourceTools:
                 "resource_id": new_resource_id,
                 "resource_type": resource_type,
                 "size": content_size,
+                "config_hash": _stored_content_hash(result),
                 "note": "Clear browser cache or hard refresh to load changes",
             }
         except ToolError:
@@ -551,20 +589,146 @@ class ResourceTools:
                     "tool": "ha_config_set_dashboard_resource",
                     "action": "update" if resource_id else "create",
                 },
-                suggestions=[
-                    "Ensure Home Assistant is running and accessible",
-                    "Check that you have admin permissions",
-                ],
             )
-            # ``exception_to_structured_error`` always raises (NoReturn); this
-            # explicit raise makes the function's exit unambiguous (no implicit
-            # ``return None`` fall-through) and is never reached at runtime.
+            # Unreachable (exception_to_structured_error is NoReturn).
             raise
+
+    async def _patch_inline_resource(
+        self,
+        resource_id: str | None,
+        edits: list[ResourceEdit],
+        config_hash: str | None,
+        other_modes: tuple[str | None, str | None],
+    ) -> dict[str, Any]:
+        """Apply search/replace edits to a stored inline resource, all or nothing."""
+        if any(mode is not None for mode in other_modes):
+            raise_tool_error(
+                create_error_response(
+                    code=ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    message="Provide only one of 'edits', 'content' or 'url'",
+                    suggestions=[
+                        "Use edits= alone to change part of an existing inline resource",
+                    ],
+                )
+            )
+        if resource_id is None:
+            raise_tool_error(
+                create_error_response(
+                    code=ErrorCode.VALIDATION_MISSING_PARAMETER,
+                    message="edits requires resource_id",
+                    suggestions=[
+                        "Get the ID from ha_config_list_dashboard_resources()",
+                    ],
+                )
+            )
+        validate_identifier_not_empty(
+            resource_id,
+            "resource_id",
+            suggestions=["Pass the ID of the inline resource to patch"],
+            context={"action": "patch"},
+        )
+        # with_auto_backup holds this resource's write lock around the whole
+        # call (resource_write_lock), so no other write through this server
+        # lands between this read and the write below.
+        try:
+            stored, resource_type = await load_inline_resource(
+                self._client, resource_id
+            )
+        except ToolError:
+            raise
+        except Exception as e:
+            logger.error(f"Error reading dashboard resource to patch: {e}")
+            exception_to_structured_error(
+                e,
+                context={
+                    "tool": "ha_config_set_dashboard_resource",
+                    "action": "patch",
+                    "resource_id": resource_id,
+                },
+            )
+            # Unreachable (exception_to_structured_error is NoReturn).
+            raise
+        check_config_hash(stored, config_hash)
+        patched = apply_resource_edits(stored, edits)
+        response = await self._set_inline_resource(
+            patched, resource_type, resource_id, check_preview=False
+        )
+        return {**response, "action": "patched", "applied": len(edits)}
+
+    async def _reject_truncated_preview_resave(
+        self, content: str, resource_id: str
+    ) -> None:
+        """Refuse to overwrite an inline resource with its own truncated preview.
+
+        The list tool's default output carries ``_preview`` — the first
+        ``_PREVIEW_LENGTH`` characters plus ``"..."``. An agent that re-saves
+        a resource using that string as ``content`` would silently replace
+        the user's card with a syntactically broken fragment.
+
+        Only preview-shaped content triggers the (one WS round-trip) check,
+        so normal updates pay nothing. When the check itself cannot run, it
+        FAILS CLOSED: the write is refused rather than allowed unverified.
+        A preview-shaped payload is already the suspicious case, and the
+        costs are lopsided — a wrong refusal costs one retry with the real
+        content, a wrong allow destroys the user's card and still reports
+        ``success: True``.
+        """
+        if not _looks_like_preview(content):
+            return
+
+        def _unverifiable(detail: str) -> NoReturn:
+            logger.warning(
+                "Preview-writeback guard could not verify resource %s (%s); "
+                "refusing the update rather than risking content loss",
+                resource_id,
+                detail,
+            )
+            raise_tool_error(
+                create_error_response(
+                    code=ErrorCode.SERVICE_CALL_FAILED,
+                    message=(
+                        "Content looks like the truncated preview from "
+                        "ha_config_list_dashboard_resources, and the stored "
+                        f"resource could not be read back to confirm ({detail}). "
+                        "Refusing the write: saving a preview would destroy the "
+                        "resource."
+                    ),
+                    context={"resource_id": resource_id},
+                    suggestions=[
+                        "Fetch the full code with ha_config_list_dashboard_resources(include_content=True)",
+                        "Re-save with the complete content (this check only triggers on preview-shaped content)",
+                    ],
+                )
+            )
+
+        try:
+            found = await find_resource(self._client, resource_id)
+        except ResourceLookupError as e:
+            _unverifiable(e.detail)
+        except Exception as e:  # noqa: BLE001
+            _unverifiable(f"listing the resources failed: {e}")
+        if found is None:
+            return
+        stored = found[1]
+        if stored and _is_preview_of(content, stored):
+            raise_tool_error(
+                create_error_response(
+                    code=ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    message="Content is the truncated preview from "
+                    "ha_config_list_dashboard_resources, not the full "
+                    "resource code — saving it would destroy the resource",
+                    context={"resource_id": resource_id},
+                    suggestions=[
+                        "Fetch the full code with ha_config_list_dashboard_resources(include_content=True)",
+                        "Then re-save with the complete content",
+                    ],
+                )
+            )
 
     async def _set_url_resource(
         self,
         url: str | None,
-        resource_type: str,
+        resource_type: _RESOURCE_TYPE,
         resource_id: str | None,
     ) -> dict[str, Any]:
         """Create or update an external URL dashboard resource."""
@@ -573,30 +737,13 @@ class ResourceTools:
                 resource_id, url, resource_type
             )
 
-            error_msg = _check_ws_error(result)
-            if error_msg:
-                error_str = str(error_msg).lower()
-                if "already exists" in error_str or "duplicate" in error_str:
-                    raise_tool_error(
-                        create_error_response(
-                            code=ErrorCode.SERVICE_CALL_FAILED,
-                            message="Resource with this URL already exists",
-                            context={"action": action, "url": url},
-                            suggestions=[
-                                "Use ha_config_list_dashboard_resources() to find existing resource",
-                                "Provide resource_id to update the existing resource",
-                            ],
-                        )
-                    )
-                raise_tool_error(
-                    create_error_response(
-                        code=ErrorCode.SERVICE_CALL_FAILED,
-                        message=str(error_msg),
-                        context={"action": action, "url": url},
-                    )
+            if _check_ws_error(result):
+                await self._raise_write_error(
+                    result, {"action": action, "resource_id": resource_id, "url": url}
                 )
 
             new_resource_id = _extract_resource_id(result, resource_id)
+            _require_created_resource_id(new_resource_id, action)
 
             logger.info(
                 f"Dashboard resource {action}: id={new_resource_id}, "
@@ -622,39 +769,77 @@ class ResourceTools:
                     "action": "update" if resource_id else "create",
                     "url": url,
                 },
-                suggestions=[
-                    "Ensure Home Assistant is running and accessible",
-                    "Check that you have admin permissions",
-                    "Verify the URL is correctly formatted",
-                ],
             )
-            # ``exception_to_structured_error`` always raises (NoReturn); this
-            # explicit raise makes the function's exit unambiguous (no implicit
-            # ``return None`` fall-through) and is never reached at runtime.
+            # Unreachable (exception_to_structured_error is NoReturn).
             raise
+
+    async def _resource_mode(self) -> str | None:
+        """Core's lovelace ``resource_mode`` ('storage'/'yaml'), None if unreadable."""
+        try:
+            result = await self._client.send_websocket_message(
+                {"type": "lovelace/info"}
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not read lovelace/info: {e}")
+            return None
+        info = result.get("result") if isinstance(result, dict) else None
+        mode = info.get("resource_mode") if isinstance(info, dict) else None
+        return mode if isinstance(mode, str) else None
+
+    async def _raise_write_error(
+        self, result: Any, context: dict[str, Any]
+    ) -> NoReturn:
+        """Raise Core's rejection of a resource write, routed on Core's error code."""
+        error_msg = str(_check_ws_error(result))
+        code = result.get("error_code") if isinstance(result, dict) else None
+        resource_id = context.get("resource_id")
+        if code == "not_found" and resource_id:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    f"Dashboard resource '{resource_id}' not found",
+                    details=error_msg,
+                    context=context,
+                    suggestions=[
+                        "Use ha_config_list_dashboard_resources() to see available resources"
+                    ],
+                )
+            )
+        if code == "unknown_command" and await self._resource_mode() == "yaml":
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    _YAML_MODE_MESSAGE,
+                    details=error_msg,
+                    context={**context, "resource_mode": "yaml"},
+                    suggestions=[
+                        "Edit lovelace: resources: in configuration.yaml, then run "
+                        "the lovelace.reload_resources action"
+                    ],
+                )
+            )
+        raise_tool_error(
+            create_error_response(
+                ws_failure_code(result)
+                if isinstance(result, dict)
+                else ErrorCode.SERVICE_CALL_FAILED,
+                error_msg,
+                context={**context, "ha_error_code": code} if code else context,
+            )
+        )
 
     async def _upsert_resource(
         self,
         resource_id: str | None,
         url: str | None,
-        resource_type: str,
+        resource_type: _RESOURCE_TYPE,
     ) -> tuple[dict[str, Any], str]:
-        """Create or update a lovelace resource. Returns (result, action)."""
-        # ``None`` stays the documented "create-new" sentinel; explicit
-        # empty/whitespace ``resource_id`` would silently route to the
-        # ``else`` create branch below and lose update intent (destructive
-        # intent-loss class, same as the registry-metadata twins).
+        """Create or update a lovelace resource. Returns (result, action).
+
+        Callers validate ``resource_id`` first: None creates, anything else
+        updates.
+        """
         if resource_id is not None:
-            validate_identifier_not_empty(
-                resource_id,
-                "resource_id",
-                suggestions=[
-                    "Omit resource_id entirely to create a new resource",
-                    "Pass a valid resource_id to update an existing resource",
-                ],
-                context={"action": "set"},
-            )
-        if resource_id:
             result = await self._client.send_websocket_message(
                 {
                     "type": "lovelace/resources/update",
@@ -677,11 +862,12 @@ class ResourceTools:
     @tool(
         name="ha_config_delete_dashboard_resource",
         tags={"Dashboards"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "title": "Delete Dashboard Resource",
-        },
+        annotations=write_hints(
+            "Delete Dashboard Resource",
+            destructive=True,
+            idempotent=True,
+            open_world=False,
+        ),
     )
     @with_auto_backup(domain="dashboard_resource", id_param="resource_id")
     @log_tool_usage
@@ -689,9 +875,7 @@ class ResourceTools:
         self,
         resource_id: Annotated[
             str,
-            Field(
-                description="Resource ID to delete. Get from ha_config_list_dashboard_resources()"
-            ),
+            Field(description="Resource ID to delete."),
         ],
     ) -> dict[str, Any]:
         """
@@ -726,33 +910,9 @@ class ResourceTools:
                 }
             )
 
-            # Check for errors
-            error_msg = _check_ws_error(result)
-            if error_msg:
-                error_str = str(error_msg).lower()
-                if "not found" in error_str or "unable to find" in error_str:
-                    raise_tool_error(
-                        create_error_response(
-                            ErrorCode.RESOURCE_NOT_FOUND,
-                            f"Dashboard resource '{resource_id}' not found",
-                            details=(
-                                f"Resource '{resource_id}' not found. "
-                                "Use ha_config_list_dashboard_resources() to see available resources."
-                            ),
-                            context={"action": "delete", "resource_id": resource_id},
-                        )
-                    )
-
-                raise_tool_error(
-                    create_error_response(
-                        code=ErrorCode.SERVICE_CALL_FAILED,
-                        message=f"Failed to delete dashboard resource: {error_msg}",
-                        context={"action": "delete", "resource_id": resource_id},
-                        suggestions=[
-                            "Verify resource ID using ha_config_list_dashboard_resources()",
-                            "Check that you have admin permissions",
-                        ],
-                    )
+            if _check_ws_error(result):
+                await self._raise_write_error(
+                    result, {"action": "delete", "resource_id": resource_id}
                 )
 
             logger.info(f"Dashboard resource deleted: id={resource_id}")
@@ -768,16 +928,9 @@ class ResourceTools:
         except Exception as e:
             logger.error(f"Error deleting dashboard resource: {e}")
             exception_to_structured_error(
-                e,
-                context={"action": "delete", "resource_id": resource_id},
-                suggestions=[
-                    "Verify resource ID using ha_config_list_dashboard_resources()",
-                    "Check that you have admin permissions",
-                ],
+                e, context={"action": "delete", "resource_id": resource_id}
             )
-            # ``exception_to_structured_error`` always raises (NoReturn); this
-            # explicit raise makes the function's exit unambiguous (no implicit
-            # ``return None`` fall-through) and is never reached at runtime.
+            # Unreachable (exception_to_structured_error is NoReturn).
             raise
 
 
@@ -786,49 +939,47 @@ def register_resources_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
     register_tool_methods(mcp, ResourceTools(client))
 
 
-def _process_resource_list(
-    resources: list[Any], include_content: bool
-) -> list[dict[str, Any]]:
-    """Process raw resources, decoding inline URLs for preview."""
-    processed = []
-    for resource in resources:
-        res = dict(resource)
-        url = res.get("url", "")
-
-        if _is_inline_url(url):
-            content = _decode_inline_url(url)
-            if content:
-                res["_inline"] = True
-                res["_size"] = len(content)
-
-                if include_content:
-                    res["_content"] = content
-                else:
-                    preview = content[:150]
-                    if len(content) > 150:
-                        preview += "..."
-                    res["_preview"] = preview
-
-                res["url"] = "[inline]"
-
-        processed.append(res)
-    return processed
-
-
-def _check_ws_error(result: Any) -> str | None:
-    """Check a WebSocket result for errors. Returns error message or None."""
-    if isinstance(result, dict) and not result.get("success", True):
-        error = result.get("error", {})
-        if isinstance(error, dict):
-            msg: str = error.get("message", str(error)) or "Unknown error"
-            return msg
-        return str(error) or "Unknown error"
-    return None
-
-
 def _extract_resource_id(result: Any, fallback_id: str | None) -> str | None:
-    """Extract resource ID from a WebSocket result."""
+    """Extract resource ID from a WebSocket result.
+
+    On the create path ``fallback_id`` is None, so a response without an id
+    would yield ``resource_id: None`` alongside ``success: True`` — leaving
+    the caller no handle to update or delete what it just created. Callers
+    guard that with ``_require_created_resource_id``.
+    """
     resource_info = result.get("result") if isinstance(result, dict) else result
     if isinstance(resource_info, dict):
         return resource_info.get("id", fallback_id)
     return fallback_id
+
+
+def _stored_content_hash(result: Any) -> str | None:
+    """Hash the content Home Assistant stored, decoded from the write's result.
+
+    ``lovelace/resources/create`` and ``/update`` return the stored item;
+    hashing its URL rather than the string sent keeps the hash tied to what
+    HA holds. None when the result carries no decodable inline URL.
+    """
+    item = result.get("result") if isinstance(result, dict) else None
+    url = item.get("url") if isinstance(item, dict) else None
+    decoded = _decode_inline_content(url) if isinstance(url, str) else None
+    return content_sha256(decoded[0]) if decoded else None
+
+
+def _require_created_resource_id(resource_id: str | None, action: str) -> None:
+    """Fail a create that came back without an id rather than reporting success."""
+    if action == "created" and not resource_id:
+        raise_tool_error(
+            create_error_response(
+                code=ErrorCode.SERVICE_CALL_FAILED,
+                message=(
+                    "Home Assistant reported the resource was created but "
+                    "returned no resource_id, so it cannot be updated or "
+                    "deleted by this tool"
+                ),
+                context={"action": action},
+                suggestions=[
+                    "Run ha_config_list_dashboard_resources() to locate the resource and confirm whether it was created",
+                ],
+            )
+        )

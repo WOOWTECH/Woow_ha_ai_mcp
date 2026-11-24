@@ -1,5 +1,5 @@
 """
-End-to-End tests for Home Assistant Script Management (ha_manage_script tool).
+End-to-End tests for the Home Assistant script configuration tool family.
 
 This test suite validates the complete lifecycle of Home Assistant scripts including:
 - Script creation with various configurations
@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 def enhanced_parse_mcp_result(result) -> dict[str, Any]:
     """Enhanced MCP result parser with better error handling."""
+    # Same passthrough contract as the shared utilities.assertions helper:
+    # an already-parsed dict comes back unchanged.
+    if isinstance(result, dict):
+        return result
     try:
         if hasattr(result, "content") and result.content:
             response_text = str(result.content[0].text)
@@ -53,7 +57,7 @@ def enhanced_parse_mcp_result(result) -> dict[str, Any]:
                         .replace("null", "None")
                     )
                     return ast.literal_eval(fixed_text)
-                except (SyntaxError, NameError, ValueError, TypeError):
+                except SyntaxError, NameError, ValueError, TypeError:
                     # Return raw response if parsing fails
                     return {"raw_response": response_text, "parse_error": True}
 
@@ -63,18 +67,20 @@ def enhanced_parse_mcp_result(result) -> dict[str, Any]:
                 str(result.content[0]) if hasattr(result, "content") else str(result)
             )
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Failed to parse MCP result: {e}")
         return {"error": "Failed to parse result", "exception": str(e)}
 
 
 def extract_script_config(get_data: dict[str, Any]) -> dict[str, Any]:
-    """Extract script configuration from ha_manage_script get response."""
-    # Handle nested config structure: get_data["config"]["config"]
-    config_wrapper = get_data.get("config", {})
-    if isinstance(config_wrapper, dict) and "config" in config_wrapper:
-        return config_wrapper.get("config", {})
-    return config_wrapper
+    """Extract script configuration from a ha_config_get_script response.
+
+    ``config`` is the script body. It used to be the REST envelope, so this
+    helper unwrapped a second ``config`` key; doing that now would corrupt a
+    script whose body legitimately carries one.
+    """
+    config = get_data.get("config", {})
+    return config if isinstance(config, dict) else {}
 
 
 def wait_for_script_registration(script_count: int = 1) -> int:
@@ -166,7 +172,7 @@ async def verify_script_exists_and_registered(
                     logger.info(f"✅ Script {script_entity} found via search API")
                     return True
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"Script registration check failed: {e}")
 
         elapsed = time.monotonic() - start_time
@@ -200,7 +206,7 @@ async def verify_script_execution_state(
                 return state_data
 
             consecutive_failures = 0  # Reset on successful API call
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             consecutive_failures += 1
             logger.debug(
                 f"State check failed ({consecutive_failures}/{max_consecutive_failures}): {e}"
@@ -262,7 +268,7 @@ async def _verify_bulk_scripts(mcp, created_scripts):
             verified_scripts.append((script_id, script_entity))
             logger.info(f"✅ Verified: {script_entity} - {config.get('alias')}")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"❌ Failed to verify {script_entity}: {e}")
     return verified_scripts
 
@@ -928,7 +934,7 @@ class TestScriptOrchestration:
 
                     logger.info(f"✅ Created: {script_entity}")
 
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.error(f"❌ Failed to create {script_id}: {e}")
                     failed_scripts.append((script_id, str(e)))
 
@@ -963,7 +969,7 @@ class TestScriptOrchestration:
                     )
                     executed_scripts.append((script_id, script_entity))
                     logger.info(f"✅ Executed: {script_entity}")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.error(f"❌ Failed to execute {script_entity}: {e}")
 
             # Allow all executions to complete (max delay is 2s + processing)
@@ -983,7 +989,7 @@ class TestScriptOrchestration:
                     )
                     deleted_scripts.append((script_id, script_entity))
                     logger.debug(f"🗑️ Deleted: {script_entity}")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.error(f"❌ Failed to delete {script_entity}: {e}")
                     failed_deletions.append((script_id, script_entity, str(e)))
 
@@ -1113,7 +1119,7 @@ async def test_script_search_and_discovery(mcp_client):
                         logger.info(f"    - Steps: {sequence_count}")
                         logger.info(f"    - Mode: {mode}")
 
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         logger.info(
                             f"ℹ️ Could not retrieve config for {script_entity_id}: {str(e)} (likely YAML-defined)"
                         )
@@ -1135,7 +1141,7 @@ async def test_script_search_and_discovery(mcp_client):
             else:
                 logger.info("ℹ️ No scripts found in system for discovery test")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"⚠️ Script search failed: {e}")
             logger.info(
                 "ℹ️ This may be normal if no scripts exist in the test environment"
@@ -1149,10 +1155,10 @@ async def script_blueprint_path(mcp_client):
     """Fixture to get the path of the first available script blueprint."""
     async with MCPAssertions(mcp_client) as mcp:
         list_result = await mcp.call_tool_success(
-            "ha_get_blueprint",
-            {"domain": "script"},
+            "ha_manage_blueprints",
+            {"action": "list", "domain": "script"},
         )
-        blueprints = list_result.get("blueprints", [])
+        blueprints = list_result["data"].get("blueprints", [])
         if not blueprints:
             pytest.skip("No script blueprints available for testing")
         return blueprints[0]["path"]
@@ -1178,11 +1184,11 @@ async def test_blueprint_script_lifecycle(
 
         # Step 2: Get blueprint details to understand required inputs
         detail_result = await mcp.call_tool_success(
-            "ha_get_blueprint",
-            {"path": blueprint_path, "domain": "script"},
+            "ha_manage_blueprints",
+            {"action": "get", "path": blueprint_path, "domain": "script"},
         )
 
-        inputs = detail_result.get("inputs", {})
+        inputs = detail_result["data"].get("inputs", {})
         logger.info(f"Blueprint has {len(inputs)} inputs")
 
         # Step 3: Create script from blueprint (no sequence field)

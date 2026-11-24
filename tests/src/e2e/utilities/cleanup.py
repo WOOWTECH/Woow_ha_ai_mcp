@@ -5,12 +5,106 @@ This module provides utilities for cleaning up test entities, managing test data
 and ensuring tests don't interfere with each other.
 """
 
+import asyncio
 import logging
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from types import TracebackType
 from typing import Any
 
+import pytest
+
+from ...timed_out_task import CANCEL_MESSAGE
 from .assertions import parse_mcp_result
 
 logger = logging.getLogger(__name__)
+
+
+class CleanupSteps:
+    """Run a ``finally`` block's cleanup so one failed step neither skips the
+    next nor replaces the test's own failure.
+
+    Enter it as the first statement of the ``finally`` block and wrap each step
+    in ``with cleanup.step():``. A step that raises an ``Exception`` or calls
+    ``pytest.fail()`` or ``pytest.skip()`` is logged and the next step runs.
+    On exit the failures raise one ``AssertionError`` naming all of them,
+    unless the body failed: then they stay in the log, and the body's own
+    failure is the one pytest reports. A skipped body has no failure to keep,
+    so it counts as passed.
+
+    ``pytest.fail()`` counts as a failed step because some wait helpers in the
+    tests use it. A skip in a step is a failed step too, so it cannot report a
+    failed body as skipped. Any other ``BaseException`` (``KeyboardInterrupt``,
+    an ``asyncio.CancelledError`` without the timeout hook's ``CANCEL_MESSAGE``)
+    ends the cleanup and propagates unchanged.
+
+    The per-test timeout (pytest-timeout's ``signal`` method) calls
+    ``pytest.fail()`` in whatever frame runs when it fires. While a step runs
+    blocking code, the step records the timeout as a failed step and the next
+    step runs; the timeout fires only once, so only the steps' own time limits
+    and the CI job timeout bound every step after it, blocking or awaiting.
+    While the test awaits, the hook in ``tests/src/timed_out_task.py`` cancels
+    its task instead. When that cancellation lands in the body, the steps run
+    as after any failed body; a step cancelled with the hook's
+    ``CANCEL_MESSAGE`` counts as a failed step, and the next step runs. Either
+    way, a ``CancelledError`` with that message is taken back, so the steps
+    after it run with none pending.
+
+    Entering reads the body's outcome from ``sys.exception()``. Read while
+    another exception is handled, for example inside an ``except`` in the
+    ``finally`` block, it would return that exception and mistake it for a
+    failed body.
+    """
+
+    def __enter__(self) -> CleanupSteps:
+        body_exception = sys.exception()
+        self._body_failed = body_exception is not None and not isinstance(
+            body_exception, pytest.skip.Exception
+        )
+        if _from_timeout_hook(body_exception):
+            _take_back_cancellation()
+        self._failures: list[BaseException] = []
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if exc is None and self._failures and not self._body_failed:
+            raise AssertionError(
+                f"Cleanup failed: {self._failures!r}"
+            ) from self._failures[0]
+
+    @contextmanager
+    def step(self) -> Iterator[None]:
+        try:
+            yield
+        except (Exception, pytest.fail.Exception, pytest.skip.Exception) as error:
+            logger.exception("Cleanup step failed")
+            self._failures.append(error)
+        except asyncio.CancelledError as error:
+            if not _from_timeout_hook(error):
+                logger.error("Cleanup cancelled; the steps after this one do not run")
+                raise
+            logger.exception("Cleanup step cancelled after the test timed out")
+            self._failures.append(error)
+            _take_back_cancellation()
+
+
+def _from_timeout_hook(error: BaseException | None) -> bool:
+    return isinstance(error, asyncio.CancelledError) and error.args == (CANCEL_MESSAGE,)
+
+
+def _take_back_cancellation() -> None:
+    # A TaskGroup with a failing child in a later step reads a nonzero
+    # task.cancelling() as an outside cancellation and cancels the task again,
+    # without a message.
+    task = asyncio.current_task()
+    if task is not None:
+        task.uncancel()
 
 
 class TestEntityCleaner:
@@ -86,7 +180,7 @@ class TestEntityCleaner:
 
             return result
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"❌ Error cleaning up {entity_id}: {e}")
             self.cleanup_attempted[cleanup_key] = False
             return False
@@ -95,44 +189,41 @@ class TestEntityCleaner:
         """Clean up an automation entity."""
         try:
             delete_result = await self.client.call_tool(
-                "ha_config_remove_automation", {"identifier": entity_id}
+                "ha_config_remove_automation", {"entity_id": entity_id}
             )
 
             delete_data = parse_mcp_result(delete_result)
             return delete_data.get("success", False)
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"Automation cleanup error: {e}")
             return False
 
     async def _cleanup_script(self, entity_id: str) -> bool:
         """Clean up a script entity."""
         try:
-            # Extract script ID from entity ID
-            script_id = entity_id.replace("script.", "")
-
+            # A bare id would delete only under that storage key, so a renamed
+            # script is removed by its entity_id.
             delete_result = await self.client.call_tool(
-                "ha_config_remove_script", {"script_id": script_id}
+                "ha_config_remove_script", {"script_id": entity_id}
             )
 
             delete_data = parse_mcp_result(delete_result)
             return delete_data.get("success", False)
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"Script cleanup error: {e}")
             return False
 
     async def _cleanup_helper(self, helper_type: str, entity_id: str) -> bool:
         """Clean up a helper entity."""
         try:
-            # Extract helper ID from entity ID
-            helper_id = entity_id.replace(f"{helper_type}.", "")
-
+            # The entity_id, not its name: a renamed helper's storage id differs.
             delete_result = await self.client.call_tool(
                 "ha_remove_helpers_integrations",
                 {
                     "helper_type": helper_type,
-                    "target": helper_id,
+                    "target": entity_id,
                     "confirm": True,
                 },
             )
@@ -140,7 +231,7 @@ class TestEntityCleaner:
             delete_data = parse_mcp_result(delete_result)
             return delete_data.get("success", False)
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"Helper cleanup error: {e}")
             return False
 
@@ -247,7 +338,7 @@ async def _cleanup_domain_test_entities(
                     if success:
                         cleaned_count += 1
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ Error cleaning up {domain} entities: {e}")
 
     return found_count, cleaned_count
@@ -255,7 +346,7 @@ async def _cleanup_domain_test_entities(
 
 async def cleanup_test_entities_by_name(
     mcp_client, name_patterns: list[str]
-) -> dict[str, int]:
+) -> dict[str, dict[str, int]]:
     """
     Clean up entities matching test name patterns.
 
@@ -279,7 +370,7 @@ async def cleanup_test_entities_by_name(
         "input_select",
         "input_text",
     ]
-    results = {}
+    results: dict[str, dict[str, int]] = {}
 
     for domain in domains_to_check:
         found_count, cleaned_count = await _cleanup_domain_test_entities(
@@ -311,7 +402,7 @@ async def verify_entity_cleanup(mcp_client, entity_id: str, entity_type: str) ->
         if entity_type == "automation":
             # Try to get automation config
             result = await mcp_client.call_tool(
-                "ha_config_get_automation", {"identifier": entity_id}
+                "ha_config_get_automation", {"entity_id": entity_id}
             )
 
             result_data = parse_mcp_result(result)
@@ -344,7 +435,7 @@ async def verify_entity_cleanup(mcp_client, entity_id: str, entity_type: str) ->
             logger.debug(f"✅ Entity {entity_id} successfully removed")
             return True
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"Error verifying cleanup for {entity_id}: {e}")
         # Assume cleanup was successful if we can't verify
         return True
@@ -438,7 +529,7 @@ async def reset_entity_states(mcp_client, entity_ids: list[str]) -> dict[str, bo
             else:
                 logger.warning(f"⚠️ Failed to reset {entity_id}")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"⚠️ Error resetting {entity_id}: {e}")
             results[entity_id] = False
 
@@ -490,7 +581,7 @@ class TestEnvironmentManager:
                     f"📸 Captured initial state for {entity_id}: {self.initial_states[entity_id]}"
                 )
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"⚠️ Could not capture initial state for {entity_id}: {e}")
 
     async def restore_initial_states(self) -> dict[str, bool]:

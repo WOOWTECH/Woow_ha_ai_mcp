@@ -6,9 +6,15 @@ Each proxy carries its own MCP annotations so clients can apply
 appropriate permission policies (e.g., auto-approve reads, gate writes).
 
 Tools are categorized by their existing MCP annotations:
-- readOnlyHint=True → "read" category
-- destructiveHint=True with remove/delete in name → "delete" category
-- destructiveHint=True (other) → "write" category
+- read_only_hint=True → "read" category
+- destructive_hint=True with remove/delete in name → "delete" category
+- destructive_hint=True (other) → "write" category
+
+A ``manage`` tool combines several operations behind one name, so it is
+reachable from every proxy — read-approved calls only on the read proxy,
+the whole tool on the write and delete proxies (see ``_admits``) — and
+search results point each kind of action at its own proxy. In Read Only
+Mode only the read proxy is listed.
 """
 
 from __future__ import annotations
@@ -17,32 +23,52 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn
 
-from fastmcp.exceptions import ToolError
-from fastmcp.server.context import Context
-from fastmcp.server.transforms import Transform
-from fastmcp.server.transforms.search.bm25 import BM25SearchTransform
-from fastmcp.tools import Tool
-from mcp.types import ToolAnnotations
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.server.context import Context
+from ha_mcp._vendor.fastmcp.server.transforms import Transform
+from ha_mcp._vendor.fastmcp.server.transforms.search.bm25 import BM25SearchTransform
+from ha_mcp._vendor.fastmcp.tools import Tool
+from ha_mcp._vendor.mcp.types import ToolAnnotations
 
-from ..errors import ErrorCode, create_error_response
+from ..errors import TOOL_ERROR_LOG_LEVEL, ErrorCode, create_error_response
+from ..renamed_tools import (
+    add_stale_list_warning,
+    current_tool_name,
+)
+from ..server_tool_text import SKILL_TOOL_NAME
+from ..tool_catalog import tool_search_active
+from ..tools.renamed_tool_middleware import adapt_retired_call
+from .compact_params import compact_params, summary
+from .write_tool_note import DESKTOP_APPROVAL_NOTE
 
 if TYPE_CHECKING:
-    from fastmcp.server.transforms import GetToolNext
-    from fastmcp.utilities.versions import VersionSpec
+    from ha_mcp._vendor.fastmcp.server.transforms import GetToolNext
+    from ha_mcp._vendor.fastmcp.utilities.versions import VersionSpec
 
 logger = logging.getLogger(__name__)
 
 # Default HA tools to pin (always visible, bypass search transform).
 #
-# These are DEFAULTS, not mandatory — users can unpin any of them via the
-# Tools tab in the settings UI by explicitly setting the tool's state to
-# ``"enabled"`` in ``tool_config.json``. Server-side, the effective pinned
-# set is computed as ``DEFAULT_PINNED_TOOLS`` minus any tool whose saved
-# state is ``"enabled"``, plus any user-pinned tools. Tools with no entry
-# in ``tool_config.json`` stay pinned by default.
+# Most of these are defaults only — users can unpin them via the Tools
+# tab in the settings UI, which sets the tool's state to ``"enabled"`` in
+# ``tool_config.json``. Server-side, the effective pinned set is computed
+# as ``DEFAULT_PINNED_TOOLS`` minus any tool whose saved state is
+# ``"enabled"``, plus any user-pinned tools. Tools with no entry in
+# ``tool_config.json`` stay pinned by default.
+#
+# EXCEPTION: tools that are also in settings_ui._tools_meta
+# .MANDATORY_TOOLS (ha_search, ha_get_overview, ha_report_issue,
+# ha_manage_backup) cannot be unpinned — the settings UI locks their pin
+# toggle, so they are always pinned as well as always enabled. This is
+# intentional (#2058): mandatory tools must stay discoverable in the
+# advertised catalog, not merely callable through the ha_call_*_tool
+# proxies, because hiding them can break the workflows they anchor (e.g.
+# the backup safety net before config writes). ha_get_skill_guide gets
+# the same pin lock while strict best-practices mode is on
+# (BPS_MANDATORY_TOOLS, #1886).
 #
 # Removed in #966 (operational recovery actions, low frequency, low value
 # in the default LLM tool surface — still discoverable via tool search):
@@ -67,15 +93,70 @@ DEFAULT_PINNED_TOOLS: tuple[str, ...] = (
     # Skill guide must stay visible when tool search hides the catalog —
     # its description carries the bundled best-practices trigger
     # conditions that the LLM needs to see before writing config.
-    "ha_get_skill_guide",
+    SKILL_TOOL_NAME,
 )
 
 # Tool name patterns that indicate delete/remove operations
 _DELETE_PATTERNS = ("_remove_", "_delete_")
 
+# Ranking is plain English keyword matching (BM25, no stemming, no
+# translation), so a query in another language returns nothing (#2576).
+SEARCH_QUERY_DESCRIPTION = (
+    "English keywords naming the operation, e.g. 'get entity state' or "
+    "'create automation'. Translate other languages to English first; "
+    "entity, area and device names keep their original spelling."
+)
+
+SEARCH_TOOLS_DESCRIPTION = (
+    "Exact tool names to return in full (description, input schema, "
+    "annotations); pinned tools come back as their stub. 'query' is ignored "
+    "when this is given."
+)
+
+_TOOL_NOT_FOUND = "Search by English keywords to find the right tool name."
+
+# ``manage`` names one interface that intentionally combines several
+# operations (.gemini/styleguide.md, Tool Naming Convention). Such a tool is
+# categorised by its annotations like any other, but every call proxy can
+# reach it — see ``_admits``.
+_MANAGE_PATTERNS = ("_manage_",)
+
 # Capability tier a tool falls into — shared by the call-proxy routing and
 # the settings-UI capability badges. See ``categorize_capability``.
 Capability = Literal["read", "write", "delete"]
+
+# Every hint is explicit: Home Assistant 2026.10+ reads an omitted
+# destructiveHint as true even on a read-only tool.
+_PROXY_ANNOTATIONS: dict[Capability, ToolAnnotations] = {
+    "read": ToolAnnotations(
+        title="Call Read Tool",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+    "write": ToolAnnotations(
+        title="Call Write Tool",
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+    "delete": ToolAnnotations(
+        title="Call Delete Tool",
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=True,
+        open_world_hint=False,
+    ),
+}
+_SEARCH_TOOL_ANNOTATIONS = ToolAnnotations(
+    title="Search Tools",
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
 
 
 class SearchKeywordsTransform(Transform):
@@ -88,8 +169,10 @@ class SearchKeywordsTransform(Transform):
       a narrower one so BM25 ranks the tool *lower* for broad queries.
 
     The original description is preserved unless an override is applied.
-    Only active when added to the transform pipeline (i.e., behind
-    the ``enable_tool_search`` toggle).
+
+    Added to the transform pipeline unconditionally (#940), so ``keywords``
+    reach every client whatever its catalog mode; ``overrides`` apply only
+    to connections using search mode.
     """
 
     def __init__(
@@ -104,7 +187,7 @@ class SearchKeywordsTransform(Transform):
     def _enrich(self, tool: Tool) -> Tool:
         # Overrides take priority — replace the entire description
         override = self._overrides.get(tool.name)
-        if override is not None:
+        if override is not None and tool_search_active():
             return tool.model_copy(update={"description": override})
         # Otherwise append keywords if present
         keywords = self._keywords.get(tool.name)
@@ -145,14 +228,16 @@ def _build_proxy_descriptions(search_tool_name: str) -> dict[str, str]:
             f"Creates or updates data. Use for any tool that modifies "
             f"state but does not delete/remove resources.\n"
             f"{_PROXY_PARAMS_SUFFIX}\n"
-            f'EXAMPLE: ha_call_write_tool(name="ha_set_area_or_floor", arguments={{"kind": "area", "name": "Kitchen"}})'
+            f'EXAMPLE: ha_call_write_tool(name="ha_set_area_or_floor", arguments={{"kind": "area", "name": "Kitchen"}})\n'
+            f"{DESKTOP_APPROVAL_NOTE}"
         ),
         "delete": (
             f"Execute a delete/remove tool discovered via {search_tool_name}. "
             f"Permanently removes data. Use for tools that delete or "
             f"remove resources (areas, automations, devices, etc.).\n"
             f"{_PROXY_PARAMS_SUFFIX}\n"
-            f'EXAMPLE: ha_call_delete_tool(name="ha_remove_area_or_floor", arguments={{"kind": "area", "id": "old_area"}})'
+            f'EXAMPLE: ha_call_delete_tool(name="ha_remove_area_or_floor", arguments={{"kind": "area", "id": "old_area"}})\n'
+            f"{DESKTOP_APPROVAL_NOTE}"
         ),
     }
 
@@ -178,13 +263,127 @@ def categorize_capability(
     return "write"
 
 
+def _is_manage_tool(name: str) -> bool:
+    """Whether *name* follows the ``manage`` convention for a multi-operation tool."""
+    return any(pattern in name for pattern in _MANAGE_PATTERNS)
+
+
+def _is_read_call_on_write_tool(name: str, arguments: dict[str, Any] | None) -> bool:
+    """Whether this call on a non-read-category tool is one of its read actions.
+
+    A mixed read/write tool (``ha_manage_backup``, ``ha_manage_updates``,
+    ``ha_manage_blueprints``, ...) is categorised ``write`` by its annotations
+    and lives in that category set only. But refusing its list/get actions on
+    the read proxy would strip real read surface from a client that only holds
+    that proxy — for blueprints, folding the old read tool into the merged one
+    would otherwise have removed listing entirely (#2329).
+
+    Read-only mode already enumerates, per call, which invocations of such a
+    tool are reads (``READ_ONLY_EXEMPT_TOOLS``), and the proxies reuse that
+    verdict so the two surfaces cannot disagree about what counts as a read.
+    The verdict fails closed: a tool without an exemption entry, or a missing
+    or unknown action, is never a read.
+    """
+    from ..read_only import READ_ONLY_EXEMPT_TOOLS
+
+    exemption = READ_ONLY_EXEMPT_TOOLS.get(name)
+    return exemption is not None and exemption.blocked_write(arguments or {}) is None
+
+
+def _has_read_actions(name: str) -> bool:
+    """Whether a write-category tool has read actions the read proxy can approve."""
+    from ..read_only import READ_ONLY_EXEMPT_TOOLS
+
+    return name in READ_ONLY_EXEMPT_TOOLS
+
+
+def _admits(
+    transform: CategorizedSearchTransform,
+    category: Capability,
+    name: str,
+    arguments: dict[str, Any] | None,
+) -> bool:
+    """Whether the *category* proxy may dispatch this call.
+
+    Membership in the category set is the rule. A ``manage`` tool (#2358) is
+    the exception: it is reachable from every proxy. The read proxy is the
+    one hard boundary — it carries ``readOnlyHint`` — so it admits only a
+    call the read-only predicate approves. The write and delete proxies both
+    carry ``destructiveHint`` and run the whole tool: its delete actions are
+    not statically enumerable (``ha_manage_radio`` and ``ha_manage_updates``
+    take a free-form ``action``), so neither proxy pretends to carve them out.
+    """
+    if category == "read":
+        return name in transform._read_tools or (
+            name in transform._write_tools
+            and _is_read_call_on_write_tool(name, arguments)
+        )
+    if category == "write":
+        return name in transform._write_tools
+    return name in transform._delete_tools or (
+        name in transform._write_tools and _is_manage_tool(name)
+    )
+
+
+def _execute_via(proxy: str, tool_name: str) -> str:
+    """Render the call form a search result advertises for *tool_name*."""
+    return (
+        f'client.{proxy}(name="{tool_name}", arguments={{...}}) '
+        f'or {proxy}(name="{tool_name}", arguments={{...}})'
+    )
+
+
+def _read_only_mode() -> bool:
+    """Whether Read Only Mode is on — consulted per request, like its filter."""
+    from ..read_only import is_read_only
+
+    return is_read_only()
+
+
+def _advertised_routes(name: str, category: Capability) -> list[Capability]:
+    """Proxies a search result points at for *name*, in listing order.
+
+    A manage tool lists every proxy it is reachable through (see
+    ``_admits``); the read route exists only when the read-only predicate can
+    approve calls to it. In Read Only Mode the destructive proxies are not
+    listed, so only the read route remains. The ``["write", "delete"]`` case
+    cannot occur in that mode: ``ReadOnlyToolsTransform`` drops every
+    non-exempt write tool from the catalog before the search index is built,
+    and every exempt tool has read actions.
+    """
+    if category != "write" or not _is_manage_tool(name):
+        return [category]
+    if _has_read_actions(name):
+        return ["read"] if _read_only_mode() else ["read", "write", "delete"]
+    return ["write", "delete"]
+
+
 def _categorize_tool(tool: Tool) -> Capability:
     """Categorize a Tool as read, write, or delete based on annotations and name."""
     annotations = tool.annotations
     return categorize_capability(
         tool.name,
-        read_only=bool(annotations and annotations.readOnlyHint),
-        destructive=bool(annotations and annotations.destructiveHint),
+        read_only=bool(annotations and annotations.read_only_hint),
+        destructive=bool(annotations and annotations.destructive_hint),
+    )
+
+
+def _raise_non_object_arguments(value: Any, proxy_name: str, name: str) -> NoReturn:
+    """Refuse a proxy ``arguments`` payload that is not an object."""
+    raise ToolError(
+        json.dumps(
+            create_error_response(
+                code=ErrorCode.VALIDATION_INVALID_PARAMETER,
+                message=(
+                    f"'arguments' must be a JSON object (got {type(value).__name__})."
+                ),
+                suggestions=[
+                    "Pass 'arguments' as an object (dict), not a list or scalar.",
+                ],
+                context={"proxy_used": proxy_name, "tool_name": name},
+            )
+        ),
+        log_level=TOOL_ERROR_LOG_LEVEL,
     )
 
 
@@ -202,7 +401,9 @@ def _coerce_proxy_arguments(
         return arguments
     try:
         parsed = json.loads(arguments)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
+        # RecursionError: a string nested past the interpreter's limit is
+        # still "not valid JSON" to the caller, not an internal error.
         raise ToolError(
             json.dumps(
                 create_error_response(
@@ -213,24 +414,11 @@ def _coerce_proxy_arguments(
                     ],
                     context={"proxy_used": proxy_name, "tool_name": name},
                 )
-            )
+            ),
+            log_level=TOOL_ERROR_LOG_LEVEL,
         ) from e
     if not isinstance(parsed, dict):
-        raise ToolError(
-            json.dumps(
-                create_error_response(
-                    code=ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    message=(
-                        "'arguments' must be a JSON object "
-                        f"(got {type(parsed).__name__})."
-                    ),
-                    suggestions=[
-                        "Pass 'arguments' as an object (dict), not a list or scalar.",
-                    ],
-                    context={"proxy_used": proxy_name, "tool_name": name},
-                )
-            )
-        )
+        _raise_non_object_arguments(parsed, proxy_name, name)
     logger.warning(
         "Proxy %s received 'arguments' as a JSON string for tool %s — parsed as fallback",
         proxy_name,
@@ -267,7 +455,8 @@ def _raise_wrong_category_error(
                     message=f"Tool '{name}' not found. Use ha_search_tools to discover available tools.",
                     context={"tool_name": name},
                 )
-            )
+            ),
+            log_level=TOOL_ERROR_LOG_LEVEL,
         )
     raise ToolError(
         json.dumps(
@@ -283,7 +472,8 @@ def _raise_wrong_category_error(
                     "correct_proxy": correct_proxy,
                 },
             )
-        )
+        ),
+        log_level=TOOL_ERROR_LOG_LEVEL,
     )
 
 
@@ -294,9 +484,13 @@ class CategorizedSearchTransform(BM25SearchTransform):
     three category-specific proxies, each carrying appropriate MCP
     annotations for client-side permission handling.
 
-    The unified ``ha_search_tools`` is inherited from BM25SearchTransform and
-    searches across ALL tools regardless of category. Search results include
-    each tool's full annotations so the LLM can determine which proxy to use.
+    The unified ``ha_search_tools`` searches across ALL tools regardless of
+    category, pinned ones included (issue #2576: a pinned tool vanishing
+    from search reads as "no such capability" to a small model). Hidden
+    hits are compact (description, one-line params, proxy hint), and
+    ``tools=[...]`` returns their full definitions. Pinned hits are rendered
+    as a name-only stub pointing back at the tool list, and never consume
+    one of the ``max_results`` slots.
     """
 
     def __init__(
@@ -310,6 +504,7 @@ class CategorizedSearchTransform(BM25SearchTransform):
         call_write_name: str = "ha_call_write_tool",
         call_delete_name: str = "ha_call_delete_tool",
         enable_code_mode: bool = False,
+        get_client: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -336,6 +531,9 @@ class CategorizedSearchTransform(BM25SearchTransform):
         # running code mode; server.py flips this on when
         # ``settings.enable_code_mode`` is True.
         self._enable_code_mode = enable_code_mode
+        # Core judges a name a retired signature carried and the current one
+        # drops (``adapt_retired_call``).
+        self._get_client = get_client
 
         # Category caches rebuilt when the catalog hash changes,
         # matching BM25SearchTransform's staleness detection pattern.
@@ -390,29 +588,197 @@ class CategorizedSearchTransform(BM25SearchTransform):
             self._delete_tools = delete
             self._last_catalog_hash = current_hash
 
-    async def _render_results(self, tools: Sequence[Tool]) -> list[dict[str, Any]]:
-        """Serialize search results with ``execute_via`` hints."""
+    def _make_search_tool(self) -> Tool:
+        """Search tool over the whole catalog (pinned tools included)."""
+        transform = self
+
+        async def search_tools(
+            query: Annotated[str, SEARCH_QUERY_DESCRIPTION] = "",
+            tools: Annotated[list[str] | None, SEARCH_TOOLS_DESCRIPTION] = None,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> list[dict[str, Any]]:
+            """Search for tools using English keywords.
+
+            Returns compact matches ranked by relevance; pass ``tools`` to
+            get the full definitions of named tools.
+            """
+            catalog = await transform.get_tool_catalog(ctx)
+            if tools:
+                return await transform._render_full(catalog, tools, ctx)
+            if not query.strip():
+                raise ToolError(
+                    json.dumps(
+                        create_error_response(
+                            code=ErrorCode.VALIDATION_INVALID_PARAMETER,
+                            message=(
+                                "Pass 'query' (English keywords) or 'tools' "
+                                "(exact tool names)."
+                            ),
+                            suggestions=[
+                                "ha_search_tools(query='create helper') finds tools.",
+                                "ha_search_tools(tools=['<name>']) returns a tool's full schema.",
+                            ],
+                        )
+                    ),
+                    log_level=TOOL_ERROR_LOG_LEVEL,
+                )
+            results = await transform._search(catalog, query)
+            return await transform._render_results(results)
+
+        return Tool.from_function(fn=search_tools, name=self._search_tool_name)
+
+    async def _search(self, tools: Sequence[Tool], query: str) -> Sequence[Tool]:
+        """Rank ``tools``; pinned hits ride along without using a result slot.
+
+        A pinned tool is kept only when it ranks inside the first
+        ``max_results`` of the whole catalog, so a weak match on a stop word
+        does not add a stub to every page.
+        """
+        # The base call (re)builds the index for this catalog; its own top-k
+        # is discarded because pinned hits must not crowd out hidden ones.
+        await super()._search(tools, query)
+        pinned_count = sum(t.name in self._always_visible for t in tools)
+        indices = self._index.query(query, self._max_results + pinned_count)
+        slots = self._max_results
+        results: list[Tool] = []
+        tools_by_name = {tool.name: tool for tool in tools}
+        for rank, tool in enumerate(
+            tools_by_name[self._indexed_names[i]] for i in indices
+        ):
+            if tool.name in self._always_visible:
+                if rank < self._max_results:
+                    results.append(tool)
+            elif slots:
+                results.append(tool)
+                slots -= 1
+        return results
+
+    def _execute_via_hint(self, tool: Tool) -> str:
+        """Call form(s) for *tool* through each proxy ``_advertised_routes`` lists."""
         proxy_map: dict[Capability, str] = {
             "read": self._call_read_name,
             "write": self._call_write_name,
             "delete": self._call_delete_name,
         }
-        results = []
-        for tool in tools:
-            data = tool.to_mcp_tool().model_dump(mode="json", exclude_none=True)
-            proxy = proxy_map[_categorize_tool(tool)]
-            data["execute_via"] = (
-                f'client.{proxy}(name="{tool.name}", arguments={{...}}) '
-                f'or {proxy}(name="{tool.name}", arguments={{...}})'
-            )
-            results.append(data)
+        routes = _advertised_routes(tool.name, _categorize_tool(tool))
+        if len(routes) == 1:
+            return _execute_via(proxy_map[routes[0]], tool.name)
+        hint = "; ".join(
+            f"{route} actions: {_execute_via(proxy_map[route], tool.name)}"
+            for route in routes
+        )
+        return hint[:1].upper() + hint[1:]
+
+    @staticmethod
+    def _pinned_stub(tool: Tool) -> dict[str, Any]:
+        # The client already holds this tool's full definition — repeating a
+        # 5-9KB schema here is what overflows small context windows (#2576).
+        return {
+            "name": tool.name,
+            "pinned": True,
+            "execute_via": (
+                f"{tool.name} is already in your tool list — "
+                "call it directly with the schema you have; "
+                "no search or proxy needed."
+            ),
+        }
+
+    async def _render_results(self, tools: Sequence[Tool]) -> list[dict[str, Any]]:
+        """Serialize search hits as compact entries with ``execute_via`` hints."""
+        return [
+            self._pinned_stub(tool)
+            if tool.name in self._always_visible
+            else {
+                "name": tool.name,
+                "description": summary(tool.description),
+                "params": compact_params(tool.parameters),
+                "execute_via": self._execute_via_hint(tool),
+            }
+            for tool in tools
+        ]
+
+    async def _render_full(
+        self, catalog: Sequence[Tool], names: list[str], ctx: Context
+    ) -> list[dict[str, Any]]:
+        """Full definitions of *names* from *catalog*, in the order given.
+
+        A pinned name gets the stub, an unknown one a not-found entry — or,
+        for a write tool Read Only Mode hides, the READ_ONLY_MODE error the
+        call proxies give, so the model learns why rather than concluding
+        the capability does not exist. When no name resolves the whole call
+        is an error.
+        """
+        by_name = {tool.name: tool for tool in catalog}
+        hidden = await self._read_only_hidden(names, by_name, ctx)
+        results: list[dict[str, Any]] = []
+        found = 0
+        for name in names:
+            tool = by_name.get(name)
+            if tool is None:
+                error = (
+                    hidden[name]
+                    if name in hidden
+                    else create_error_response(
+                        code=ErrorCode.RESOURCE_NOT_FOUND,
+                        message=f"Tool '{name}' not found.",
+                        suggestions=[_TOOL_NOT_FOUND],
+                        context={"tool_name": name},
+                    )
+                )
+                results.append({"name": name, **error})
+                continue
+            found += 1
+            if tool.name in self._always_visible:
+                results.append(self._pinned_stub(tool))
+            else:
+                data = tool.to_mcp_tool().model_dump(
+                    mode="json", exclude_none=True, by_alias=True
+                )
+                data["execute_via"] = self._execute_via_hint(tool)
+                results.append(data)
+        if not found:
+            if len(results) == 1:
+                error = results[0]
+            elif all(name in hidden for name in names):
+                error = {**hidden[names[0]], "results": results}
+            else:
+                missing = [name for name in names if name not in hidden]
+                message = f"No tool is named {', '.join(missing)}."
+                if hidden:
+                    message += " Read Only Mode hides the others; see their entries in results."
+                error = create_error_response(
+                    code=ErrorCode.RESOURCE_NOT_FOUND,
+                    message=message,
+                    suggestions=[_TOOL_NOT_FOUND],
+                    context={"results": results},
+                )
+            raise ToolError(json.dumps(error), log_level=TOOL_ERROR_LOG_LEVEL)
         return results
+
+    @staticmethod
+    async def _read_only_hidden(
+        names: list[str], visible: dict[str, Tool], ctx: Context
+    ) -> dict[str, dict[str, Any]]:
+        """READ_ONLY_MODE errors for the *names* Read Only Mode hides."""
+        if not _read_only_mode() or all(name in visible for name in names):
+            return {}
+        from ..read_only import read_only_error_response, read_only_visible
+
+        registered = {
+            tool.name: tool for tool in await ctx.fastmcp.local_provider._list_tools()
+        }
+        return {
+            name: read_only_error_response(name)
+            for name in names
+            if name not in visible
+            and name in registered
+            and not read_only_visible(registered[name])
+        }
 
     def _make_categorized_proxy(
         self,
         proxy_name: str,
         category: Capability,
-        annotations: ToolAnnotations,
         description: str,
     ) -> Tool:
         """Create a call proxy that validates tool category before execution."""
@@ -428,18 +794,21 @@ class CategorizedSearchTransform(BM25SearchTransform):
             # Rebuild category cache if catalog has changed
             await transform._rebuild_category_cache(ctx)
 
+            # A client working from an older catalog can name a tool that has
+            # since been renamed. The category check below reads the live
+            # catalog, so it would reject that call before the re-dispatch
+            # reaches RenamedToolAliasMiddleware — resolve the name here too,
+            # and the alias covers both call shapes.
+            requested = name
+            name = current_tool_name(name)
+            # The middleware only sees the resolved name on the re-dispatch,
+            # so the stale-list warning for a retired one is added here.
+            renames = [(requested, name)] if name != requested else []
+
             # Tolerate `arguments` passed as a JSON string — small models
             # sometimes serialize it before sending. Parse once up front so
             # downstream logic can assume a dict (or None).
             arguments = _coerce_proxy_arguments(arguments, proxy_name, name)
-
-            # Determine which category set to check
-            if category == "read":
-                allowed = transform._read_tools
-            elif category == "delete":
-                allowed = transform._delete_tools
-            else:
-                allowed = transform._write_tools
 
             # Detect and unwrap double-wrapped arguments where the LLM
             # accidentally nested name/arguments inside the arguments param
@@ -458,62 +827,106 @@ class CategorizedSearchTransform(BM25SearchTransform):
                     transform._call_write_name,
                     transform._call_delete_name,
                 )
-                and arguments["name"] in all_known
             ):
-                logger.warning(
-                    "Detected double-wrapped proxy call for '%s' via %s — unwrapping",
-                    arguments["name"],
-                    name,
-                )
-                name = arguments["name"]
-                arguments = arguments.get("arguments") or {}
+                # The envelope carries whatever name the client knows the tool
+                # by, and this check reads the live catalog — so resolve the
+                # inner name for the same reason the outer one is resolved
+                # above, or the alias covers one envelope shape and not the
+                # other.
+                requested_inner = arguments["name"]
+                inner_name = current_tool_name(requested_inner)
+                if inner_name in all_known:
+                    if inner_name != requested_inner:
+                        renames.append((requested_inner, inner_name))
+                    logger.warning(
+                        "Detected double-wrapped proxy call for '%s' via %s"
+                        " — unwrapping",
+                        inner_name,
+                        name,
+                    )
+                    name = inner_name
+                    # The nested payload gets the same treatment as the outer
+                    # one: a JSON string is parsed, and a scalar or list is
+                    # refused with the same structured error rather than
+                    # reaching the adapter, whose dict() would raise a bare
+                    # ValueError.
+                    nested = _coerce_proxy_arguments(
+                        arguments.get("arguments"), proxy_name, inner_name
+                    )
+                    if nested is not None and not isinstance(nested, dict):
+                        _raise_non_object_arguments(nested, proxy_name, inner_name)
+                    requested, arguments = requested_inner, nested or {}
 
-            if name not in allowed:
+            # A retired name folded into an action-dispatched tool (#2329)
+            # needs the action its old signature never carried, and Core
+            # judges a name the current tool drops. When the call was
+            # double-wrapped, the outer name is a proxy name, which is never
+            # retired, so only the unwrapped name needs adapting.
+            arguments = await adapt_retired_call(
+                requested, arguments, transform._get_client
+            )
+
+            if not _admits(transform, category, name, arguments):
                 _raise_wrong_category_error(name, transform, proxy_name)
 
-            return await ctx.fastmcp.call_tool(name, arguments)
+            result = await ctx.fastmcp.call_tool(name, arguments)
+            if renames:
+                add_stale_list_warning(result, renames)
+            return result
 
         return Tool.from_function(
             fn=categorized_call,
             name=proxy_name,
             description=description,
-            annotations=annotations,
+            annotations=_PROXY_ANNOTATIONS[category],
         )
 
     async def transform_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
-        """Replace tool listing with search + categorized call proxies."""
+        """Replace tool listing with search + categorized call proxies.
+
+        Connections using the full catalog get the tools unchanged.
+        """
+        if not tool_search_active():
+            return tools
         pinned = [t for t in tools if t.name in (self._always_visible or [])]
 
         search_tool = self._make_search_tool()
-        # Always set readOnlyHint and override description if provided
+        # Fixed annotations; override the description if one was configured
         search_tool = search_tool.model_copy(
             update={
                 "description": self._search_tool_description or search_tool.description,
-                "annotations": ToolAnnotations(openWorldHint=False, readOnlyHint=True),
+                "annotations": _SEARCH_TOOL_ANNOTATIONS,
             }
         )
 
         call_read = self._make_categorized_proxy(
             proxy_name=self._call_read_name,
             category="read",
-            annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True),
             description=self._proxy_descs["read"],
         )
 
         call_write = self._make_categorized_proxy(
             proxy_name=self._call_write_name,
             category="write",
-            annotations=ToolAnnotations(openWorldHint=True, destructiveHint=True),
             description=self._proxy_descs["write"],
         )
 
         call_delete = self._make_categorized_proxy(
             proxy_name=self._call_delete_name,
             category="delete",
-            annotations=ToolAnnotations(openWorldHint=False, destructiveHint=True),
             description=self._proxy_descs["delete"],
         )
 
+        if _read_only_mode():
+            # ReadOnlyToolsTransform runs before this one and never sees the
+            # proxies synthesised here; with every write blocked at call time
+            # the destructive proxies would only advertise dead ends. They
+            # stay resolvable by name so a client holding a stale catalog gets
+            # the proxy's own structured answer (ReadOnlyMiddleware blocks a
+            # write before the proxy is even resolved) rather than a bare
+            # not-found that ToolSearchHintMiddleware declines to explain
+            # while tool search is on.
+            return [*pinned, search_tool, call_read]
         return [*pinned, search_tool, call_read, call_write, call_delete]
 
     async def get_tool(
@@ -523,27 +936,27 @@ class CategorizedSearchTransform(BM25SearchTransform):
 
         The parent only handles _search_tool_name and _call_tool_name (unused).
         We must also intercept our three categorized proxy names so they can
-        be found when the LLM calls them.
+        be found when the LLM calls them. On a full-catalog connection the
+        synthetic names do not exist.
         """
+        if not tool_search_active():
+            return await call_next(name, version=version)
         if name == self._call_read_name:
             return self._make_categorized_proxy(
                 self._call_read_name,
                 "read",
-                ToolAnnotations(openWorldHint=True, readOnlyHint=True),
                 self._proxy_descs["read"],
             )
         if name == self._call_write_name:
             return self._make_categorized_proxy(
                 self._call_write_name,
                 "write",
-                ToolAnnotations(openWorldHint=True, destructiveHint=True),
                 self._proxy_descs["write"],
             )
         if name == self._call_delete_name:
             return self._make_categorized_proxy(
                 self._call_delete_name,
                 "delete",
-                ToolAnnotations(openWorldHint=False, destructiveHint=True),
                 self._proxy_descs["delete"],
             )
         return await super().get_tool(name, call_next, version=version)

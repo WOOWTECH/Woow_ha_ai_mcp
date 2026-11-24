@@ -1,43 +1,34 @@
-"""Unit tests for fields= projection in ha_list_services (issue #1199)."""
+"""Unit tests for fields= projection in ha_list_services (issue #1199).
 
-from unittest.mock import AsyncMock, MagicMock
+The tool runs on the server's own client against a real ``hass`` that answers
+the component's service catalog command; Core's ``input_boolean`` integration
+supplies the services and their descriptions. (Core's ``light`` descriptions
+filter on supported features, which imports every entity component, ``tts``
+among them, whose requirement the dev group does not install.)
+"""
+
+from typing import Any
 
 import pytest
-from fastmcp.exceptions import ToolError
+from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
 
-from ha_mcp.tools.tools_services import register_services_tools
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp.client.rest_client import HomeAssistantClient
+from ha_mcp.tools.tools_services import ServiceDiscoveryTools
+
+
+@pytest.fixture
+async def list_services_tool(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> Any:
+    """``ha_list_services`` on a ``hass`` with Core's ``input_boolean`` services."""
+    assert await async_setup_component(hass, "input_boolean", {})
+    return ServiceDiscoveryTools(component_core_client).ha_list_services
 
 
 class TestHaListServicesFieldsProjection:
     """Tool-level tests for fields= projection in ha_list_services."""
-
-    @pytest.fixture
-    def mock_mcp(self):
-        mcp = MagicMock()
-        self.registered_tools = {}
-
-        def capture_tool(func):
-            self.registered_tools[func.__name__] = func
-            return func
-
-        mcp.add_tool = capture_tool
-        return mcp
-
-    @pytest.fixture
-    def mock_client(self):
-        client = MagicMock()
-        # get_services returns an empty dict (no services), _process_services handles it
-        client.get_services = AsyncMock(return_value={})
-        # send_websocket_message used by _get_service_translations
-        client.send_websocket_message = AsyncMock(
-            return_value={"success": True, "result": {"resources": {}}}
-        )
-        return client
-
-    @pytest.fixture
-    def list_services_tool(self, mock_mcp, mock_client):
-        register_services_tools(mock_mcp, mock_client)
-        return self.registered_tools["ha_list_services"]
 
     @pytest.mark.asyncio
     async def test_fields_none_returns_full_response(self, list_services_tool):
@@ -75,42 +66,6 @@ class TestHaListServicesServiceFieldsProjection:
     service, ...) down to the requested keys.  The typo-guard fires when
     all projected records are empty dicts.
     """
-
-    @pytest.fixture
-    def mock_mcp(self):
-        mcp = MagicMock()
-        self.registered_tools: dict = {}
-
-        def capture_tool(func):
-            self.registered_tools[func.__name__] = func
-            return func
-
-        mcp.add_tool = capture_tool
-        return mcp
-
-    @pytest.fixture
-    def mock_client(self):
-        client = MagicMock()
-        # Two light services so we can verify projection on multiple records.
-        client.get_services = AsyncMock(
-            return_value={
-                "light": {
-                    "services": {
-                        "turn_on": {"description": "Turn on a light"},
-                        "turn_off": {"description": "Turn off a light"},
-                    }
-                }
-            }
-        )
-        client.send_websocket_message = AsyncMock(
-            return_value={"success": True, "result": {"resources": {}}}
-        )
-        return client
-
-    @pytest.fixture
-    def list_services_tool(self, mock_mcp, mock_client):
-        register_services_tools(mock_mcp, mock_client)
-        return self.registered_tools["ha_list_services"]
 
     @pytest.mark.asyncio
     async def test_service_fields_projects_each_record(self, list_services_tool):

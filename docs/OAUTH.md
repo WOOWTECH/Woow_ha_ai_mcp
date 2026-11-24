@@ -2,7 +2,7 @@
 
 > **Status:** Beta — OAuth provides an alternative to the private URL method. Fully functional but still being refined.
 
-OAuth authentication lets multiple users authenticate with their own Home Assistant Long-Lived Access Token via a consent form.
+OAuth authentication lets multiple users authenticate with their own Home Assistant Long-Lived Access Token via a consent form. An administrator's token is recommended: non-admin tokens are not officially supported but still work, with limitations — ha-mcp refuses admin-only operations for them (see the [FAQ](FAQ.md#token-invalid-or-authentication-errors)).
 
 ## Migrating from v6.x
 
@@ -19,6 +19,7 @@ Removing the URL field and sanitizing form output eliminates both attack surface
 **Docker:**
 ```bash
 docker run -d -p 8086:8086 \
+  -v ha-mcp-data:/home/mcpuser/.ha-mcp \
   -e HOMEASSISTANT_URL=https://your-ha-instance.example.com \
   -e MCP_BASE_URL=https://your-mcp-server.example.com \
   ghcr.io/homeassistant-ai/ha-mcp:latest ha-mcp-oauth
@@ -28,7 +29,7 @@ docker run -d -p 8086:8086 \
 ```bash
 HOMEASSISTANT_URL=https://your-ha-instance.example.com \
 MCP_BASE_URL=https://your-mcp-server.example.com \
-uvx --from=ha-mcp@latest ha-mcp-oauth
+uvx --python 3.14 --from=ha-mcp@latest ha-mcp-oauth
 ```
 
 The consent form now accepts only the Long-Lived Access Token. Everything else stays the same.
@@ -67,6 +68,7 @@ For production, set up a [persistent Cloudflare Tunnel](https://developers.cloud
 ```bash
 docker run -d --name ha-mcp-oauth \
   -p 8086:8086 \
+  -v ha-mcp-data:/home/mcpuser/.ha-mcp \
   -e HOMEASSISTANT_URL=http://homeassistant.local:8123 \
   -e MCP_BASE_URL=https://your-tunnel.trycloudflare.com \
   ghcr.io/homeassistant-ai/ha-mcp:latest \
@@ -77,7 +79,7 @@ docker run -d --name ha-mcp-oauth \
 ```bash
 export HOMEASSISTANT_URL=http://homeassistant.local:8123
 export MCP_BASE_URL=https://your-tunnel.trycloudflare.com
-uvx --from=ha-mcp@latest ha-mcp-oauth
+uvx --python 3.14 --from=ha-mcp@latest ha-mcp-oauth
 ```
 
 ### 3. Environment Variables
@@ -91,14 +93,16 @@ uvx --from=ha-mcp@latest ha-mcp-oauth
 | `MCP_SETTINGS_SECRET_PATH` | Dedicated secret path for the web settings UI. In OAuth mode the settings UI never shares the MCP path (its custom routes bypass OAuth auth), so it is served under this separate secret. Auto-generated and printed in the startup log when unset. | Auto-generated `/private_<token>` |
 | `HA_MCP_DISABLE_SETTINGS_UI` | Set truthy (`1`/`true`/`yes`/`on`) to not serve the web settings UI at all. | unset (UI served) |
 
-> **Note:** `HOMEASSISTANT_TOKEN` is NOT required in OAuth mode. Each user provides their own Long-Lived Access Token via the consent form.
+> **Note:** `HOMEASSISTANT_TOKEN` is NOT required in OAuth mode. Each user provides their own Long-Lived Access Token (an administrator's is recommended) via the consent form.
 
 ### 4. Connect in Claude.ai
 
-1. Go to **Settings** → **Connectors** → **Add custom connector**
-2. Enter URL: `https://your-tunnel.com/mcp`
-3. Click **Add**
-4. In the consent form that opens:
+1. Open the connector form for your plan:
+   - **Individual plan:** **Settings** → **Customize** → **Add** → **Add custom connector** (the entry point can differ by browser; on accounts with the new Plugins page, **Customize** reads **Plugins**)
+   - **Team or Enterprise plan:** an Owner or Primary Owner goes to **Organization settings** → **Connectors** → **Add** → **Custom** → **Web**
+2. Enter a name and the URL `https://your-tunnel.com/mcp`, then click **Continue**
+3. Claude detects the server and selects the sign-in settings. Keep the sign-in option Claude detected (**Sign in now** or **Sign in when needed**) and **OAuth client: Register automatically**, then click **Add**
+4. If the connector shows a **Connect** button, click it. On a Team or Enterprise plan, members then find the connector under **Customize** → **Connectors** (under **Plugins** on accounts with the new Plugins page) and click **Connect** themselves. In the consent form that opens:
    - Enter your Long-Lived Access Token ([how to generate](https://www.home-assistant.io/docs/authentication/#your-account-profile))
 5. Click **Authorize**
 
@@ -131,7 +135,7 @@ Check that `HOMEASSISTANT_URL` is correct and accessible from the server running
 
 ### Can I use OAuth with Home Assistant OS?
 
-No. The ha-mcp add-on doesn't support OAuth mode.
+No. The ha-mcp app (add-on) doesn't support OAuth mode.
 
 **Alternatives:**
 - Run ha-mcp OAuth on another device (Raspberry Pi, NAS, PC)

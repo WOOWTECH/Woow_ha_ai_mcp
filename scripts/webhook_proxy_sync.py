@@ -4,16 +4,18 @@
 The stable (``homeassistant-addon-webhook-proxy``) and dev
 (``homeassistant-addon-webhook-proxy-dev``) flavors are a hand-maintained
 duplicate: the same code with a fixed *identity* rewrite between them. This
-module encodes that identity as two :class:`Flavor` profiles that are exact
-inverses of each other, and applies it mechanically:
+module encodes that identity as two :class:`Flavor` profiles, each naming the
+other as its sibling, and applies it mechanically:
 
 * ``--direction promote``  copies dev -> stable (SRC=dev, DST=stable)
 * ``--direction reset``    copies stable -> dev (SRC=stable, DST=dev)
 
-Beyond the component code, the copy+rename set also spans ``start.py``, the
-``Dockerfile``, ``config.yaml``, and ``translations/en.yaml`` — each carries
-the ``mcp_proxy`` identity token (in ``translations/en.yaml`` it is the
-log-filter hint) that must flip with the flavor.
+Beyond the component code, the copy+rename set also spans every top-level
+``*.py`` module (``start.py`` and its sibling modules; a destination module
+the source no longer has is deleted), the ``Dockerfile``, ``config.yaml``, and
+``translations/en.yaml`` — each may carry the ``mcp_proxy`` identity token (in
+``translations/en.yaml`` it is the log-filter hint) that must flip with the
+flavor.
 
 Everything is expressed as small pure functions so the transform can be unit
 tested without touching the filesystem. The one side-effecting step is
@@ -34,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,7 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
-# Flavor identity profiles (exact inverses of each other)
+# Flavor identity profiles (each one's sibling is the other)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Flavor:
@@ -54,18 +57,18 @@ class Flavor:
     config_description: str
     boot: str
     stage: str | None
-    sibling_slug_base: str
     mutex_notification_id: str
-    sibling_mutex_notification_id: str
+    # Not derivable from the other profile: no field there carries the short
+    # label ("Webhook Proxy" / "Webhook Proxy (Dev)") start.py uses for it.
     sibling_label: str
     async_register_name: str
     dockerfile_hass_name: str
     dockerfile_hass_description: str
     manifest_name: str
     # The flavor-descriptor comment in start.py flips like the mutex constants:
-    # "This is the {flavor_word} flavor: its sibling is the {sibling_word} add-on."
+    # "This is the {flavor_word} flavor: its sibling is the <sibling's
+    # flavor_word, lowercased> add-on."
     flavor_word: str
-    sibling_word: str
 
 
 STABLE = Flavor(
@@ -79,16 +82,13 @@ STABLE = Flavor(
     ),
     boot="auto",
     stage=None,
-    sibling_slug_base="ha_mcp_webhook_proxy_dev",
     mutex_notification_id="mcp_proxy_mutex",
-    sibling_mutex_notification_id="mcp_proxy_dev_mutex",
     sibling_label="Webhook Proxy (Dev)",
     async_register_name="MCP Proxy",
     dockerfile_hass_name="Nabu Casa - Webhook Proxy for HA MCP",
     dockerfile_hass_description="Remote access proxy for HA MCP via webhook",
     manifest_name="MCP Webhook Proxy",
     flavor_word="STABLE",
-    sibling_word="dev",
 )
 
 DEV = Flavor(
@@ -98,20 +98,17 @@ DEV = Flavor(
     config_name="Nabu Casa - Webhook Proxy for HA MCP (Dev)",
     config_description=(
         "DEV CHANNEL (unstable) — remote access proxy via Nabu Casa or any "
-        "reverse proxy. Cannot run alongside the stable Webhook Proxy add-on."
+        "reverse proxy. Cannot run alongside the stable Webhook Proxy app."
     ),
     boot="manual",
     stage="experimental",
-    sibling_slug_base="ha_mcp_webhook_proxy",
     mutex_notification_id="mcp_proxy_dev_mutex",
-    sibling_mutex_notification_id="mcp_proxy_mutex",
     sibling_label="Webhook Proxy",
     async_register_name="MCP Proxy (Dev)",
     dockerfile_hass_name="Nabu Casa - Webhook Proxy for HA MCP (Dev)",
     dockerfile_hass_description="DEV channel — remote access proxy for HA MCP via webhook",
     manifest_name="MCP Webhook Proxy (Dev)",
     flavor_word="DEV",
-    sibling_word="stable",
 )
 
 
@@ -156,17 +153,25 @@ def promote_version(current_stable: str, bump: str) -> str:
 
 
 def reset_version(current_dev: str, current_stable: str) -> str:
-    """Next dev version, guaranteed to strictly increase.
+    """Next dev version, strictly increasing AND sorting ahead of stable.
 
-    ``new_base = max(stable_base, dev_base)`` and the ``devN`` counter always
-    advances by one. Because the base never decreases and the counter always
-    rises, the result strictly increases even when stable's base is *behind*
-    the current dev base (the code goes backward; the version still climbs).
+    ``new_base = max(next_stable_patch, dev_base)``: the
+    ``homeassistant-addon-webhook-proxy/AGENTS.md`` Versioning rule makes the
+    dev base the NEXT stable patch (stable ``2.0.2`` → ``2.0.3.devN``)
+    so dev always sorts ahead of the stable it will promote into — under
+    PEP 440 a ``X.Y.Z.devN`` pre-release sorts BEHIND ``X.Y.Z``, so basing
+    dev on stable's own base advertised the dev channel as older than the
+    stable carrying the same code. A dev base already further ahead (an
+    escalated line in progress) is kept. The ``devN`` counter restarts at 1
+    on a base jump and advances by one otherwise, so the result strictly
+    increases either way.
     """
     dev_base, dev_n = parse_dev_version(current_dev)
     stable_base = parse_stable_version(current_stable)
-    new_base = max(stable_base, dev_base)
-    return "{}.{}.{}.dev{}".format(*new_base, dev_n + 1)
+    next_patch = (stable_base[0], stable_base[1], stable_base[2] + 1)
+    new_base = max(next_patch, dev_base)
+    new_n = dev_n + 1 if new_base == dev_base else 1
+    return "{}.{}.{}.dev{}".format(*new_base, new_n)
 
 
 # ---------------------------------------------------------------------------
@@ -195,35 +200,21 @@ def apply_start_py_identity(text: str, dst: Flavor) -> str:
     The four mutual-exclusion constants and the flavor-descriptor comment do
     NOT follow the blanket rename (the sibling relationship flips), so each is
     rewritten explicitly and robustly regardless of what the rename produced.
+    The sibling's slug, mutex id and flavor word come from the other profile;
+    ``SIBLING_LABEL`` comes from ``dst.sibling_label``.
     """
-    text = re.sub(
-        r'^SIBLING_SLUG_BASE = "[^"]*"',
-        f'SIBLING_SLUG_BASE = "{dst.sibling_slug_base}"',
-        text,
-        flags=re.M,
-    )
-    text = re.sub(
-        r'^MUTEX_NOTIFICATION_ID = "[^"]*"',
-        f'MUTEX_NOTIFICATION_ID = "{dst.mutex_notification_id}"',
-        text,
-        flags=re.M,
-    )
-    text = re.sub(
-        r'^SIBLING_MUTEX_NOTIFICATION_ID = "[^"]*"',
-        f'SIBLING_MUTEX_NOTIFICATION_ID = "{dst.sibling_mutex_notification_id}"',
-        text,
-        flags=re.M,
-    )
-    text = re.sub(
-        r'^SIBLING_LABEL = "[^"]*"',
-        f'SIBLING_LABEL = "{dst.sibling_label}"',
-        text,
-        flags=re.M,
-    )
+    sibling = DEV if dst is STABLE else STABLE
+    for name, value in (
+        ("SIBLING_SLUG_BASE", sibling.slug),
+        ("MUTEX_NOTIFICATION_ID", dst.mutex_notification_id),
+        ("SIBLING_MUTEX_NOTIFICATION_ID", sibling.mutex_notification_id),
+        ("SIBLING_LABEL", dst.sibling_label),
+    ):
+        text = re.sub(rf'^{name} = "[^"]*"', f'{name} = "{value}"', text, flags=re.M)
     text = re.sub(
         r"# This is the \w+ flavor: its sibling is the \w+ add-on\.",
         f"# This is the {dst.flavor_word} flavor: its sibling is the "
-        f"{dst.sibling_word} add-on.",
+        f"{sibling.flavor_word.lower()} add-on.",
         text,
     )
     return text
@@ -240,16 +231,11 @@ def apply_async_register_name(text: str, dst: Flavor) -> str:
 
 def apply_dockerfile_labels(text: str, dst: Flavor) -> str:
     """Set the two ``io.hass.*`` labels (the COPY line is handled by rename)."""
-    text = re.sub(
-        r'io\.hass\.name="[^"]*"',
-        f'io.hass.name="{dst.dockerfile_hass_name}"',
-        text,
-    )
-    text = re.sub(
-        r'io\.hass\.description="[^"]*"',
-        f'io.hass.description="{dst.dockerfile_hass_description}"',
-        text,
-    )
+    for label, value in (
+        ("name", dst.dockerfile_hass_name),
+        ("description", dst.dockerfile_hass_description),
+    ):
+        text = re.sub(rf'io\.hass\.{label}="[^"]*"', f'io.hass.{label}="{value}"', text)
     return text
 
 
@@ -276,12 +262,12 @@ DOCS_BANNERS = {
     "mcp_proxy_dev": (
         "## Only one flavor runs at a time (dev vs stable)\n"
         "\n"
-        "This is the **dev** build. It is fully isolated from the stable Webhook Proxy add-on\n"
+        "This is the **dev** build. It is fully isolated from the stable Webhook Proxy app\n"
         "(separate integration, webhook URL, and OAuth credentials), but the two **cannot run at\n"
         "the same time** — they would collide over Home Assistant's root OAuth `/authorize` and\n"
-        "`/token` routes. If you start this add-on while the stable **Webhook Proxy for HA MCP**\n"
-        "add-on is running, it refuses to start (a clear error in the add-on log plus a Home\n"
-        "Assistant notification). Stop the stable add-on first; the notification clears\n"
+        "`/token` routes. If you start this app while the stable **Webhook Proxy for HA MCP**\n"
+        "app is running, it refuses to start (a clear error in the app log plus a Home\n"
+        "Assistant notification). Stop the stable app first; the notification clears\n"
         "automatically on the next clean start.\n"
         "\n"
     ),
@@ -308,22 +294,13 @@ def transform_docs(src_text: str, src: Flavor, dst: Flavor) -> str:
 
 def apply_manifest(text: str, dst: Flavor, version: str) -> str:
     """Set ``domain``/``name``/``version`` in the component manifest.json."""
-    text = re.sub(
-        r'("domain":\s*")[^"]*(")',
-        lambda m: m.group(1) + dst.component + m.group(2),
+    values = {"domain": dst.component, "name": dst.manifest_name, "version": version}
+    # Lambda replacement: the value is literal text, not a regex template.
+    return re.sub(
+        r'("(domain|name|version)":\s*")[^"]*(")',
+        lambda m: m.group(1) + values[m.group(2)] + m.group(3),
         text,
     )
-    text = re.sub(
-        r'("name":\s*")[^"]*(")',
-        lambda m: m.group(1) + dst.manifest_name + m.group(2),
-        text,
-    )
-    text = re.sub(
-        r'("version":\s*")[^"]*(")',
-        lambda m: m.group(1) + version + m.group(2),
-        text,
-    )
-    return text
 
 
 def transform_config_yaml(src_text: str, dst: Flavor, version: str) -> str:
@@ -368,20 +345,6 @@ def transform_config_yaml(src_text: str, dst: Flavor, version: str) -> str:
     return "\n".join(lines)
 
 
-def profiles_are_inverse(a: Flavor, b: Flavor) -> bool:
-    """True if two flavor profiles are exact identity inverses of each other."""
-    return (
-        a.slug == b.sibling_slug_base
-        and b.slug == a.sibling_slug_base
-        and a.mutex_notification_id == b.sibling_mutex_notification_id
-        and b.mutex_notification_id == a.sibling_mutex_notification_id
-        and a.flavor_word.lower() == b.sibling_word
-        and b.flavor_word.lower() == a.sibling_word
-        and a.sibling_label != b.sibling_label
-        and a.component != b.component
-    )
-
-
 # ---------------------------------------------------------------------------
 # Orchestration (filesystem I/O)
 # ---------------------------------------------------------------------------
@@ -408,6 +371,30 @@ def _ruff_format(paths: list[Path], root: Path) -> None:
     )
 
 
+def _edit(path: Path, transform: Callable[[str], str]) -> None:
+    path.write_text(transform(path.read_text(encoding="utf-8")), encoding="utf-8")
+
+
+def rebase_dev_version(new_stable: str, root: Path = REPO_ROOT) -> str:
+    """Rewrite the dev flavor's version files onto ``new_stable``'s line.
+
+    Called by the promote transform so the promote PR itself carries the dev
+    version rebase (next stable patch + ``.dev1`` — see ``reset_version``)
+    instead of a follow-up reset PR existing only for the version line. Only
+    the two version-bearing files are touched; the dev code is left alone
+    (right after a promote it is identical to stable anyway). Reuses the
+    identity writers, which are idempotent on the dev tree's own identity.
+    """
+    dev_dir = root / DEV.addon_dir
+    new_dev = reset_version(_read_config_version(dev_dir / "config.yaml"), new_stable)
+    _edit(dev_dir / "config.yaml", lambda t: transform_config_yaml(t, DEV, new_dev))
+    _edit(
+        dev_dir / DEV.component / "manifest.json",
+        lambda t: apply_manifest(t, DEV, new_dev),
+    )
+    return new_dev
+
+
 def sync(direction: str, bump: str | None = None, root: Path = REPO_ROOT) -> str:
     """Apply the promote/reset transform in place. Returns the new version."""
     if direction == "promote":
@@ -430,7 +417,8 @@ def sync(direction: str, bump: str | None = None, root: Path = REPO_ROOT) -> str
     dst_dir = root / dst.addon_dir
     dst_comp = dst_dir / dst.component
 
-    # 1. Replace the component dir + copy start.py / Dockerfile / translations.
+    # 1. Replace the component dir + the top-level modules (start.py and its
+    # siblings), and copy the Dockerfile / translations.
     if dst_comp.exists():
         shutil.rmtree(dst_comp)
     shutil.copytree(
@@ -438,7 +426,13 @@ def sync(direction: str, bump: str | None = None, root: Path = REPO_ROOT) -> str
         dst_comp,
         ignore=shutil.ignore_patterns("__pycache__"),
     )
-    shutil.copy2(src_dir / "start.py", dst_dir / "start.py")
+    src_modules = {p.name for p in src_dir.glob("*.py")}
+    for stale in dst_dir.glob("*.py"):
+        if stale.name not in src_modules:
+            stale.unlink()
+    modules = [dst_dir / name for name in sorted(src_modules)]
+    for module in modules:
+        shutil.copy2(src_dir / module.name, module)
     shutil.copy2(src_dir / "Dockerfile", dst_dir / "Dockerfile")
     shutil.copy2(
         src_dir / "translations" / "en.yaml", dst_dir / "translations" / "en.yaml"
@@ -454,7 +448,7 @@ def sync(direction: str, bump: str | None = None, root: Path = REPO_ROOT) -> str
 
     # 2. Blanket token rename on the copied code + Dockerfile + translations.
     rename_targets = [
-        dst_dir / "start.py",
+        *modules,
         dst_dir / "Dockerfile",
         dst_dir / "translations" / "en.yaml",
     ]
@@ -464,24 +458,14 @@ def sync(direction: str, bump: str | None = None, root: Path = REPO_ROOT) -> str
         if p.is_file() and "__pycache__" not in p.parts
     ]
     for path in rename_targets:
-        original = path.read_text(encoding="utf-8")
-        path.write_text(
-            rename_tokens(original, src.component, dst.component), encoding="utf-8"
-        )
+        _edit(path, lambda t: rename_tokens(t, src.component, dst.component))
 
     # 3. Overwrite the flip-affected identity in start.py.
     start_py = dst_dir / "start.py"
-    start_py.write_text(
-        apply_start_py_identity(start_py.read_text(encoding="utf-8"), dst),
-        encoding="utf-8",
-    )
+    _edit(start_py, lambda t: apply_start_py_identity(t, dst))
 
     # 4. Overwrite the async_register display name.
-    init_py = dst_comp / "__init__.py"
-    init_py.write_text(
-        apply_async_register_name(init_py.read_text(encoding="utf-8"), dst),
-        encoding="utf-8",
-    )
+    _edit(dst_comp / "__init__.py", lambda t: apply_async_register_name(t, dst))
 
     # 5. Rebuild config.yaml from SRC + DST identity + version.
     config_yaml = dst_dir / "config.yaml"
@@ -493,21 +477,20 @@ def sync(direction: str, bump: str | None = None, root: Path = REPO_ROOT) -> str
     )
 
     # 6. Set the Dockerfile labels.
-    dockerfile = dst_dir / "Dockerfile"
-    dockerfile.write_text(
-        apply_dockerfile_labels(dockerfile.read_text(encoding="utf-8"), dst),
-        encoding="utf-8",
-    )
+    _edit(dst_dir / "Dockerfile", lambda t: apply_dockerfile_labels(t, dst))
 
     # 7. Set manifest domain/name/version.
-    manifest = dst_comp / "manifest.json"
-    manifest.write_text(
-        apply_manifest(manifest.read_text(encoding="utf-8"), dst, version),
-        encoding="utf-8",
-    )
+    _edit(dst_comp / "manifest.json", lambda t: apply_manifest(t, dst, version))
 
     # Re-wrap .py lines whose length crossed 88 cols due to the token swap.
-    _ruff_format([start_py, *sorted(dst_comp.rglob("*.py"))], root)
+    _ruff_format([*modules, *sorted(dst_comp.rglob("*.py"))], root)
+
+    if direction == "promote":
+        # The promote PR itself carries the dev version-line rebase — see
+        # rebase_dev_version. Stdout stays the stable version (the promote
+        # workflow captures it); the dev version is visible in the diff.
+        rebase_dev_version(version, root)
+
     return version
 
 

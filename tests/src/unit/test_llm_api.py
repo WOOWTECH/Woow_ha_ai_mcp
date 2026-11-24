@@ -1,32 +1,33 @@
-"""Unit tests for the conversation-agent LLM API (issue #1745).
+"""The component's Home Assistant LLM API (#1745).
 
-``llm_api`` exposes the in-process server's toolset as Home Assistant LLM
-API(s) so conversation agents (and through them the Assist chat UI and voice)
-can drive ha-mcp. These tests cover the registration lifecycle (exposure
-modes, failure containment), the per-turn tool-list fetch with the server's
-exposure stamp, the tool-search meta-tools (search + call-time enforcement),
-and the loopback transport error mapping — all hermetically: Home Assistant
-is stubbed via ``_embedded_stubs`` and the MCP client session is faked at the
-``_mcp_session`` seam (the SDK itself is exercised by the embedded e2e test).
+A mirrored tool call over loopback MCP and how its failures map, which codec
+converts the server's tool schemas, and how the toolset registers as LLM
+API(s). The agent sees a ``HomeAssistantError`` for any failure to reach the
+server; a genuine bug must surface as itself instead of being relabeled as one.
 """
 
 from __future__ import annotations
 
-import asyncio
+import importlib
 import logging
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
+import sys
+import threading
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
+import probatio
 import pytest
+import voluptuous as vol
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import llm
+from mcp import McpError, types
+from pytest_homeassistant.common import MockConfigEntry
 
-from ._embedded_stubs import fake_llm_apis, install
-
-install()
-
-import custom_components.ha_mcp_tools.llm_api as llm_api  # noqa: E402
-from custom_components.ha_mcp_tools.const import (  # noqa: E402
+from custom_components.ha_mcp_tools import llm_api
+from custom_components.ha_mcp_tools.const import (
     DATA_LLM_API_UNSUB,
     DOMAIN,
     EXPOSURE_BOTH,
@@ -35,756 +36,402 @@ from custom_components.ha_mcp_tools.const import (  # noqa: E402
     OPT_LLM_API_EXPOSURE,
 )
 
+from ._llm_api_helpers import registered_apis
+from ._llm_api_server import (
+    ServedTool,
+    call,
+    mirrored_tool,
+    payload,
+    refused_port,
+    serve,
+)
+
+_LOOPBACK = pytest.mark.usefixtures("socket_enabled")
+_FRESH_CONVERTER = pytest.mark.usefixtures("_resolve_the_converter_afresh")
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {"query": {"type": "string"}},
+    "required": ["query"],
+}
 _FULL_ID = f"{DOMAIN}-entry-1745"
-_SEARCH_ID = f"{DOMAIN}-entry-1745-toolsearch"
+_SEARCH_ID = f"{_FULL_ID}-toolsearch"
+_URL = "http://127.0.0.1:9584/private_x"
 
 
-def _make_hass() -> MagicMock:
-    hass = MagicMock(name="hass")
-    hass.data = {}
-
-    async def _executor(func, *args):
-        return func(*args)
-
-    hass.async_add_executor_job = AsyncMock(side_effect=_executor)
-    return hass
+# -- mirrored tool call ---------------------------------------------------------
 
 
-def _make_entry(options: dict[str, Any] | None = None) -> MagicMock:
-    entry = MagicMock(name="entry")
-    entry.entry_id = "entry-1745"
-    entry.title = "HA-MCP Server"
-    entry.options = options or {}
+@_LOOPBACK
+async def test_a_call_passes_its_arguments_and_returns_the_servers_result(
+    hass: HomeAssistant,
+) -> None:
+    tools = [
+        ServedTool(
+            result=types.CallToolResult(
+                content=[types.TextContent(type="text", text="found it")]
+            )
+        )
+    ]
+    async with serve(tools) as srv:
+        result = await call(hass, mirrored_tool(srv.port), {"query": "kitchen light"})
+
+    assert srv.calls == [("ha_search", {"query": "kitchen light"})]
+    assert result.error is False
+    assert payload(result)["content"] == [{"type": "text", "text": "found it"}]
+
+
+@_LOOPBACK
+async def test_a_refused_connection_raises_homeassistanterror(
+    hass: HomeAssistant,
+) -> None:
+    with (
+        refused_port() as port,
+        pytest.raises(HomeAssistantError, match="ha_search"),
+    ):
+        await call(hass, mirrored_tool(port), {})
+
+
+@_LOOPBACK
+async def test_a_protocol_error_from_the_server_raises_homeassistanterror(
+    hass: HomeAssistant,
+) -> None:
+    """JSON-RPC errors surface as McpError, which Core's own mcp integration
+    maps the same way."""
+    error = McpError(types.ErrorData(code=-32000, message="boom"))
+    async with serve(list_error=error) as srv:
+        with pytest.raises(HomeAssistantError, match="ha_search"):
+            await call(hass, mirrored_tool(srv.port), {})
+
+    assert srv.calls == []
+
+
+@_LOOPBACK
+async def test_a_malformed_answer_propagates_as_the_bug_it_is(
+    hass: HomeAssistant,
+) -> None:
+    """The SDK's task groups wrap a genuine bug; mapping it to a friendly
+    transport message would hide its traceback (#1782)."""
+    async with serve(empty_list_answer=True) as srv:
+        with pytest.raises(ExceptionGroup):
+            await call(hass, mirrored_tool(srv.port), {})
+
+
+@_LOOPBACK
+@pytest.mark.parametrize(
+    ("error", "transport"),
+    [
+        pytest.param(
+            ExceptionGroup("session", [OSError("refused")]), True, id="transport-only"
+        ),
+        pytest.param(
+            ExceptionGroup("session", [OSError("refused"), TypeError("bug")]),
+            False,
+            id="mixed-transport-and-bug",
+        ),
+        pytest.param(
+            ExceptionGroup(
+                "session",
+                [ExceptionGroup("inner", [OSError("refused"), TypeError("bug")])],
+            ),
+            False,
+            id="bug-in-a-nested-group",
+        ),
+    ],
+)
+def test_a_group_holding_any_bug_is_not_a_transport_failure(
+    error: ExceptionGroup, transport: bool
+) -> None:
+    """A transport error beside a bug must not relabel the bug as an
+    unreachable server (#1782)."""
+    assert llm_api.is_transport_failure(error) is transport
+
+
+@_LOOPBACK
+async def test_a_slow_tool_call_times_out_as_homeassistanterror(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(llm_api, "CALL_TOOL_TIMEOUT_SECONDS", 0.05)
+    async with serve() as srv:
+        srv.call_delay = 1.0
+        with pytest.raises(HomeAssistantError, match="ha_search"):
+            await call(hass, mirrored_tool(srv.port), {})
+
+
+# -- schema converter -----------------------------------------------------------
+#
+# The component's manifest installs ``voluptuous_openapi`` and converts with it;
+# Core itself ships only ``probatio``. Without the manifest's package the
+# component falls back to ``probatio``, once per process and never on the event
+# loop.
+
+
+@pytest.fixture
+def _resolve_the_converter_afresh() -> Iterator[None]:
+    """The choice is memoised for the process; each test starts unresolved."""
+    llm_api.reset_schema_converter()
+    yield
+    llm_api.reset_schema_converter()
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == llm_api.__name__ and record.levelno == logging.WARNING
+    ]
+
+
+@_FRESH_CONVERTER
+def test_the_voluptuous_openapi_converter_is_used_without_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger=llm_api.__name__):
+        converted = llm_api.convert_to_voluptuous(_SCHEMA)
+
+    assert isinstance(converted, vol.Schema)
+    assert converted({"query": "kitchen"}) == {"query": "kitchen"}
+    with pytest.raises(vol.Invalid):
+        converted({})
+    assert _warnings(caplog) == []
+
+
+@_FRESH_CONVERTER
+def test_a_core_without_voluptuous_openapi_converts_with_probatio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "voluptuous_openapi", None)
+
+    converted = llm_api.convert_to_voluptuous(_SCHEMA)
+
+    assert isinstance(converted, probatio.Schema)
+    assert converted({"query": "kitchen"}) == {"query": "kitchen"}
+    with pytest.raises(probatio.Invalid):
+        converted({})
+
+
+@_FRESH_CONVERTER
+def test_the_fallback_announces_which_codec_is_converting(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing else reports that the component runs on the other codec.
+
+    A requirement that failed to install never gets here: Home Assistant
+    logs that itself and abandons the integration before importing it. What
+    does get here -- skip_pip, or a deps tree that lost the package --
+    produces no message anywhere else, and the conversion then succeeds
+    quietly with a codec that retypes integers.
+    """
+    monkeypatch.setitem(sys.modules, "voluptuous_openapi", None)
+
+    with caplog.at_level(logging.DEBUG, logger=llm_api.__name__):
+        llm_api.convert_to_voluptuous(_SCHEMA)
+
+    [warning] = _warnings(caplog)
+    assert "voluptuous-openapi" in warning
+
+
+@_FRESH_CONVERTER
+def test_a_failure_inside_the_converter_is_not_mistaken_for_its_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falling back would hide a broken install behind a working codec."""
+    package = tmp_path / "voluptuous_openapi"
+    package.mkdir()
+    (package / "__init__.py").write_text("import legacy_dependency_not_installed\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in [n for n in sys.modules if n.partition(".")[0] == "voluptuous_openapi"]:
+        monkeypatch.delitem(sys.modules, name)
+
+    with pytest.raises(ModuleNotFoundError, match="legacy_dependency_not_installed"):
+        llm_api.convert_to_voluptuous(_SCHEMA)
+
+
+@_FRESH_CONVERTER
+async def test_the_converter_is_imported_once_and_off_the_event_loop(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Importing it on the loop would trip Home Assistant's blocking-call check."""
+    loop_thread = threading.get_ident()
+    watched = {"mcp.client.session", "mcp.client.streamable_http", "voluptuous_openapi"}
+    imports: list[tuple[str, int]] = []
+    real_import_module = importlib.import_module
+
+    def recording_import_module(name: str, package: str | None = None) -> Any:
+        if name in watched:
+            imports.append((name, threading.get_ident()))
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", recording_import_module)
+
+    assert await llm_api.async_probe_mcp_sdk(hass)
+    llm_api.convert_to_voluptuous(_SCHEMA)
+    llm_api.convert_to_voluptuous(_SCHEMA)
+
+    assert [name for name, _ in imports] == [
+        "mcp.client.session",
+        "mcp.client.streamable_http",
+        "voluptuous_openapi",
+    ]
+    assert all(thread != loop_thread for _, thread in imports)
+
+
+# -- registration ---------------------------------------------------------------
+#
+# ``async_register_llm_api`` runs on every in-process server bring-up. The
+# exposure option picks which APIs a conversation agent can select, a repeated
+# bring-up must not stack registrations, and nothing that goes wrong here may
+# reach the bring-up, which would tear the running server down.
+
+
+def _add_entry(
+    hass: HomeAssistant, options: dict[str, Any] | None = None
+) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="HA-MCP Server",
+        entry_id="entry-1745",
+        options=options or {},
+    )
+    entry.add_to_hass(hass)
     return entry
 
 
-def _tool_entry(
-    name: str = "ha_search",
-    *,
-    exposed: bool = True,
-    pinned: bool = False,
-    stamped: bool = True,
-    description: str | None = None,
-) -> SimpleNamespace:
-    meta = (
-        {"ha_mcp": {"llm_api_exposed": exposed, "pinned": pinned}} if stamped else None
-    )
-    return SimpleNamespace(
-        name=name,
-        description=description if description is not None else f"{name} description",
-        inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
-        meta=meta,
-    )
+def _ours(hass: HomeAssistant) -> dict[str, Any]:
+    """The APIs this component registered; Core registers its own as well."""
+    return {
+        api_id: api
+        for api_id, api in registered_apis(hass).items()
+        if api_id.startswith(DOMAIN)
+    }
 
 
-def _fake_session(
-    monkeypatch,
-    *,
-    tools: list[Any] | None = None,
-    instructions: str | None = "Use the skills-first workflow.",
-    call_result: Any = None,
-    raise_on_open: BaseException | None = None,
-    delay: float = 0.0,
-) -> SimpleNamespace:
-    """Patch ``llm_api._mcp_session`` with a fake and return the session."""
-    session = SimpleNamespace(
-        list_tools=AsyncMock(return_value=SimpleNamespace(tools=tools or [])),
-        call_tool=AsyncMock(return_value=call_result),
-    )
-    init_result = SimpleNamespace(instructions=instructions)
-
-    @asynccontextmanager
-    async def fake_mcp_session(url, http_client=None):
-        session.url = url
-        session.http_client = http_client
-        if raise_on_open is not None:
-            raise raise_on_open
-        if delay:
-            await asyncio.sleep(delay)
-        yield session, init_result
-
-    monkeypatch.setattr(llm_api, "_mcp_session", fake_mcp_session)
-    return session
-
-
-def _make_api(hass, mode: str = EXPOSURE_FULL) -> Any:
-    return llm_api.HaMcpLlmApi(
-        hass=hass,
-        id=_FULL_ID,
-        name="HA-MCP Server",
-        server_url="http://127.0.0.1:9584/private_x",
-        mode=mode,
+async def _register(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    port: int = 9584,
+    secret_path: str = "/private_x",
+) -> None:
+    await llm_api.async_register_llm_api(
+        hass, entry, port=port, secret_path=secret_path
     )
 
 
-class TestRegistrationLifecycle:
-    async def test_default_exposure_registers_tool_search_api(self, monkeypatch):
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
+async def test_default_exposure_registers_only_the_tool_search_api(
+    hass: HomeAssistant,
+) -> None:
+    await _register(hass, _add_entry(hass))
 
-        await llm_api.async_register_llm_api(
-            hass, _make_entry(), port=9584, secret_path="/private_x"
-        )
+    apis = _ours(hass)
+    assert set(apis) == {_SEARCH_ID}
+    api = apis[_SEARCH_ID]
+    assert api.name == "HA-MCP Server (tool search)"
+    assert api.mode == EXPOSURE_TOOL_SEARCH
+    assert api.server_url == _URL
+    unsubs = hass.data[DOMAIN][DATA_LLM_API_UNSUB]
+    assert len(unsubs) == 1 and all(callable(unsub) for unsub in unsubs)
 
-        apis = fake_llm_apis(hass)
-        assert set(apis) == {_SEARCH_ID}
-        api = apis[_SEARCH_ID]
-        assert api.name == "HA-MCP Server (tool search)"
-        assert api.mode == EXPOSURE_TOOL_SEARCH
-        assert api.server_url == "http://127.0.0.1:9584/private_x"
-        unsubs = hass.data[DOMAIN][DATA_LLM_API_UNSUB]
-        assert len(unsubs) == 1 and all(callable(u) for u in unsubs)
 
-    async def test_full_exposure_registers_full_api(self, monkeypatch):
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
-        entry = _make_entry({OPT_LLM_API_EXPOSURE: EXPOSURE_FULL})
+async def test_full_exposure_registers_only_the_full_api(
+    hass: HomeAssistant,
+) -> None:
+    await _register(hass, _add_entry(hass, {OPT_LLM_API_EXPOSURE: EXPOSURE_FULL}))
 
-        await llm_api.async_register_llm_api(
-            hass, entry, port=9584, secret_path="/private_x"
-        )
+    apis = _ours(hass)
+    assert set(apis) == {_FULL_ID}
+    assert apis[_FULL_ID].mode == EXPOSURE_FULL
+    assert apis[_FULL_ID].name == "HA-MCP Server"
 
-        apis = fake_llm_apis(hass)
-        assert set(apis) == {_FULL_ID}
-        assert apis[_FULL_ID].mode == EXPOSURE_FULL
-        assert apis[_FULL_ID].name == "HA-MCP Server"
 
-    async def test_both_exposure_registers_two_apis_one_server(self, monkeypatch):
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
-        entry = _make_entry({OPT_LLM_API_EXPOSURE: EXPOSURE_BOTH})
+async def test_both_exposure_registers_two_apis_for_one_server(
+    hass: HomeAssistant,
+) -> None:
+    await _register(hass, _add_entry(hass, {OPT_LLM_API_EXPOSURE: EXPOSURE_BOTH}))
 
-        await llm_api.async_register_llm_api(
-            hass, entry, port=9584, secret_path="/private_x"
-        )
+    apis = _ours(hass)
+    assert set(apis) == {_FULL_ID, _SEARCH_ID}
+    assert {api.server_url for api in apis.values()} == {_URL}
+    assert len(hass.data[DOMAIN][DATA_LLM_API_UNSUB]) == 2
 
-        apis = fake_llm_apis(hass)
-        assert set(apis) == {_FULL_ID, _SEARCH_ID}
-        # One server: both registrations point at the same loopback URL.
-        assert {a.server_url for a in apis.values()} == {
-            "http://127.0.0.1:9584/private_x"
-        }
-        assert len(hass.data[DOMAIN][DATA_LLM_API_UNSUB]) == 2
 
-    async def test_unknown_stored_mode_degrades_to_default(self, monkeypatch):
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
-        entry = _make_entry({OPT_LLM_API_EXPOSURE: "bogus"})
+async def test_an_unknown_stored_exposure_degrades_to_the_default(
+    hass: HomeAssistant,
+) -> None:
+    await _register(hass, _add_entry(hass, {OPT_LLM_API_EXPOSURE: "bogus"}))
 
-        await llm_api.async_register_llm_api(
-            hass, entry, port=9584, secret_path="/private_x"
-        )
+    assert set(_ours(hass)) == {_SEARCH_ID}
 
-        assert set(fake_llm_apis(hass)) == {_SEARCH_ID}
 
-    async def test_unregister_removes_apis_and_is_idempotent(self, monkeypatch):
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
-        entry = _make_entry({OPT_LLM_API_EXPOSURE: EXPOSURE_BOTH})
+async def test_unregister_removes_the_apis_and_is_idempotent(
+    hass: HomeAssistant,
+) -> None:
+    await _register(hass, _add_entry(hass, {OPT_LLM_API_EXPOSURE: EXPOSURE_BOTH}))
 
-        await llm_api.async_register_llm_api(
-            hass, entry, port=9584, secret_path="/private_x"
-        )
-        llm_api.async_unregister_llm_api(hass)
+    llm_api.async_unregister_llm_api(hass)
 
-        assert fake_llm_apis(hass) == {}
-        assert DATA_LLM_API_UNSUB not in hass.data[DOMAIN]
-        # Second teardown (reload paths run it again) must be a no-op.
-        llm_api.async_unregister_llm_api(hass)
+    assert _ours(hass) == {}
+    assert DATA_LLM_API_UNSUB not in hass.data[DOMAIN]
+    # Reload paths run the teardown again; the second run must not raise.
+    llm_api.async_unregister_llm_api(hass)
 
-    async def test_reregistration_replaces_stale_apis(self, monkeypatch):
-        # A bring-up after a teardown that never ran (e.g. a crashed reload)
-        # must replace the stale registrations instead of failing on the
-        # duplicate ids.
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
 
-        await llm_api.async_register_llm_api(
-            hass, _make_entry(), port=9584, secret_path="/private_x"
-        )
-        await llm_api.async_register_llm_api(
-            hass, _make_entry(), port=9999, secret_path="/private_y"
-        )
+async def test_a_second_bring_up_replaces_the_stale_registration(
+    hass: HomeAssistant,
+) -> None:
+    """A crashed reload never ran its teardown; Core refuses duplicate ids."""
+    entry = _add_entry(hass)
 
-        apis = fake_llm_apis(hass)
-        assert len(apis) == 1
-        assert apis[_SEARCH_ID].server_url == "http://127.0.0.1:9999/private_y"
+    await _register(hass, entry)
+    await _register(hass, entry, port=9999, secret_path="/private_y")
 
-    @pytest.mark.parametrize(
-        "exc_factory",
-        [
-            lambda: llm_api.HomeAssistantError("duplicate id"),
-            lambda: RuntimeError("unexpected"),
-        ],
-        ids=["homeassistanterror", "unexpected-exception"],
+    apis = _ours(hass)
+    assert len(apis) == 1
+    assert apis[_SEARCH_ID].server_url == "http://127.0.0.1:9999/private_y"
+
+
+async def test_an_id_core_refuses_is_logged_not_raised(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Anything escaping would tear the already-running server down (#1782)."""
+    llm.async_register_api(
+        hass,
+        llm_api.HaMcpLlmApi(hass=hass, id=_SEARCH_ID, name="taken", server_url=_URL),
     )
-    async def test_registration_failure_is_contained(
-        self, monkeypatch, caplog, exc_factory
-    ):
-        # "Never raises" must be literal: anything escaping this function
-        # lands in the bring-up's outer `except Exception`, which tears the
-        # ALREADY-RUNNING server down and files a "start" repair issue for a
-        # cosmetic failure (review findings on #1782). Both the expected
-        # HomeAssistantError and an arbitrary exception must be contained.
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", lambda: None)
-        hass = _make_hass()
-        exc = exc_factory()
 
-        def _raise(*_args):
-            raise exc
+    with caplog.at_level(logging.WARNING):
+        await _register(hass, _add_entry(hass))
 
-        monkeypatch.setattr(llm_api.llm, "async_register_api", _raise)
-
-        with caplog.at_level(logging.WARNING):
-            await llm_api.async_register_llm_api(
-                hass, _make_entry(), port=9584, secret_path="/private_x"
-            )
-
-        assert DATA_LLM_API_UNSUB not in hass.data.get(DOMAIN, {})
-        assert "Could not register the HA-MCP LLM API" in caplog.text
-
-    async def test_missing_sdk_skips_registration(self, monkeypatch, caplog):
-        # The mcp client SDK arrives with the runtime-installed server
-        # package; a build without it must skip the feature with a warning,
-        # never fail the (already running) server bring-up.
-        def _boom() -> None:
-            raise ImportError("No module named 'mcp'")
-
-        monkeypatch.setattr(llm_api, "_import_mcp_sdk", _boom)
-        hass = _make_hass()
-
-        with caplog.at_level(logging.WARNING):
-            await llm_api.async_register_llm_api(
-                hass, _make_entry(), port=9584, secret_path="/private_x"
-            )
-
-        assert fake_llm_apis(hass) == {}
-        assert DATA_LLM_API_UNSUB not in hass.data.get(DOMAIN, {})
-        assert "no importable 'mcp' client SDK" in caplog.text
+    assert DATA_LLM_API_UNSUB not in hass.data.get(DOMAIN, {})
+    assert "Could not register the HA-MCP LLM API" in caplog.text
 
 
-class TestFullModeInstance:
-    async def test_lists_exposed_tools_with_converted_schemas_and_prompt(
-        self, monkeypatch
-    ):
-        hass = _make_hass()
-        session = _fake_session(
-            monkeypatch,
-            tools=[_tool_entry("ha_search"), _tool_entry("ha_get_state")],
-            instructions="Use the skills-first workflow.",
-        )
-
-        instance = await _make_api(hass).async_get_api_instance(
-            llm_api.llm.LLMContext()
-        )
-
-        assert session.url == "http://127.0.0.1:9584/private_x"
-        assert [t.name for t in instance.tools] == ["ha_search", "ha_get_state"]
-        assert instance.tools[0].description == "ha_search description"
-        # The stubbed convert_to_voluptuous wraps the input schema verbatim.
-        assert instance.tools[0].parameters == {
-            "_converted": _tool_entry("ha_search").inputSchema
-        }
-        # The server's own initialize instructions become the API prompt,
-        # WITHOUT the tool-search discovery section in full mode.
-        assert instance.api_prompt == "Use the skills-first workflow."
-
-    async def test_hidden_tools_are_filtered_out(self, monkeypatch):
-        # The server stamp is the exposure decision: a tool stamped
-        # llm_api_exposed=False must be invisible to the agent even though it
-        # is present on the raw MCP surface.
-        hass = _make_hass()
-        _fake_session(
-            monkeypatch,
-            tools=[
-                _tool_entry("ha_get_state"),
-                _tool_entry("ha_restart", exposed=False),
-            ],
-        )
-
-        instance = await _make_api(hass).async_get_api_instance(
-            llm_api.llm.LLMContext()
-        )
-
-        assert [t.name for t in instance.tools] == ["ha_get_state"]
-
-    async def test_unstamped_server_falls_back_to_deny_list(self, monkeypatch, caplog):
-        # Older server packages don't stamp exposure: the component applies
-        # its conservative built-in deny-list instead, loudly.
-        hass = _make_hass()
-        _fake_session(
-            monkeypatch,
-            tools=[
-                _tool_entry("ha_get_state", stamped=False),
-                _tool_entry("ha_restart", stamped=False),
-                _tool_entry("ha_write_file", stamped=False),
-                _tool_entry("ha_dev_manage_server", stamped=False),
-            ],
-        )
-
-        with caplog.at_level(logging.WARNING):
-            instance = await _make_api(hass).async_get_api_instance(
-                llm_api.llm.LLMContext()
-            )
-
-        assert [t.name for t in instance.tools] == ["ha_get_state"]
-        assert "does not stamp LLM-API exposure metadata" in caplog.text
-
-    async def test_prompt_falls_back_when_server_has_no_instructions(self, monkeypatch):
-        hass = _make_hass()
-        _fake_session(monkeypatch, tools=[_tool_entry()], instructions=None)
-
-        instance = await _make_api(hass).async_get_api_instance(
-            llm_api.llm.LLMContext()
-        )
-
-        assert instance.api_prompt == llm_api._FALLBACK_API_PROMPT
-
-    async def test_unconvertible_schema_skips_that_tool_only(self, monkeypatch, caplog):
-        hass = _make_hass()
-        _fake_session(
-            monkeypatch, tools=[_tool_entry("ha_bad"), _tool_entry("ha_good")]
-        )
-
-        calls = {"n": 0}
-
-        def _convert_first_fails(schema):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise ValueError("unsupported schema")
-            return {"_converted": schema}
-
-        monkeypatch.setattr(llm_api, "convert_to_voluptuous", _convert_first_fails)
-
-        with caplog.at_level(logging.WARNING):
-            instance = await _make_api(hass).async_get_api_instance(
-                llm_api.llm.LLMContext()
-            )
-
-        assert [t.name for t in instance.tools] == ["ha_good"]
-        assert "Skipping tool ha_bad" in caplog.text
-
-    async def test_server_unreachable_raises_homeassistanterror(self, monkeypatch):
-        hass = _make_hass()
-        _fake_session(monkeypatch, raise_on_open=OSError("connection refused"))
-
-        with pytest.raises(llm_api.HomeAssistantError, match="Could not reach"):
-            await _make_api(hass).async_get_api_instance(llm_api.llm.LLMContext())
-
-    async def test_slow_server_times_out_as_homeassistanterror(self, monkeypatch):
-        hass = _make_hass()
-        _fake_session(monkeypatch, tools=[_tool_entry()], delay=0.2)
-        monkeypatch.setattr(llm_api, "_LIST_TOOLS_TIMEOUT_SECONDS", 0.01)
-
-        with pytest.raises(llm_api.HomeAssistantError, match="Could not reach"):
-            await _make_api(hass).async_get_api_instance(llm_api.llm.LLMContext())
-
-    async def test_group_wrapped_bug_propagates_from_list(self, monkeypatch):
-        # The SDK's task groups wrap in-session failures indiscriminately —
-        # a group carrying a genuine bug must NOT be relabeled as "could not
-        # reach the server" (review finding on #1782).
-        hass = _make_hass()
-        _fake_session(
-            monkeypatch,
-            raise_on_open=ExceptionGroup("boom", [ValueError("a bug")]),
-        )
-
-        with pytest.raises(ExceptionGroup):
-            await _make_api(hass).async_get_api_instance(llm_api.llm.LLMContext())
-
-
-class TestToolSearchModeInstance:
-    def _tools(self) -> list[SimpleNamespace]:
-        return [
-            _tool_entry("ha_search", pinned=True),
-            _tool_entry("ha_get_state", description="Get entity state"),
-            _tool_entry("ha_config_set_automation", description="Create automation"),
-            _tool_entry("ha_restart", exposed=False),
-        ]
-
-    async def _instance(self, monkeypatch, tools=None):
-        hass = _make_hass()
-        _fake_session(monkeypatch, tools=tools or self._tools())
-        return await _make_api(hass, mode=EXPOSURE_TOOL_SEARCH).async_get_api_instance(
-            llm_api.llm.LLMContext()
-        )
-
-    async def test_compact_catalog_shape(self, monkeypatch):
-        instance = await self._instance(monkeypatch)
-
-        names = [t.name for t in instance.tools]
-        # Pinned exposed tool mirrored directly; hidden + unpinned ones are
-        # only reachable through the meta-tools.
-        assert names == ["ha_search", "ha_search_tools", "ha_call_tool"]
-        assert "Tool Discovery" in instance.api_prompt
-
-    async def test_search_finds_exposed_tools_only(self, monkeypatch):
-        instance = await self._instance(monkeypatch)
-        search = next(t for t in instance.tools if t.name == "ha_search_tools")
-
-        result = await search.async_call(
-            _make_hass(),
-            llm_api.llm.ToolInput("ha_search_tools", {"query": "create automation"}),
-            llm_api.llm.LLMContext(),
-        )
-
-        names = [r["name"] for r in result["results"]]
-        assert "ha_config_set_automation" in names
-        # Hidden tools never appear in search results.
-        assert "ha_restart" not in names
-        # Results carry the schema the agent needs for ha_call_tool.
-        assert all("input_schema" in r for r in result["results"])
-
-    async def test_search_with_no_match_guides_retry(self, monkeypatch):
-        instance = await self._instance(monkeypatch)
-        search = next(t for t in instance.tools if t.name == "ha_search_tools")
-
-        result = await search.async_call(
-            _make_hass(),
-            llm_api.llm.ToolInput("ha_search_tools", {"query": "zzzznothing"}),
-            llm_api.llm.LLMContext(),
-        )
-
-        assert result["results"] == []
-        assert "message" in result
-
-    async def test_call_tool_forwards_exposed_tool(self, monkeypatch):
-        instance = await self._instance(monkeypatch)
-        call = next(t for t in instance.tools if t.name == "ha_call_tool")
-        forward = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
-        monkeypatch.setattr(llm_api, "_forward_tool_call", forward)
-        hass = _make_hass()
-
-        result = await call.async_call(
-            hass,
-            llm_api.llm.ToolInput(
-                "ha_call_tool",
-                {"name": "ha_get_state", "arguments": {"entity_id": "sun.sun"}},
-            ),
-            llm_api.llm.LLMContext(),
-        )
-
-        forward.assert_awaited_once_with(
-            hass,
-            "http://127.0.0.1:9584/private_x",
-            "ha_get_state",
-            {"entity_id": "sun.sun"},
-        )
-        assert result == {"content": [{"type": "text", "text": "ok"}]}
-
-    @pytest.mark.parametrize(
-        "target", ["ha_restart", "ha_totally_made_up"], ids=["hidden", "nonexistent"]
+async def test_an_unexpected_registration_failure_is_logged_not_raised(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        llm, "async_register_api", MagicMock(side_effect=RuntimeError("unexpected"))
     )
-    async def test_call_tool_unknown_for_hidden_and_nonexistent(
-        self, monkeypatch, target
-    ):
-        # Call-time enforcement: a hidden tool gets EXACTLY the same
-        # unknown-tool answer a nonexistent tool gets — hiding without
-        # enforcement would let a model that guesses names skirt the
-        # exposure settings, and a distinct error would leak existence.
-        instance = await self._instance(monkeypatch)
-        call = next(t for t in instance.tools if t.name == "ha_call_tool")
-        forward = AsyncMock()
-        monkeypatch.setattr(llm_api, "_forward_tool_call", forward)
 
-        result = await call.async_call(
-            _make_hass(),
-            llm_api.llm.ToolInput("ha_call_tool", {"name": target, "arguments": {}}),
-            llm_api.llm.LLMContext(),
-        )
+    with caplog.at_level(logging.WARNING):
+        await _register(hass, _add_entry(hass))
 
-        forward.assert_not_awaited()
-        assert result["error"] == f"Unknown tool '{target}'."
-
-    async def test_server_side_search_tool_name_is_excluded(self, monkeypatch):
-        # A server running its own ENABLE_TOOL_SEARCH registers a real
-        # ha_search_tools — never mirror/search it alongside the synthesized
-        # one: one name, one behavior.
-        tools = [*self._tools(), _tool_entry("ha_search_tools", pinned=True)]
-        instance = await self._instance(monkeypatch, tools=tools)
-
-        search = next(t for t in instance.tools if t.name == "ha_search_tools")
-        assert isinstance(search, llm_api.HaMcpSearchTool)
-        result = await search.async_call(
-            _make_hass(),
-            llm_api.llm.ToolInput("ha_search_tools", {"query": "search tools"}),
-            llm_api.llm.LLMContext(),
-        )
-        assert "ha_search_tools" not in [r["name"] for r in result["results"]]
+    assert DATA_LLM_API_UNSUB not in hass.data.get(DOMAIN, {})
+    assert "Could not register the HA-MCP LLM API" in caplog.text
 
 
-class TestToolCall:
-    def _tool(self) -> Any:
-        return llm_api.HaMcpTool(
-            "ha_search",
-            "Search",
-            {"_converted": {}},
-            "http://127.0.0.1:9584/private_x",
-        )
+async def test_a_build_without_the_mcp_sdk_skips_the_feature_with_a_warning(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The SDK arrives with the runtime-installed server package."""
+    monkeypatch.setitem(sys.modules, "mcp.client.session", None)
 
-    async def test_call_passes_args_and_returns_model_dump(self, monkeypatch):
-        result = MagicMock(name="call_result")
-        result.model_dump.return_value = {"content": [{"type": "text", "text": "ok"}]}
-        session = _fake_session(monkeypatch, call_result=result)
+    with caplog.at_level(logging.WARNING):
+        await _register(hass, _add_entry(hass))
 
-        out = await self._tool().async_call(
-            _make_hass(),
-            llm_api.llm.ToolInput("ha_search", {"query": "kitchen light"}),
-            llm_api.llm.LLMContext(),
-        )
-
-        session.call_tool.assert_awaited_once_with(
-            "ha_search", {"query": "kitchen light"}
-        )
-        result.model_dump.assert_called_once_with(exclude_unset=True, exclude_none=True)
-        assert out == {"content": [{"type": "text", "text": "ok"}]}
-
-    async def test_transport_error_raises_homeassistanterror(self, monkeypatch):
-        _fake_session(monkeypatch, raise_on_open=OSError("connection refused"))
-
-        with pytest.raises(llm_api.HomeAssistantError, match="ha_search"):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-    async def test_exception_group_from_transport_is_mapped(self, monkeypatch):
-        # The SDK's anyio task groups surface failures as ExceptionGroup.
-        _fake_session(
-            monkeypatch,
-            raise_on_open=ExceptionGroup("boom", [OSError("refused")]),
-        )
-
-        with pytest.raises(llm_api.HomeAssistantError, match="ha_search"):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-    async def test_unwrapped_httpx_error_is_mapped(self, monkeypatch):
-        # httpx errors do NOT inherit from OSError and can escape a session
-        # call unwrapped (Gemini review finding on #1782); they must map to
-        # HomeAssistantError like every other transport failure.
-        import httpx
-
-        _fake_session(monkeypatch, raise_on_open=httpx.ConnectError("refused"))
-
-        with pytest.raises(llm_api.HomeAssistantError, match="ha_search"):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-    async def test_protocol_mcperror_is_mapped(self, monkeypatch):
-        # Protocol-level JSON-RPC errors surface as McpError (HA core's mcp
-        # integration maps these the same way).
-        from mcp import McpError
-        from mcp.types import ErrorData
-
-        _fake_session(
-            monkeypatch,
-            raise_on_open=McpError(ErrorData(code=-32000, message="boom")),
-        )
-
-        with pytest.raises(llm_api.HomeAssistantError, match="ha_search"):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-    async def test_non_transport_bug_propagates(self, monkeypatch):
-        # A genuine bug (TypeError, ValueError, ...) must NOT be swallowed
-        # into a friendly transport message — it should surface as itself.
-        _fake_session(monkeypatch, raise_on_open=ValueError("a bug"))
-
-        with pytest.raises(ValueError, match="a bug"):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-    @pytest.mark.parametrize(
-        "group",
-        [
-            lambda: ExceptionGroup("boom", [ValueError("a bug")]),
-            lambda: ExceptionGroup("boom", [OSError("refused"), ValueError("a bug")]),
-            lambda: ExceptionGroup(
-                "outer", [ExceptionGroup("inner", [TypeError("a bug")])]
-            ),
-        ],
-        ids=["bug-only", "mixed-transport-and-bug", "nested-group-bug"],
-    )
-    async def test_group_wrapped_bug_propagates(self, monkeypatch, group):
-        # anyio task groups wrap whatever failed inside them — a group is a
-        # transport failure only when EVERY leaf is one. Any genuine bug in
-        # the group (even nested, even alongside real transport errors) must
-        # propagate with its traceback instead of being remapped (review
-        # finding on #1782).
-        _fake_session(monkeypatch, raise_on_open=group())
-
-        with pytest.raises(ExceptionGroup):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-    async def test_slow_tool_call_times_out_as_homeassistanterror(self, monkeypatch):
-        _fake_session(monkeypatch, call_result=MagicMock(), delay=0.2)
-        monkeypatch.setattr(llm_api, "_CALL_TOOL_TIMEOUT_SECONDS", 0.01)
-
-        with pytest.raises(llm_api.HomeAssistantError, match="ha_search"):
-            await self._tool().async_call(
-                _make_hass(),
-                llm_api.llm.ToolInput("ha_search", {}),
-                llm_api.llm.LLMContext(),
-            )
-
-
-class TestMetaKeyContract:
-    def test_component_meta_keys_match_server(self):
-        # The stamp keys are duplicated because the component must never
-        # import ha_mcp at runtime — but the TEST tier can import both, so
-        # the keep-in-sync comment is enforced mechanically here.
-        from ha_mcp.llm_exposure import (
-            META_EXPOSED_KEY,
-            META_NAMESPACE,
-            META_PINNED_KEY,
-        )
-
-        assert llm_api._META_NAMESPACE == META_NAMESPACE
-        assert llm_api._META_EXPOSED_KEY == META_EXPOSED_KEY
-        assert llm_api._META_PINNED_KEY == META_PINNED_KEY
-
-
-class TestModeDefault:
-    async def test_omitted_mode_builds_tool_search_instance(self, monkeypatch):
-        # The dataclass default is the compact/safe shape (review finding:
-        # a full-catalog default made an omitted mode maximally exposed).
-        hass = _make_hass()
-        _fake_session(monkeypatch, tools=[_tool_entry("ha_get_state")])
-        api = llm_api.HaMcpLlmApi(
-            hass=hass,
-            id=_SEARCH_ID,
-            name="HA-MCP Server (tool search)",
-            server_url="http://127.0.0.1:9584/private_x",
-        )
-
-        instance = await api.async_get_api_instance(llm_api.llm.LLMContext())
-
-        assert [t.name for t in instance.tools] == ["ha_search_tools", "ha_call_tool"]
-        assert "Tool Discovery" in instance.api_prompt
-
-    async def test_unknown_mode_degrades_to_tool_search(self, monkeypatch):
-        hass = _make_hass()
-        _fake_session(monkeypatch, tools=[_tool_entry("ha_get_state")])
-        api = _make_api(hass, mode="bogus")
-
-        instance = await api.async_get_api_instance(llm_api.llm.LLMContext())
-
-        assert [t.name for t in instance.tools] == ["ha_search_tools", "ha_call_tool"]
-
-
-class TestSharedHttpClientPassthrough:
-    async def test_canonical_sdk_receives_hass_shared_client(self, monkeypatch):
-        # The blocking-SSL-setup fix (live-found by HA's event-loop monitor):
-        # sessions must hand HA's shared httpx client to the SDK so it never
-        # constructs its own inside the loop. Faked at the sys.modules level
-        # so _mcp_session's REAL wiring runs.
-        import sys
-        from types import ModuleType
-
-        opened: dict[str, Any] = {}
-
-        @asynccontextmanager
-        async def _canonical_client(url, http_client=None):
-            opened["url"] = url
-            opened["http_client"] = http_client
-            yield "read-stream", "write-stream", lambda: None
-
-        fake_transport = ModuleType("mcp.client.streamable_http")
-        fake_transport.streamable_http_client = _canonical_client  # type: ignore[attr-defined]
-
-        class _FakeClientSession:
-            def __init__(self, read_stream, write_stream):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc_info):
-                return False
-
-            async def initialize(self):
-                return SimpleNamespace(instructions="hi")
-
-        fake_session_mod = ModuleType("mcp.client.session")
-        fake_session_mod.ClientSession = _FakeClientSession  # type: ignore[attr-defined]
-
-        monkeypatch.setitem(sys.modules, "mcp.client.streamable_http", fake_transport)
-        monkeypatch.setitem(sys.modules, "mcp.client.session", fake_session_mod)
-
-        shared_client = object()
-        async with llm_api._mcp_session(
-            "http://127.0.0.1:9584/private_x", shared_client
-        ):
-            pass
-
-        assert opened["http_client"] is shared_client
-
-
-class TestPreRenameSdkFallback:
-    async def test_falls_back_to_deprecated_client_name(self, monkeypatch):
-        # A pip-spec override can install an older ha-mcp whose fastmcp pins
-        # a pre-rename mcp SDK: mcp.client.streamable_http then exposes only
-        # streamablehttp_client. _mcp_session must import-fall-back to it and
-        # wire the session identically. Faked at the sys.modules level so the
-        # REAL import selection in _mcp_session runs (the other tests patch
-        # _mcp_session wholesale and never exercise it).
-        import sys
-        from types import ModuleType
-
-        opened: dict[str, Any] = {}
-
-        @asynccontextmanager
-        async def _old_name_client(url):
-            opened["url"] = url
-            yield "read-stream", "write-stream", lambda: None
-
-        fake_transport = ModuleType("mcp.client.streamable_http")
-        fake_transport.streamablehttp_client = _old_name_client  # type: ignore[attr-defined]
-        # Deliberately NO streamable_http_client attribute.
-
-        class _FakeClientSession:
-            def __init__(self, read_stream, write_stream):
-                opened["streams"] = (read_stream, write_stream)
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc_info):
-                return False
-
-            async def initialize(self):
-                return SimpleNamespace(instructions="from old SDK")
-
-        fake_session_mod = ModuleType("mcp.client.session")
-        fake_session_mod.ClientSession = _FakeClientSession  # type: ignore[attr-defined]
-
-        monkeypatch.setitem(sys.modules, "mcp.client.streamable_http", fake_transport)
-        monkeypatch.setitem(sys.modules, "mcp.client.session", fake_session_mod)
-
-        async with llm_api._mcp_session("http://127.0.0.1:9584/private_x") as (
-            session,
-            init,
-        ):
-            assert isinstance(session, _FakeClientSession)
-            assert init.instructions == "from old SDK"
-
-        assert opened["url"] == "http://127.0.0.1:9584/private_x"
-        assert opened["streams"] == ("read-stream", "write-stream")
+    assert _ours(hass) == {}
+    assert DATA_LLM_API_UNSUB not in hass.data.get(DOMAIN, {})
+    assert "required LLM dependency is not importable" in caplog.text

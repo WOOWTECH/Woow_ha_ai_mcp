@@ -10,23 +10,24 @@ File I/O for the three JSON files the settings UI owns in the data dir:
 - ``backup_settings.json`` — the standalone-mode auto-backup override
   (``_load_backup_settings_override`` / ``_save_backup_settings_override``).
 
-``_atomic_write_json`` is the shared tmp-then-rename writer, and
-``_get_override_file_lock`` serialises the feature-flag/advanced-settings
-read-modify-write. Leaf module (no imports from the settings_ui package)
+``_atomic_write_json`` is the shared tmp-then-rename writer.
+Leaf module (no imports from the settings_ui package)
 so the handler families and ``__init__`` can depend on it without cycles.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..config import get_global_settings
+from ..llm_exposure import LLM_API_CONFIG_KEY
+from ..renamed_tools import current_tool_name, rename_retired_keys
 from ..utils.data_paths import get_data_dir
 
 if TYPE_CHECKING:
@@ -66,7 +67,11 @@ def dump_tool_metadata_cache(metadata: list[dict[str, Any]]) -> bool:
     """
     path = _get_tool_metadata_cache_path()
     try:
-        path.write_text(json.dumps(metadata))
+        # Atomic (tmp-then-rename): since the dump moved ahead of the
+        # sidecar retire it overlaps the OLD still-serving sidecar on
+        # every startup, and a truncate-write would hand a concurrent
+        # /api/tools request an empty tool list from the torn file.
+        _atomic_write_json(path, metadata)
     except OSError:
         logger.warning("Failed to dump tool metadata cache to %s", path, exc_info=True)
         return False
@@ -111,21 +116,46 @@ def _seed_tool_config_from_env(settings: Settings) -> dict[str, str]:
     PINNED_TOOLS wins ties only where a tool is not already marked
     disabled (matches the historical seed semantics). Returns an empty
     dict when neither env var names anything.
+
+    Each name is resolved to the tool's current one as it is read, so a
+    retired name on one var and the current name on the other are one key
+    and the tie rule above decides between them. Re-keying afterwards
+    instead would hand the tie to whichever var used the current spelling,
+    inverting the rule for exactly the case the rename mapping exists to
+    protect: a disabled write tool.
     """
     tools: dict[str, str] = {}
     disabled_raw = getattr(settings, "disabled_tools", "")
     if disabled_raw:
-        for name in disabled_raw.split(","):
-            name = name.strip()
+        for raw_name in disabled_raw.split(","):
+            name = current_tool_name(raw_name.strip())
             if name:
                 tools[name] = "disabled"
     pinned_raw = getattr(settings, "pinned_tools", "")
     if pinned_raw:
-        for name in pinned_raw.split(","):
-            name = name.strip()
+        for raw_name in pinned_raw.split(","):
+            name = current_tool_name(raw_name.strip())
             if name and name not in tools:
                 tools[name] = "pinned"
     return tools
+
+
+# Stored ``tools`` states, most restrictive first: a disabled tool stays
+# disabled whatever its consolidated sibling said.
+_TOOL_STATE_RANK = {"disabled": 0, "pinned": 1}
+
+
+def _more_restrictive_tool_state(first: Any, second: Any) -> Any:
+    rank_first = _TOOL_STATE_RANK.get(first, len(_TOOL_STATE_RANK))
+    rank_second = _TOOL_STATE_RANK.get(second, len(_TOOL_STATE_RANK))
+    return second if rank_second < rank_first else first
+
+
+def _more_restrictive_exposure(first: Any, second: Any) -> Any:
+    # ``llm_api`` stores {tool: exposed}; not exposed is the restrictive side.
+    if isinstance(first, bool) and isinstance(second, bool):
+        return first and second
+    return first
 
 
 def load_tool_config(settings: Settings | None = None) -> dict[str, Any]:
@@ -149,6 +179,26 @@ def load_tool_config(settings: Settings | None = None) -> dict[str, Any]:
         except json.JSONDecodeError:
             logger.warning("Tool config at %s is not valid JSON; ignoring.", path)
         else:
+            # A state stored under a tool's retired name still belongs to
+            # that tool: without this, a disabled write tool comes back
+            # enabled the first time the server starts after the rename.
+            # Both name-keyed maps in this file need it — an orphaned
+            # ``llm_api`` override is not lost, it is worse than lost: it
+            # stays in the file, keyed on a name nothing looks up, while the
+            # tool falls through to its default, which for the app tools
+            # means exposed to every conversation agent.
+            # Two retired names folded into one tool (#2329) can disagree;
+            # the more restrictive stored state wins.
+            tools_states = result.get("tools")
+            if isinstance(tools_states, dict):
+                result["tools"] = rename_retired_keys(
+                    tools_states, prefer=_more_restrictive_tool_state
+                )
+            exposure_states = result.get(LLM_API_CONFIG_KEY)
+            if isinstance(exposure_states, dict):
+                result[LLM_API_CONFIG_KEY] = rename_retired_keys(
+                    exposure_states, prefer=_more_restrictive_exposure
+                )
             return result
 
     if settings is None:
@@ -169,19 +219,49 @@ def env_pinned_tools(settings: Settings | None = None) -> dict[str, str]:
     in the DISABLED_TOOLS or PINNED_TOOLS env vars.
 
     Used by the UI to render env-pinned rows as read-only and by the
-    save handler to reject flips. PINNED_TOOLS wins ties (matches the
-    existing seed semantics in load_tool_config).
+    save handler to reject flips. PINNED_TOOLS wins when the SAME name
+    appears in both vars (matches the existing seed semantics in
+    load_tool_config); when two different retired names now resolve to one
+    consolidated tool, the more restrictive state wins instead.
+
+    Names resolve to the current tool as they are read, for the reason
+    given in ``_seed_tool_config_from_env``: the tie rule has to see one
+    key per tool, whichever spelling each var used.
     """
     if settings is None:
         settings = get_global_settings()
+    # Collect every spelling per resolved tool first: deciding as we go let a
+    # second pinned alias overwrite a restriction that a FIRST alias had
+    # already resolved in favour of "disabled".
+    disabled_by: dict[str, set[str]] = {}
+    pinned_by: dict[str, set[str]] = {}
+    for raw_name in (settings.disabled_tools or "").split(","):
+        raw = raw_name.strip()
+        name = current_tool_name(raw)
+        if name:
+            disabled_by.setdefault(name, set()).add(raw)
+    for raw_name in (settings.pinned_tools or "").split(","):
+        raw = raw_name.strip()
+        name = current_tool_name(raw)
+        if name:
+            pinned_by.setdefault(name, set()).add(raw)
+
     pinned: dict[str, str] = {}
-    for name in (settings.disabled_tools or "").split(","):
-        name = name.strip()
-        if name:
+    for name in disabled_by.keys() | pinned_by.keys():
+        disabled_spellings = disabled_by.get(name, set())
+        pinned_spellings = pinned_by.get(name, set())
+        if not disabled_spellings:
+            pinned[name] = "pinned"
+        elif not pinned_spellings:
             pinned[name] = "disabled"
-    for name in (settings.pinned_tools or "").split(","):
-        name = name.strip()
-        if name:
+        elif disabled_spellings - pinned_spellings:
+            # A spelling asked for "disabled" and was never named in
+            # PINNED_TOOLS itself, so this is a consolidation collision, not
+            # one tool named in both vars: the restriction wins, or the
+            # consolidated write-capable tool comes back enabled.
+            pinned[name] = "disabled"
+        else:
+            # Every disabled spelling is also pinned: the documented tie.
             pinned[name] = "pinned"
     return pinned
 
@@ -202,10 +282,13 @@ def effective_tool_config(settings: Settings | None = None) -> dict[str, Any]:
     return {**cfg, "tools": tools}
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write_json(
+    path: Path, payload: dict[str, Any] | list[dict[str, Any]]
+) -> None:
     """Write ``payload`` to ``path`` atomically.
 
-    Writes to ``<path>.tmp`` first and ``os.replace``s into place so a
+    Writes to a unique same-directory temp file (``mkstemp``, since
+    #1993) first and ``os.replace``s into place so a
     crash or out-of-space mid-write cannot leave a partial/empty file —
     callers that read the file back (``load_tool_config`` /
     ``_load_backup_settings_override``) would otherwise treat a
@@ -216,16 +299,22 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
     Raises OSError on filesystem failure — same surface as the previous
     ``path.write_text`` so caller try/except shapes don't need updating.
-    On failure, the ``.tmp`` file is cleaned up so a previous partial
-    write does not accumulate next to the real file.
+    On failure, the temp file is cleaned up so a partial write does not
+    accumulate next to the real file. The temp name is UNIQUE (``mkstemp``,
+    same pattern as ``policy.persistence.save_policy``) so two concurrent
+    writers to the same ``path`` can't collide on a shared ``.tmp`` and
+    corrupt each other's write.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
     try:
-        tmp.write_text(json.dumps(payload, indent=2))
-        os.replace(str(tmp), str(path))
-    except OSError:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, indent=2))
+        os.replace(tmp_name, str(path))
+    except OSError, ValueError:
         with contextlib.suppress(FileNotFoundError, OSError):
-            tmp.unlink()
+            Path(tmp_name).unlink()
         raise
 
 
@@ -253,7 +342,7 @@ def _get_backup_settings_override_path() -> Path:
 
     Sits next to ``tool_config.json`` in the same data dir. Web UI edits
     in standalone (non-addon) mode persist here; ``get_global_settings``
-    reads the file on the next call after ``_reset_global_settings``.
+    reads the file on the next call after ``reset_global_settings``.
     """
     return get_data_dir() / "backup_settings.json"
 
@@ -301,33 +390,3 @@ def _save_backup_settings_override(data: dict[str, Any]) -> bool:
         logger.exception("Failed to save backup settings override to %s", path)
         return False
     return True
-
-
-# Serialises read-modify-write on the shared override file
-# (``feature_flags.json``) so two concurrent saves can't interleave
-# their reads and clobber each other's persisted state. Both
-# ``_save_feature_flags`` and ``_save_advanced_settings``
-# touch the same file; without this lock, request A reading before
-# request B's ``os.replace`` lands would write back a merged dict that
-# misses B's changes. The runtime master gate kept functionality
-# correct even when this raced, but the persisted state lied about the
-# user's intent — surfacing as "I set the flag and it came back off"
-# after a restart.
-_OVERRIDE_FILE_LOCK: asyncio.Lock | None = None
-
-
-def _get_override_file_lock() -> asyncio.Lock:
-    """Lazy lock construction. ``asyncio.Lock()`` on Python 3.10+ no
-    longer takes a ``loop=`` argument and only binds to a loop on
-    first ``acquire()`` via ``asyncio.get_event_loop()``. Either eager
-    or lazy module-level construction works for this project's
-    single-uvicorn-loop deployment; we keep the lazy pattern so a
-    future test fixture that spins up its own loop doesn't lock in
-    the import-time loop. Assumes a single asyncio event loop for the
-    process lifetime — a multi-loop deployment (e.g. threaded handler
-    dispatch) would race here.
-    """
-    global _OVERRIDE_FILE_LOCK
-    if _OVERRIDE_FILE_LOCK is None:
-        _OVERRIDE_FILE_LOCK = asyncio.Lock()
-    return _OVERRIDE_FILE_LOCK

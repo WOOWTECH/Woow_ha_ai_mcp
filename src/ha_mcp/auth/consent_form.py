@@ -14,7 +14,7 @@ def _extract_domain(redirect_uri: str) -> str:
     try:
         parsed = urlparse(redirect_uri)
         return parsed.netloc or redirect_uri
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return redirect_uri
 
 
@@ -316,7 +316,8 @@ def create_consent_html(
                     autocomplete="off"
                 >
                 <p class="help-text">
-                    Create a token at: Home Assistant &rarr; Profile &rarr;
+                    Create a token (an administrator's is recommended; non-admin
+                    tokens work with limitations) at: Home Assistant &rarr; Profile &rarr;
                     <a href="https://www.home-assistant.io/docs/authentication/#your-account-profile" target="_blank" rel="noopener">
                         Long-Lived Access Tokens
                     </a>

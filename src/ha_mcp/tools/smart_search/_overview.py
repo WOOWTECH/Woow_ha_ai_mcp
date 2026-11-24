@@ -3,9 +3,15 @@
 import asyncio
 import logging
 import random
+from itertools import islice
 from typing import Any
 
-from ...visibility.resolver import load_hidden_set
+from ...utils.device_registry_semantics import (
+    build_device_registry_snapshot,
+    effective_entity_area_id,
+)
+from ...visibility.resolver import core_device_list_reply, load_hidden_set
+from ..component_registries import registry_list_reply
 from ..helpers import exception_to_structured_error
 from ._base import _SearchBase
 from ._config import _simplify_states_summary
@@ -15,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 class SystemOverviewMixin(_SearchBase):
     """``get_system_overview`` and its analysis/format/paginate helpers."""
+
+    async def _fetch_legacy_overview_slices(self) -> list[Any]:
+        """Fetch broad legacy slices in parallel after states succeeds."""
+        states = await self.client.get_states()
+        optional_results = await asyncio.gather(
+            self.client.get_services(),
+            registry_list_reply(self.client, "area"),
+            self.client.send_websocket_message({"type": "config/entity_registry/list"}),
+            core_device_list_reply(self.client),
+            return_exceptions=True,
+        )
+        return [states, *optional_results]
 
     async def get_system_overview(
         self,
@@ -71,35 +89,11 @@ class SystemOverviewMixin(_SearchBase):
                     prefetched_slices["device_registry"],
                 ]
             else:
-                # Fetch all data in parallel. return_exceptions=True so a degraded
-                # registry/service fetch doesn't abort the whole overview.
-                results = await asyncio.gather(
-                    self.client.get_states(),
-                    self.client.get_services(),
-                    self.client.send_websocket_message(
-                        {"type": "config/area_registry/list"}
-                    ),
-                    self.client.send_websocket_message(
-                        {"type": "config/entity_registry/list"}
-                    ),
-                    self.client.send_websocket_message(
-                        {"type": "config/device_registry/list"}
-                    ),
-                    return_exceptions=True,
-                )
+                # Fetch mandatory states first, then read optional slices in
+                # parallel; optional failures degrade independently below.
+                results = await self._fetch_legacy_overview_slices()
 
-            # Entities are mandatory — surface connection/auth errors immediately.
-            # Use BaseException so a cancelled states fetch propagates instead of
-            # being assigned to `entities` and crashing downstream iteration
-            # (mirrors get_entities_by_area / _fetch_search_entities).
-            if isinstance(results[0], BaseException):
-                raise results[0]
             entities = results[0]
-            # A cancelled services/registry sub-task must propagate too, not be
-            # silently degraded by the fail-open handlers below.
-            for sub_result in results[1:]:
-                if isinstance(sub_result, asyncio.CancelledError):
-                    raise sub_result
 
             # Opt-in visibility filter: drop out-of-scope entities from the whole
             # overview universe before any domain stats/samples are computed, so
@@ -146,6 +140,7 @@ class SystemOverviewMixin(_SearchBase):
             entity_area_map = self._build_entity_area_map(
                 entity_registry, device_registry
             )
+            entity_names = self._build_entity_name_map(entity_registry)
 
             (
                 max_entities_per_domain,
@@ -171,6 +166,7 @@ class SystemOverviewMixin(_SearchBase):
                 domains_filter_set,
                 area_stats,
                 entity_area_map,
+                entity_names,
                 include_state,
                 include_entity_id,
             )
@@ -236,24 +232,34 @@ class SystemOverviewMixin(_SearchBase):
         entity_registry: list[dict[str, Any]],
         device_registry: list[dict[str, Any]],
     ) -> dict[str, str | None]:
-        """Map entity_id -> area_id. Priority: entity direct area_id > device area_id."""
-        device_area_map: dict[str, str | None] = {}
-        for device in device_registry:
-            device_id = device.get("id", "")
-            if device_id:
-                device_area_map[device_id] = device.get("area_id")
+        """Map entity IDs to direct area, then device direct-or-parent effective area."""
+        device_area_map = build_device_registry_snapshot(
+            list(device_registry)
+        ).effective_area_by_id
 
         entity_area_map: dict[str, str | None] = {}
         for entry in entity_registry:
             entity_id = entry.get("entity_id")
-            area_id = entry.get("area_id")
-            if not area_id:
-                device_id = entry.get("device_id")
-                if device_id:
-                    area_id = device_area_map.get(device_id)
             if entity_id:
-                entity_area_map[entity_id] = area_id
+                entity_area_map[entity_id] = effective_entity_area_id(
+                    entry, device_area_map
+                )
         return entity_area_map
+
+    @staticmethod
+    def _build_entity_name_map(
+        entity_registry: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Map entity IDs to the name Core composes for them.
+
+        Only the component's registry rows carry it (``full_name``); Core's own
+        registry list does not, so the map is empty without the component.
+        """
+        return {
+            entry["entity_id"]: entry["full_name"]
+            for entry in entity_registry
+            if entry.get("entity_id") and entry.get("full_name")
+        }
 
     @staticmethod
     def _resolve_overview_display_opts(
@@ -321,6 +327,7 @@ class SystemOverviewMixin(_SearchBase):
         domains_filter_set: set[str] | None,
         area_stats: dict[str, dict[str, Any]],
         entity_area_map: dict[str, str | None],
+        entity_names: dict[str, str],
         include_state: bool,
         include_entity_id: bool,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
@@ -343,9 +350,13 @@ class SystemOverviewMixin(_SearchBase):
             stats["count"] += 1
             stats["states_summary"][state] = stats["states_summary"].get(state, 0) + 1
 
-            entity_data: dict[str, Any] = {
-                "friendly_name": attributes.get("friendly_name", entity_id),
-            }
+            friendly_name = attributes.get("friendly_name", entity_id)
+            entity_data: dict[str, Any] = {"friendly_name": friendly_name}
+            # Most entities carry one name; a second key on every row of a
+            # whole-house listing would repeat it.
+            name = entity_names.get(entity_id)
+            if name and name != friendly_name:
+                entity_data["name"] = name
             if include_entity_id:
                 entity_data["entity_id"] = entity_id
             if include_state:
@@ -433,65 +444,41 @@ class SystemOverviewMixin(_SearchBase):
         return formatted_domain_stats
 
     @staticmethod
-    def _allocate_page_one(
-        formatted_domain_stats: dict[str, dict[str, Any]],
-        effective_limit: int,
-        total_entity_count: int,
-    ) -> int:
-        """Distribute the page-1 budget: a min allocation per domain, rest proportional.
-
-        Gives each domain a minimum slice so the LLM sees entities from every
-        domain, then distributes the remaining budget proportionally. Mutates
-        ``formatted_domain_stats`` in place; returns the count included.
-        """
-        min_per_domain = 3
-        num_domains = len(formatted_domain_stats)
-        reserved = min(min_per_domain * num_domains, effective_limit)
-        remaining_budget = effective_limit - reserved
-
-        entities_included = 0
-        for domain_data in formatted_domain_stats.values():
-            domain_entities = domain_data["entities"]
-            domain_len = len(domain_entities)
-            base = min(min_per_domain, domain_len)
-            if total_entity_count > 0 and remaining_budget > 0:
-                extra = int(remaining_budget * domain_len / total_entity_count)
-            else:
-                extra = 0
-            take = min(base + extra, domain_len)
-            if take < domain_len:
-                domain_data["entities"] = domain_entities[:take]
-                domain_data["truncated"] = True
-            entities_included += len(domain_data["entities"])
-        return entities_included
-
-    @staticmethod
-    def _allocate_subsequent_pages(
+    def _allocate_page(
         formatted_domain_stats: dict[str, dict[str, Any]],
         effective_limit: int,
         offset: int,
     ) -> int:
-        """Apply pages-2+ sequential skip/take across domains. Mutates in place."""
-        entities_skipped = 0
-        entities_included = 0
-        for domain_data in formatted_domain_stats.values():
-            domain_entities = domain_data["entities"]
-            domain_len = len(domain_entities)
+        """Take one stable round-robin page across domains.
 
-            skip_from_domain = max(0, min(domain_len, offset - entities_skipped))
-            budget_left = effective_limit - entities_included
-            take_from_domain = max(0, min(domain_len - skip_from_domain, budget_left))
+        A single ordering must drive every page. Otherwise a specially balanced
+        first page followed by sequential offset pages can repeat entities.
 
-            if skip_from_domain > 0 or take_from_domain < domain_len:
-                domain_data["entities"] = domain_entities[
-                    skip_from_domain : skip_from_domain + take_from_domain
-                ]
-                if take_from_domain < domain_len:
-                    domain_data["truncated"] = True
+        Mutates ``formatted_domain_stats`` in place; returns the count included.
+        """
+        max_domain_size = max(
+            (len(data["entities"]) for data in formatted_domain_stats.values()),
+            default=0,
+        )
+        ordered = (
+            (domain, data["entities"][index])
+            for index in range(max_domain_size)
+            for domain, data in formatted_domain_stats.items()
+            if index < len(data["entities"])
+        )
 
-            entities_skipped += skip_from_domain
-            entities_included += take_from_domain
-        return entities_included
+        selected: dict[str, list[dict[str, Any]]] = {
+            domain: [] for domain in formatted_domain_stats
+        }
+        for domain, entity in islice(ordered, offset, offset + effective_limit):
+            selected[domain].append(entity)
+
+        for domain, data in formatted_domain_stats.items():
+            original_count = len(data["entities"])
+            data["entities"] = selected[domain]
+            if len(data["entities"]) < original_count:
+                data["truncated"] = True
+        return sum(len(entities) for entities in selected.values())
 
     def _paginate_overview_entities(
         self,
@@ -514,14 +501,9 @@ class SystemOverviewMixin(_SearchBase):
         total_entity_count = sum(
             len(ds["entities"]) for ds in formatted_domain_stats.values()
         )
-        if offset == 0:
-            entities_included = self._allocate_page_one(
-                formatted_domain_stats, effective_limit, total_entity_count
-            )
-        else:
-            entities_included = self._allocate_subsequent_pages(
-                formatted_domain_stats, effective_limit, offset
-            )
+        entities_included = self._allocate_page(
+            formatted_domain_stats, effective_limit, offset
+        )
 
         has_more = (offset + entities_included) < total_entity_count
         return {

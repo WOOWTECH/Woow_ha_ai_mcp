@@ -26,6 +26,7 @@ import pytest
 # Import test utilities
 from ...utilities.assertions import (
     MCPAssertions,
+    safe_call_tool,
 )
 
 # Set up logging
@@ -35,6 +36,10 @@ logger = logging.getLogger(__name__)
 
 def enhanced_parse_mcp_result(result) -> dict[str, Any]:
     """Enhanced MCP result parser with better error handling."""
+    # Same passthrough contract as the shared utilities.assertions helper:
+    # an already-parsed dict comes back unchanged.
+    if isinstance(result, dict):
+        return result
     try:
         if hasattr(result, "content") and result.content:
             response_text = str(result.content[0].text)
@@ -48,7 +53,7 @@ def enhanced_parse_mcp_result(result) -> dict[str, Any]:
                         .replace("null", "None")
                     )
                     return ast.literal_eval(fixed_text)
-                except (SyntaxError, ValueError):
+                except SyntaxError, ValueError:
                     return {"raw_response": response_text, "parse_error": True}
 
         return {
@@ -56,7 +61,7 @@ def enhanced_parse_mcp_result(result) -> dict[str, Any]:
                 str(result.content[0]) if hasattr(result, "content") else str(result)
             )
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Failed to parse MCP result: {e}")
         return {"error": "Failed to parse result", "exception": str(e)}
 
@@ -88,7 +93,7 @@ async def wait_for_item_in_list(
                         logger.info(f"Found item '{item_summary}' in {entity_id}")
                         return True
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"Item check failed: {e}")
 
         await asyncio.sleep(poll_interval)
@@ -113,7 +118,7 @@ async def get_item_by_summary(
                 if item.get("summary") == item_summary:
                     return item
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"Failed to get item by summary: {e}")
 
     return None
@@ -359,9 +364,10 @@ class TestTodoErrorHandling:
 
     async def test_update_requires_at_least_one_field(self, mcp_client):
         """
-        Test: Update requires at least one update field
+        Test: Core refuses an update that names no field
 
-        Validates that ha_set_todo_item requires at least one update field.
+        ha_set_todo_item passes the update to Core, whose todo.update_item
+        schema requires at least one field to change.
         """
         logger.info("Testing update validation...")
 
@@ -373,67 +379,37 @@ class TestTodoErrorHandling:
                 pytest.skip("No todo lists available for testing")
 
             todo_entity = list_result["todo_lists"][0]["entity_id"]
+            item_name = f"E2E No Field {int(time.time())}"
 
-            # Try to update without any update fields
-            await mcp.call_tool_failure(
-                "ha_set_todo_item",
-                {
-                    "entity_id": todo_entity,
-                    "item": "some_item",
-                    # No rename, status, description, or due_date provided
-                },
-                expected_error="At least one update field",
+            # An existing item, so the refusal is Core's and not a missing item
+            await mcp.call_tool_success(
+                "ha_set_todo_item", {"entity_id": todo_entity, "summary": item_name}
             )
+            assert await wait_for_item_in_list(mcp_client, todo_entity, item_name)
+
+            try:
+                # Try to update without any update fields
+                await mcp.call_tool_failure(
+                    "ha_set_todo_item",
+                    {
+                        "entity_id": todo_entity,
+                        "item": item_name,
+                        # No rename, status, description, or due_date provided
+                    },
+                    expected_error="at least one of",
+                )
+            finally:
+                await safe_call_tool(
+                    mcp_client,
+                    "ha_remove_todo_item",
+                    {"entity_id": todo_entity, "item": item_name},
+                )
             logger.info("Update validation test passed")
 
 
 @pytest.mark.todo
 class TestTodoAdvancedFeatures:
-    """Test advanced todo features like descriptions and due dates."""
-
-    async def test_add_item_with_description(self, mcp_client):
-        """
-        Test: Add todo item with description
-
-        Validates adding items with optional description field.
-        Note: Not all todo integrations support descriptions.
-        """
-        logger.info("Testing add item with description...")
-
-        async with MCPAssertions(mcp_client) as mcp:
-            # Get available todo lists
-            list_result = await mcp.call_tool_success("ha_get_todo", {})
-
-            if list_result["count"] == 0:
-                pytest.skip("No todo lists available for testing")
-
-            todo_entity = list_result["todo_lists"][0]["entity_id"]
-            test_item = f"E2E Item With Desc {int(time.time())}"
-            test_desc = "This is a test description"
-
-            # Try to add with description
-            try:
-                await mcp.call_tool_success(
-                    "ha_set_todo_item",
-                    {
-                        "entity_id": todo_entity,
-                        "summary": test_item,
-                        "description": test_desc,
-                    },
-                )
-                logger.info("Item with description added successfully")
-
-                # Clean up
-                await mcp_client.call_tool(
-                    "ha_remove_todo_item", {"entity_id": todo_entity, "item": test_item}
-                )
-                logger.info("Cleanup completed")
-
-            except Exception as e:
-                # Some todo integrations don't support descriptions
-                logger.info(f"Description not supported by this integration: {e}")
-
-            logger.info("Add item with description test completed")
+    """Test renaming a todo item."""
 
     async def test_rename_todo_item(self, mcp_client):
         """
@@ -553,7 +529,7 @@ class TestTodoBulkOperations:
                         "ha_remove_todo_item",
                         {"entity_id": todo_entity, "item": item_name},
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass  # Item may already be gone
 
             logger.info("Bulk add operations test completed")

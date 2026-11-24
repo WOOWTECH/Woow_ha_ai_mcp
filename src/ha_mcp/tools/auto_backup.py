@@ -29,17 +29,28 @@ from __future__ import annotations
 import functools
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 
 from ..backup_manager import (
     _CAPTURE_TRANSIENT_ERRORS,
     MandatoryBackupError,
+    _is_flow_helper_domain,
     get_backup_manager,
 )
+from ..client.rest_client import HomeAssistantAuthError
 from ..config import get_global_settings
-from ..errors import ErrorCode, create_error_response
-from .helpers import raise_tool_error
+from ..errors import TOOL_ERROR_LOG_LEVEL, ErrorCode, create_error_response
+from ..utils.registry_update_lock import registry_update_lock
+from .helpers import (
+    exception_to_structured_error,
+    raise_tool_error,
+    tool_error_from_response,
+)
+from .resource_patch import resource_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +60,166 @@ logger = logging.getLogger(__name__)
 # tuple. Programming errors (TypeError on a bad ``id_fn`` lambda,
 # KeyError on a missing kwarg) propagate to surface the bug.
 _DECORATOR_TRANSIENT_ERRORS = _CAPTURE_TRANSIENT_ERRORS
+
+
+class PathNotAllowedError(ToolError):
+    """The File & YAML Tools component refused the file path itself.
+
+    Raised by the ``file`` capture's read. The write and delete allowlist is a
+    subset of the read gate, so a path the read refuses, the wrapped write or
+    delete would refuse too (#2908). The message names no operation and leaves
+    out the component's read allowlist, which would mislead a write; the
+    component's own text stays in ``context``.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        component_error: str,
+        *,
+        message: str | None = None,
+        suggestions: list[str] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        self.path = path
+        self.component_error = component_error
+        super().__init__(
+            json.dumps(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    message or f"Path not allowed: {path}",
+                    suggestions=suggestions or _custom_path_suggestions(path),
+                    context={
+                        **(context or {}),
+                        "path": path,
+                        "component_error": component_error,
+                    },
+                ),
+                indent=2,
+                default=str,
+            ),
+            log_level=TOOL_ERROR_LOG_LEVEL,
+        )
+
+
+# The component's volume roots and deny floor, which it doesn't publish to the
+# server on a refusal (custom_components/ha_mcp_tools/const.py: ALLOWED_VOLUME_
+# ROOTS, DENY_PATH_SEGMENTS, DENY_READ_BASENAMES). A unit test pins the copies.
+_VOLUME_ROOTS = ("/share", "/media", "/ssl")
+_DENY_SEGMENTS = frozenset({".storage"})
+_DENY_BASENAMES = frozenset({"secrets.yaml", "approval_pin.json"})
+
+
+def _custom_path_suggestions(path: str) -> list[str]:
+    """Suggest a custom path only where the settings UI can accept one."""
+    parts = path.lower().split("/")
+    if _DENY_SEGMENTS.intersection(parts) or parts[-1] in _DENY_BASENAMES:
+        return ["This path is never available to the file tools"]
+    if path.startswith("/") and not any(
+        path == root or path.startswith(root + "/") for root in _VOLUME_ROOTS
+    ):
+        return [
+            "Custom filesystem paths accept absolute paths only under "
+            f"{', '.join(_VOLUME_ROOTS)}; this one cannot be allowed"
+        ]
+    return [
+        "If it isn't listed already, add it or a folder above it under "
+        "Custom filesystem paths in the ha-mcp settings UI"
+    ]
+
+
+def path_refusal(err: BaseException) -> PathNotAllowedError | None:
+    """The component's path refusal that is, or caused, ``err``; else ``None``."""
+    if isinstance(err, PathNotAllowedError):
+        return err
+    cause = refusal_behind_capture_failure(err)
+    return cause if isinstance(cause, PathNotAllowedError) else None
+
+
+def raise_if_snapshot_path_refused(
+    err: BaseException, action: str, backup_name: str, data: Any = None
+) -> None:
+    """Re-frame a refused live-file read during a diff or restore of a snapshot.
+
+    A snapshot of a path that is no longer allowed (a removed custom path, or
+    any ``/backup`` path after #2875) can't be compared with or written back to
+    its live file. Say that, instead of the write-oriented path refusal. A
+    restore passes its outcome as ``data``, so callers still see that nothing
+    was applied. (On-demand create has no snapshot yet and reports the plain
+    refusal.)
+    """
+    refusal = path_refusal(err)
+    if refusal is None:
+        return
+    raise PathNotAllowedError(
+        refusal.path,
+        refusal.component_error,
+        message=(
+            f"Cannot {action} {backup_name!r}: its live file {refusal.path} is "
+            "no longer readable through the file tools (the path is not allowed)"
+        ),
+        suggestions=[
+            "View the snapshot with ha_manage_backup(scope='edits', "
+            f"action='view', backup_name={backup_name!r}) to recover its content",
+            *_custom_path_suggestions(refusal.path),
+        ],
+        context={
+            "backup_name": backup_name,
+            "action": action,
+            **({"data": data} if data is not None else {}),
+        },
+    ) from None
+
+
+def refusal_behind_capture_failure(err: BaseException) -> ToolError | None:
+    """Return the ``ToolError`` to report instead of a capture failure, else None.
+
+    A mandatory pre-write snapshot reads the current content through the same
+    backend the wrapped write needs, so when that refuses the call the capture
+    fails FIRST and the write would be refused as ``BACKUP_CAPTURE_FAILED``,
+    burying the real error one level deep. Three refusals are surfaced:
+    ``COMPONENT_NOT_INSTALLED`` (no tools entry, #2292) and
+    ``PathNotAllowedError`` (the path is outside the allowlist, #2908) as they
+    were raised, and a ``HomeAssistantAuthError`` from any capture backend, not
+    only the File & YAML Tools services, as a new error under the auth code.
+    ``capture_on_demand`` uses the same check, and is where a capture reaches
+    the other backends. Retrying the backup cannot succeed for any of them, and the remediation is
+    not the backup pipeline's.
+    """
+    seen: set[int] = set()
+    # Worklist over BOTH chain links: an explicit ``raise ... from other``
+    # sets an unrelated ``__cause__`` while the component error stays in
+    # ``__context__`` — following only one link per node would miss it.
+    stack: list[BaseException] = [
+        link for link in (err.__cause__, err.__context__) if link is not None
+    ]
+    while stack:
+        cause = stack.pop()
+        if id(cause) in seen:
+            continue
+        seen.add(id(cause))
+        if isinstance(cause, PathNotAllowedError):
+            return cause
+        if isinstance(cause, HomeAssistantAuthError):
+            return tool_error_from_response(
+                exception_to_structured_error(cause, raise_error=False)
+            )
+        if isinstance(cause, ToolError):
+            try:
+                payload = json.loads(str(cause))
+            except TypeError, ValueError:
+                payload = None
+            if (
+                isinstance(payload, dict)
+                and isinstance(payload.get("error"), dict)
+                and payload["error"].get("code")
+                == ErrorCode.COMPONENT_NOT_INSTALLED.value
+            ):
+                return cause
+        stack.extend(
+            link for link in (cause.__cause__, cause.__context__) if link is not None
+        )
+    return None
 
 
 def _resolve_str(value: Any) -> str:
@@ -62,13 +233,13 @@ def automation_backup_target(kw: dict[str, Any]) -> str:
     """Resolve the actual storage target for an automation write.
 
     HA's automation storage uses the body's ``id`` field as the primary
-    key (#1404). When the caller passes both ``identifier`` and a
+    key (#1404). When the caller passes both ``entity_id`` and a
     ``config.id`` that differ, HA writes to ``config.id`` — the
     snapshot must capture *that* entity, not the user-provided
-    ``identifier`` whose target is left untouched.
+    ``entity_id`` whose target is left untouched.
 
     Returns ``str(config["id"])`` when present, else
-    ``str(identifier or "")``. Empty string skips capture (matches the
+    ``str(entity_id or "")``. Empty string skips capture (matches the
     create path where there's nothing to back up yet).
 
     ``config`` accepts dict or JSON-string per the tool signature; both
@@ -78,13 +249,13 @@ def automation_backup_target(kw: dict[str, Any]) -> str:
     if isinstance(config, str):
         try:
             config = json.loads(config)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             config = None
     if isinstance(config, dict):
         config_id = config.get("id")
         if config_id:
             return str(config_id)
-    # Return the identifier UNCHANGED — do NOT strip the ``automation.``
+    # Return the entity_id UNCHANGED — do NOT strip the ``automation.``
     # prefix. Capture and restore resolve the target through
     # ``client.get_automation_config`` -> ``_resolve_automation_id``, which
     # converts an entity_id ("automation.<slug>") to the real numeric
@@ -96,8 +267,8 @@ def automation_backup_target(kw: dict[str, Any]) -> str:
     # would POST to the wrong key and create a stray automation). The
     # doubled domain segment in the snapshot filename
     # ("automation.automation.<slug>.<ts>.yaml") is purely cosmetic and is
-    # exactly what the remove path (id_param="identifier") already produces.
-    return _resolve_str(kw.get("identifier"))
+    # exactly what the remove path (id_param="entity_id") already produces.
+    return _resolve_str(kw.get("entity_id"))
 
 
 def with_auto_backup(
@@ -109,6 +280,8 @@ def with_auto_backup(
     client: Any = None,
     mandatory: bool = False,
     skip_fn: Callable[[dict[str, Any]], bool] | None = None,
+    domain_resolver: Callable[[Any, dict[str, Any], str, str], Awaitable[str]]
+    | None = None,
 ) -> Callable[..., Any]:
     """Decorate a write/destructive tool with pre-write auto-backup capture.
 
@@ -127,9 +300,13 @@ def with_auto_backup(
     write proceeds regardless.
 
     ``skip_fn`` (optional) short-circuits the whole decorator — including
-    the ``mandatory`` gate — for calls it identifies as unable to write
-    (e.g. a yaml-edit confirm-flow preview): no snapshot, no refusal, the
-    wrapped tool runs directly.
+    the ``mandatory`` gate — for calls that cannot write (e.g. a yaml-edit
+    preview) or delegate capture and write coordination to an inner owner.
+    The wrapped tool runs directly without an outer snapshot or refusal.
+
+    ``domain_resolver`` optionally refines the capture domain from HA metadata.
+    It receives the client, tool kwargs, initial domain and entity ID inside
+    the write guard, before capture. Its failures follow the capture policy.
 
     ``mandatory=True`` makes auto-backup a precondition (file/YAML writes,
     #1579 — those formerly kept their own private backups). It fails the
@@ -156,10 +333,9 @@ def with_auto_backup(
     def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # A call skip_fn identifies as unable to write (e.g. a yaml-edit
-            # confirm-flow PREVIEW, which returns a diff and writes nothing)
-            # needs no pre-write snapshot — and must not be refused by the
-            # mandatory gate either, since there is nothing to protect.
+            # Read-only previews need no capture. Delegated writes acquire
+            # their own guard and snapshot after resolving or confirming the
+            # target, so they also bypass this outer capture and refusal.
             if skip_fn is not None and skip_fn(kwargs):
                 return await func(*args, **kwargs)
             # Settings + target resolution happen OUTSIDE the best-effort
@@ -193,24 +369,86 @@ def with_auto_backup(
                         },
                     )
                 )
-            if enabled:
-                await _capture_pre_write_snapshot(
-                    func,
-                    args,
-                    kwargs,
-                    settings=settings,
-                    explicit_client=explicit_client,
-                    domain=domain,
-                    domain_fn=domain_fn,
-                    id_param=id_param,
-                    id_fn=id_fn,
-                    mandatory=mandatory,
-                )
-            return await func(*args, **kwargs)
+            snap_domain, entity_id = _resolve_snapshot_target(
+                kwargs,
+                domain=domain,
+                domain_fn=domain_fn,
+                id_param=id_param,
+                id_fn=id_fn,
+            )
+            async with _template_write_context(
+                _resolve_backup_client(explicit_client, args),
+                settings,
+                snap_domain,
+                entity_id,
+            ):
+                skipped = None
+                if enabled:
+                    skipped = await _capture_pre_write_snapshot(
+                        func,
+                        args,
+                        kwargs,
+                        settings=settings,
+                        explicit_client=explicit_client,
+                        domain=domain,
+                        domain_fn=domain_fn,
+                        id_param=id_param,
+                        id_fn=id_fn,
+                        mandatory=mandatory,
+                        domain_resolver=domain_resolver,
+                    )
+                result = await func(*args, **kwargs)
+                if skipped and isinstance(result, dict):
+                    # The caller, not only the log, learns no backup was taken.
+                    result.setdefault("warnings", []).append(skipped)
+                return result
 
         return wrapper
 
     return decorator
+
+
+@asynccontextmanager
+async def _template_write_context(
+    client: Any, settings: Any, domain: str, entity_id: str
+) -> AsyncIterator[None]:
+    """Keep a write's capture and mutation in one critical section.
+
+    Flow helpers and integrations share the restore critical section. The lock
+    is needed even when ordinary auto-backup is disabled: restores of existing
+    flow helpers require a safety snapshot before replacing their current
+    options.
+
+    Dashboard resources take their per-resource write lock here, so the
+    snapshot, the tool's own read (an ``edits=`` patch) and its write cannot
+    interleave with another write through this server. Writes from the Home
+    Assistant UI or other processes are not serialized, so the snapshot can
+    predate an edit made there that the write then replaces. The resource
+    tools must not take the lock again: ``asyncio.Lock`` is not reentrant.
+
+    File tools share one lock rather than one per path, because a link and its
+    target are the same file under two names. YAML edits take it as well: a
+    theme file is written by both, and two snapshots taken before either write
+    would let a restore of the later one remove the earlier change.
+    """
+    # Both options-update tools take stable config-entry IDs. Alias-based helper
+    # removal and dotted subentry targets have separate resolution paths.
+    is_entry_write = (
+        _is_flow_helper_domain(domain) or domain == "integration"
+    ) and "." not in entity_id
+    if is_entry_write and entity_id and client is not None:
+        manager = get_backup_manager(client, settings)
+        async with manager.config_entry_write_guard(entity_id):
+            yield
+    elif domain == "dashboard_resource" and entity_id:
+        async with resource_write_lock(entity_id):
+            yield
+    elif domain in ("file", "yaml") and entity_id:
+        # YAML edits too: ha_config_set_yaml and ha_write_file both write themes/.
+        async with registry_update_lock("file", "all_files"):
+            yield
+    else:
+        yield
 
 
 def _resolve_backup_client(explicit_client: Any, args: tuple[Any, ...]) -> Any:
@@ -253,11 +491,13 @@ async def _capture_pre_write_snapshot(
     id_param: str | None,
     id_fn: Callable[[dict[str, Any]], str] | None,
     mandatory: bool,
-) -> None:
+    domain_resolver: Callable[[Any, dict[str, Any], str, str], Awaitable[str]] | None,
+) -> str | None:
     """Resolve the snapshot target and capture a pre-write backup.
 
     Extracted from ``with_auto_backup``'s wrapper. Best-effort: a transient
-    capture failure logs a WARNING and lets the write proceed; a ``mandatory``
+    capture failure logs a WARNING, lets the write proceed and returns the
+    warning text for the tool response; a ``mandatory``
     failure maps to a structured ``BACKUP_CAPTURE_FAILED`` error that fails the
     write closed (nothing is changed).
     """
@@ -265,15 +505,21 @@ async def _capture_pre_write_snapshot(
     snap_domain, entity_id = _resolve_snapshot_target(
         kwargs, domain=domain, domain_fn=domain_fn, id_param=id_param, id_fn=id_fn
     )
+    skipped: list[str] = []
     if entity_id:
         try:
             if client_obj is not None:
+                if domain_resolver is not None:
+                    snap_domain = await domain_resolver(
+                        client_obj, kwargs, snap_domain, entity_id
+                    )
                 mgr = get_backup_manager(client_obj, settings)
                 await mgr.maybe_snapshot(
                     snap_domain,
                     entity_id,
                     tool_name=func.__name__,
                     mandatory=mandatory,
+                    skip_reasons=skipped,
                 )
             elif mandatory:
                 # No client to capture with, but this tool requires a
@@ -288,6 +534,26 @@ async def _capture_pre_write_snapshot(
             # wrapped write never runs, so nothing has been changed.
             # The ToolError this raises propagates rather than being
             # swallowed by the best-effort handler below.
+            refusal = refusal_behind_capture_failure(err)
+            if refusal is not None:
+                # The capture was refused — the same reason the wrapped write
+                # itself would fail. Surface that actionable error, not a
+                # backup complaint (#2292, #2908).
+                # The write is still blocked. ``from None`` because this IS the
+                # underlying error being unwrapped; chaining it back onto the
+                # wrapper it came out of would only print the chain twice (and
+                # B904 wants the intent explicit). ``from None`` also drops the
+                # wrapper's own text from the traceback, so record it here or
+                # the only account of WHICH mandatory capture was re-pointed at
+                # the refusal is gone.
+                logger.warning(
+                    "Auto-backup: mandatory capture for '%s' failed (%s) — "
+                    "surfacing the refusal instead; the write is blocked "
+                    "either way",
+                    func.__name__,
+                    err,
+                )
+                raise refusal from None
             raise_tool_error(
                 create_error_response(
                     ErrorCode.BACKUP_CAPTURE_FAILED,
@@ -305,3 +571,5 @@ async def _capture_pre_write_snapshot(
                 type(err).__name__,
                 err,
             )
+            skipped.append(f"No pre-write backup was taken: {type(err).__name__}")
+    return "; ".join(skipped) or None

@@ -1,258 +1,506 @@
-"""
-Unit tests for Group management tools.
+"""The group tools on real Home Assistant Core.
 
-These tests verify the input validation and error handling of the group tools
-without requiring a live Home Assistant instance.
+Core owns group.set / group.remove validation: these tests pin that the tools
+pass requests to Core's ``group`` integration over WebSocket, report Core's own
+rejection, and read create/update and existence from the group's state. Every
+state, rejection and reply comes from Core.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastmcp.exceptions import ToolError
+from homeassistant.core import HomeAssistant, State
+from homeassistant.setup import async_setup_component
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp.backup_manager import get_backup_manager
+from ha_mcp.client.rest_client import (
+    HomeAssistantAuthError,
+    HomeAssistantClient,
+    HomeAssistantCommandNotSent,
+    HomeAssistantConnectionError,
+)
+from ha_mcp.config import get_global_settings
 from ha_mcp.tools.tools_groups import GroupTools
 
+from ._client_spies import sent_messages
+from ._tool_errors import error_of
 
-class TestGroupToolsValidation:
-    """Test input validation for group tools."""
+YAML_GROUP = {"group": {"from_yaml": {"entities": ["light.a"]}}}
 
-    @pytest.fixture
-    def mock_client(self):
-        """Create a mock Home Assistant client."""
-        client = MagicMock()
-        client.get_states = AsyncMock(return_value=[])
-        # Required by wait_for_entity_registered/removed in tool internals
-        client.get_entity_state = AsyncMock(return_value={"state": "on"})
-        client.call_service = AsyncMock(return_value=None)
-        return client
 
-    @pytest.fixture
-    def tools(self, mock_client):
-        """Create GroupTools instance."""
-        return GroupTools(mock_client)
+@pytest.fixture
+async def tools(core_client: HomeAssistantClient) -> GroupTools:
+    return GroupTools(core_client)
 
-    async def test_set_group_invalid_object_id_with_dot(self, tools):
-        """Test that object_id with dots is rejected."""
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_set_group(
-                object_id="group.invalid",
-                entities=["light.test"],
-            )
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "Invalid object_id" in error_data["error"]["message"]
+async def _setup_groups(
+    hass: HomeAssistant, config: dict[str, Any] | None = None
+) -> None:
+    """Core's group integration, with the YAML groups in ``config``."""
+    hass.states.async_set("light.a", "on")
+    hass.states.async_set("light.b", "off")
+    assert await async_setup_component(hass, "group", config or {})
+    await hass.async_block_till_done()
 
-    async def test_set_group_empty_entities_list(self, tools):
-        """Test that empty entities list is rejected."""
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_set_group(
-                object_id="test_group",
-                entities=[],
-            )
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "empty" in error_data["error"]["message"].lower()
+async def _group_set(hass: HomeAssistant, object_id: str, **data: Any) -> None:
+    """Create a group the way group.set does for any caller."""
+    await hass.services.async_call(
+        "group", "set", {"object_id": object_id, **data}, blocking=True
+    )
+    await hass.async_block_till_done()
 
-    async def test_set_group_empty_add_entities_list(self, tools):
-        """Test that empty add_entities list is rejected."""
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_set_group(
-                object_id="test_group",
-                add_entities=[],
-            )
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "empty" in error_data["error"]["message"].lower()
+def _members(hass: HomeAssistant, entity_id: str) -> list[str]:
+    state = hass.states.get(entity_id)
+    assert state is not None
+    return list(state.attributes["entity_id"])
 
-    async def test_set_group_mutually_exclusive_operations(self, tools):
-        """Test that mutually exclusive entity operations are rejected."""
-        # Test entities + add_entities
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_set_group(
-                object_id="test_group",
-                entities=["light.test"],
-                add_entities=["light.another"],
-            )
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "Only one of" in error_data["error"]["message"]
 
-        # Test entities + remove_entities
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_set_group(
-                object_id="test_group",
-                entities=["light.test"],
-                remove_entities=["light.old"],
-            )
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "Only one of" in error_data["error"]["message"]
+@contextmanager
+def _state_read_fails(entity_id: str) -> Iterator[None]:
+    """Core fails serializing ``entity_id``'s state, so its REST API answers 500."""
+    original = State.__dict__["as_dict_json"]
 
-        # Test add_entities + remove_entities
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_set_group(
-                object_id="test_group",
-                add_entities=["light.new"],
-                remove_entities=["light.old"],
-            )
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "Only one of" in error_data["error"]["message"]
+    def as_dict_json(state: State) -> bytes:
+        if state.entity_id == entity_id:
+            raise RuntimeError("state serialization failed")
+        serialized: bytes = original.__get__(state, State)
+        return serialized
 
-    async def test_remove_group_invalid_object_id(self, tools):
-        """Test that remove_group rejects invalid object_id."""
-        with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_remove_group(
-                object_id="group.invalid",
-            )
+    with patch.object(State, "as_dict_json", property(as_dict_json)):
+        yield
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
-        assert "Invalid object_id" in error_data["error"]["message"]
 
-    async def test_list_groups_success(self, mock_client):
-        """Test successful group listing."""
-        # Mock states with groups
-        mock_client.get_states = AsyncMock(
-            return_value=[
-                {
-                    "entity_id": "group.living_room",
-                    "state": "on",
-                    "attributes": {
-                        "friendly_name": "Living Room",
-                        "entity_id": ["light.lamp1", "light.lamp2"],
-                        "icon": "mdi:sofa",
-                        "all": False,
-                    },
-                },
-                {
-                    "entity_id": "light.bed_light",  # Not a group
-                    "state": "off",
-                    "attributes": {"friendly_name": "Bed Light"},
-                },
-            ]
-        )
+async def _list_after_a_repeated_report(
+    hass: HomeAssistant, client: HomeAssistantClient
+) -> tuple[dict[str, Any], str]:
+    """List once so Core caches the group's serialized state, report the same
+    state a minute later, and list again. Returns the reply and the live
+    ``last_reported``."""
+    tools = GroupTools(client)
+    attrs = {"entity_id": ["light.a"]}
+    hass.states.async_set("group.g", "on", attrs, timestamp=1_800_000_000.0)
+    await tools.ha_config_list_groups()
+    hass.states.async_set("group.g", "on", attrs, timestamp=1_800_000_060.0)
+    result = await tools.ha_config_list_groups()
+    live = hass.states.get("group.g")
+    assert live is not None
+    return result, live.last_reported.isoformat()
 
-        tools = GroupTools(mock_client)
+
+class TestListGroups:
+    async def test_list_keeps_the_fields_core_sends(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
+        await _group_set(hass, "lights", entities=["light.a"])
+        core_state = hass.states.get("group.lights")
+        assert core_state is not None
+
         result = await tools.ha_config_list_groups()
 
-        assert result["success"] is True
+        # light.a and light.b are states, not groups.
         assert result["count"] == 1
-        assert len(result["groups"]) == 1
-        assert result["groups"][0]["entity_id"] == "group.living_room"
-        assert result["groups"][0]["object_id"] == "living_room"
-        assert result["groups"][0]["friendly_name"] == "Living Room"
-        assert "light.lamp1" in result["groups"][0]["entity_ids"]
+        group = result["groups"][0]
+        assert group["entity_id"] == "group.lights"
+        assert group["object_id"] == "lights"
+        assert group["entity_ids"] == ["light.a"]
+        assert group["auto"] is True
+        assert group["order"] == core_state.attributes["order"]
+        assert group["last_changed"] == core_state.last_changed.isoformat()
+        # Core leaves an unset icon out; the entry still carries the key.
+        assert group["icon"] is None
 
-    async def test_set_group_success(self, tools, mock_client):
-        """Test successful group creation."""
-        result = await tools.ha_config_set_group(
-            object_id="test_group",
-            name="Test Group",
-            entities=["light.lamp1", "light.lamp2"],
-            icon="mdi:lightbulb-group",
+    async def test_list_reports_a_yaml_group_as_not_auto(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass, YAML_GROUP)
+
+        group = (await tools.ha_config_list_groups())["groups"][0]
+
+        assert group["entity_id"] == "group.from_yaml"
+        assert group["auto"] is False
+
+    async def test_list_serves_the_live_last_reported(
+        self, hass: HomeAssistant, component_core_client: HomeAssistantClient
+    ) -> None:
+        """A group re-reporting an unchanged state (#3086)."""
+        result, live = await _list_after_a_repeated_report(hass, component_core_client)
+
+        assert result["groups"][0]["last_reported"] == live
+        assert "warnings" not in result
+
+    async def test_list_without_the_component_names_a_stale_last_reported(
+        self, hass: HomeAssistant, core_client: HomeAssistantClient
+    ) -> None:
+        result, _ = await _list_after_a_repeated_report(hass, core_client)
+
+        assert any("last_reported" in w for w in result["warnings"])
+
+    async def test_list_falls_back_to_rest_when_the_snapshot_reply_is_lost(
+        self, hass: HomeAssistant, component_core_client: HomeAssistantClient
+    ) -> None:
+        with patch(
+            "ha_mcp.tools.tools_groups.ask_component",
+            AsyncMock(side_effect=HomeAssistantConnectionError("lost")),
+        ):
+            result, _ = await _list_after_a_repeated_report(hass, component_core_client)
+
+        assert [g["entity_id"] for g in result["groups"]] == ["group.g"]
+        assert any("last_reported" in w for w in result["warnings"])
+
+    async def test_list_without_an_answer_is_a_tool_error(
+        self,
+        core_client: HomeAssistantClient,
+        tools: GroupTools,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            core_client,
+            "get_states",
+            AsyncMock(side_effect=HomeAssistantConnectionError("Connection failed")),
         )
-
-        assert result["success"] is True
-        assert result["entity_id"] == "group.test_group"
-        assert result["object_id"] == "test_group"
-        assert "name" in result["updated_fields"]
-        assert "entities" in result["updated_fields"]
-        assert "icon" in result["updated_fields"]
-
-        # Verify service was called
-        mock_client.call_service.assert_called_once_with(
-            "group",
-            "set",
-            {
-                "object_id": "test_group",
-                "name": "Test Group",
-                "icon": "mdi:lightbulb-group",
-                "entities": ["light.lamp1", "light.lamp2"],
-            },
-        )
-
-    async def test_remove_group_success(self, mock_client):
-        """Test successful group removal."""
-        from ha_mcp.client.rest_client import HomeAssistantAPIError
-
-        # After removal, entity state should return 404
-        mock_client.get_entity_state = AsyncMock(
-            side_effect=HomeAssistantAPIError("Not found", status_code=404)
-        )
-
-        tools = GroupTools(mock_client)
-        result = await tools.ha_config_remove_group(
-            object_id="test_group",
-        )
-
-        assert result["success"] is True
-        assert result["entity_id"] == "group.test_group"
-        assert result["object_id"] == "test_group"
-
-        # Verify service was called
-        mock_client.call_service.assert_called_once_with(
-            "group", "remove", {"object_id": "test_group"}
-        )
-
-    async def test_set_group_all_on_parameter(self, tools, mock_client):
-        """Test that all_on parameter is correctly mapped to 'all'."""
-        result = await tools.ha_config_set_group(
-            object_id="test_group",
-            entities=["light.lamp1"],
-            all_on=True,
-        )
-
-        assert result["success"] is True
-
-        # Verify 'all' was passed to service
-        call_args = mock_client.call_service.call_args
-        assert call_args[0][2]["all"] is True
-
-    async def test_list_groups_error_handling(self, mock_client):
-        """Test error handling in list_groups."""
-        # Make get_states raise an exception
-        mock_client.get_states = AsyncMock(side_effect=Exception("Connection failed"))
-
-        tools = GroupTools(mock_client)
 
         with pytest.raises(ToolError) as exc_info:
             await tools.ha_config_list_groups()
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
+        assert json.loads(str(exc_info.value))["success"] is False
 
-    async def test_set_group_error_handling(self, mock_client):
-        """Test error handling in set_group."""
-        # Make call_service raise an exception
-        mock_client.call_service = AsyncMock(side_effect=Exception("Service failed"))
 
-        tools = GroupTools(mock_client)
+class TestSetGroup:
+    @pytest.mark.parametrize(("all_on", "expected"), [(True, "off"), (False, "on")])
+    async def test_all_mode_reaches_core(
+        self, hass: HomeAssistant, tools: GroupTools, all_on: bool, expected: str
+    ) -> None:
+        """light.a is on and light.b off: only an all-mode group reads off."""
+        await _setup_groups(hass)
+
+        await tools.ha_config_set_group(
+            object_id="lights", entities=["light.a", "light.b"], all_on=all_on
+        )
+        await hass.async_block_till_done()
+
+        state = hass.states.get("group.lights")
+        assert state is not None
+        assert state.state == expected
+        assert list(state.attributes["entity_id"]) == ["light.a", "light.b"]
+
+    async def test_create_with_name_is_reported_as_created(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        # The docstring's create example passes name=; a create must still
+        # read as created.
+        await _setup_groups(hass)
+
+        result = await tools.ha_config_set_group(
+            object_id="bedroom_lights",
+            entities=["light.a", "light.b"],
+            name="Bedroom Lights",
+        )
+
+        assert result["message"] == "Successfully created group: group.bedroom_lights"
+        assert "warnings" not in result
+        state = hass.states.get("group.bedroom_lights")
+        assert state is not None
+        assert state.name == "Bedroom Lights"
+
+    async def test_entities_on_existing_group_is_reported_as_update(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
+        await _group_set(hass, "lights", entities=["light.a"])
+
+        result = await tools.ha_config_set_group(
+            object_id="lights", entities=["light.b"]
+        )
+
+        assert result["message"] == "Successfully updated group: group.lights"
+        assert "warnings" not in result
+        assert _members(hass, "group.lights") == ["light.b"]
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [{}, {"entities": []}, {"add_entities": []}],
+        ids=["no-entities", "empty-entities", "empty-add"],
+    )
+    async def test_arguments_are_left_for_core_to_judge(
+        self,
+        hass: HomeAssistant,
+        core_client: HomeAssistantClient,
+        tools: GroupTools,
+        arguments: dict[str, Any],
+    ) -> None:
+        """Core accepts these and creates an empty group; the tool refuses none.
+
+        The arguments Core rejects are the two rejection tests below.
+        """
+        await _setup_groups(hass)
+        arguments = {"object_id": "lights", **arguments}
+
+        with sent_messages(core_client) as sent:
+            result = await tools.ha_config_set_group(**arguments, wait=False)
+        await hass.async_block_till_done()
+
+        assert result["success"] is True
+        assert sent.await_args is not None
+        assert sent.await_args.args[0]["service_data"] == arguments
+        assert _members(hass, "group.lights") == []
+
+    async def test_core_schema_rejection_is_passed_through(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_set_group(object_id="group.lights")
+
+        error = error_of(exc_info)
+        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert "invalid slug group.lights (try group_lights)" in error["message"]
+        assert "Command failed" not in error["message"]
+        assert json.loads(str(exc_info.value))["ha_error_code"] == "invalid_format"
+        # Core's "try group_lights" names a different group.
+        assert "Drop the 'group.' prefix: object_id='lights'" in error["suggestion"]
+        assert hass.states.get("group.group_lights") is None
+
+    async def test_rejection_of_another_field_carries_no_prefix_hint(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
 
         with pytest.raises(ToolError) as exc_info:
             await tools.ha_config_set_group(
-                object_id="test_group",
-                entities=["light.lamp1"],
+                object_id="lights", entities=["light.a"], add_entities=["light.b"]
             )
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
+        error = error_of(exc_info)
+        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert "exclusion" in error["message"]
+        assert "prefix" not in error.get("suggestion", "")
+        assert hass.states.get("group.lights") is None
 
-    async def test_remove_group_error_handling(self, mock_client):
-        """Test error handling in remove_group."""
-        # Make call_service raise an exception
-        mock_client.call_service = AsyncMock(side_effect=Exception("Service failed"))
+    async def test_yaml_group_update_warns_reload_reverts_it(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass, YAML_GROUP)
 
-        tools = GroupTools(mock_client)
+        result = await tools.ha_config_set_group(
+            object_id="from_yaml", add_entities=["light.b"]
+        )
+
+        assert result["message"] == "Successfully updated group: group.from_yaml"
+        assert any("YAML" in w for w in result["warnings"])
+        # Core merges add_entities through a set, so the order varies.
+        assert sorted(_members(hass, "group.from_yaml")) == ["light.a", "light.b"]
+
+    async def test_remove_entities_on_unknown_group_warns_it_was_created_empty(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
+
+        result = await tools.ha_config_set_group(
+            object_id="typo_lights", remove_entities=["light.a"]
+        )
+
+        assert result["message"] == "Successfully created group: group.typo_lights"
+        assert any("without members" in w for w in result["warnings"])
+        assert _members(hass, "group.typo_lights") == []
+
+    async def test_remove_entities_on_existing_group_is_an_update_without_warning(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
+        await _group_set(hass, "lights", entities=["light.a", "light.b"])
+
+        result = await tools.ha_config_set_group(
+            object_id="lights", remove_entities=["light.a"]
+        )
+
+        assert result["message"] == "Successfully updated group: group.lights"
+        assert "warnings" not in result
+        assert _members(hass, "group.lights") == ["light.b"]
+
+
+class TestServiceFailures:
+    @pytest.mark.parametrize("tool_name", ["set", "remove"])
+    async def test_state_read_failure_aborts_before_the_write(
+        self,
+        hass: HomeAssistant,
+        core_client: HomeAssistantClient,
+        tools: GroupTools,
+        tool_name: str,
+    ) -> None:
+        # A 500 must not read as "no such group": set would report a create
+        # and remove a missing group.
+        await _setup_groups(hass)
+        await _group_set(hass, "lights", entities=["light.a"])
+        tool = getattr(tools, f"ha_config_{tool_name}_group")
+
+        with (
+            _state_read_fails("group.lights"),
+            sent_messages(core_client) as sent,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await tool(object_id="lights")
+
+        assert error_of(exc_info)["code"] == "SERVICE_CALL_FAILED"
+        sent.assert_not_called()
+        assert _members(hass, "group.lights") == ["light.a"]
+
+    async def test_lost_reply_says_the_write_may_have_landed(
+        self,
+        hass: HomeAssistant,
+        core_client: HomeAssistantClient,
+        tools: GroupTools,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _setup_groups(hass)
+        monkeypatch.setattr(
+            core_client,
+            "send_websocket_message",
+            AsyncMock(side_effect=HomeAssistantConnectionError("connection closed")),
+        )
 
         with pytest.raises(ToolError) as exc_info:
-            await tools.ha_config_remove_group(
-                object_id="test_group",
-            )
+            await tools.ha_config_set_group(object_id="lights")
 
-        error_data = json.loads(str(exc_info.value))
-        assert error_data["success"] is False
+        payload = json.loads(str(exc_info.value))
+        assert payload["error"]["code"] == "SERVICE_CALL_FAILED"
+        assert payload["write_outcome_unknown"] is True
+        assert "ha_config_list_groups" in payload["error"]["suggestion"]
+
+    @pytest.mark.parametrize(
+        ("cause", "code"),
+        [
+            (None, "CONNECTION_FAILED"),
+            (HomeAssistantAuthError("authentication failed"), "AUTH_INVALID_TOKEN"),
+        ],
+        ids=["not_authenticated", "token_rejected_on_connect"],
+    )
+    async def test_unsent_command_is_not_reported_as_possibly_applied(
+        self,
+        hass: HomeAssistant,
+        core_client: HomeAssistantClient,
+        tools: GroupTools,
+        cause: BaseException | None,
+        code: str,
+    ) -> None:
+        await _setup_groups(hass)
+
+        with (
+            patch.object(
+                core_client,
+                "send_websocket_message",
+                AsyncMock(side_effect=HomeAssistantCommandNotSent("not authenticated")),
+            ) as unsent,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            unsent.side_effect.__cause__ = cause
+            await tools.ha_config_set_group(object_id="lights")
+
+        payload = json.loads(str(exc_info.value))
+        assert payload["error"]["code"] == code
+        assert "write_outcome_unknown" not in payload
+
+    async def test_non_schema_error_carries_no_prefix_hint(
+        self, tools: GroupTools
+    ) -> None:
+        # The prefix hint answers Core's slug rejection, not any failure of a
+        # call whose object_id happens to start with "group.": without the
+        # group integration Core refuses the unknown action before its schema.
+        with pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_set_group(object_id="group.lights")
+
+        error = error_of(exc_info)
+        assert error["code"] == "SERVICE_NOT_FOUND"
+        assert "prefix" not in error.get("suggestion", "")
+
+    async def test_missing_group_service_is_not_reported_as_missing_group(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        # Core answers not_found when the group integration is not loaded.
+        hass.states.async_set("group.lights", "off", {"entity_id": []})
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_remove_group(object_id="lights")
+
+        error = error_of(exc_info)
+        assert error["code"] == "SERVICE_NOT_FOUND"
+        assert "group.remove not found" in error["message"]
+        assert "Command failed" not in error["message"]
+
+
+class TestRemoveGroup:
+    async def test_remove_existing_group(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass)
+        await _group_set(hass, "test_group", entities=["light.a"])
+
+        result = await tools.ha_config_remove_group(object_id="test_group")
+
+        assert result["success"] is True
+        assert result["entity_id"] == "group.test_group"
+        # verify_entity_removed reports any failure as a warning, so no
+        # warnings means the removal was confirmed.
+        assert "warnings" not in result
+        assert hass.states.get("group.test_group") is None
+
+    async def test_missing_group_is_not_reported_as_removed(
+        self,
+        hass: HomeAssistant,
+        core_client: HomeAssistantClient,
+        tools: GroupTools,
+    ) -> None:
+        # Core's group.remove only logs a warning for a missing group.
+        await _setup_groups(hass)
+
+        with sent_messages(core_client) as sent, pytest.raises(ToolError) as exc_info:
+            await tools.ha_config_remove_group(object_id="no_such_group")
+
+        error = error_of(exc_info)
+        assert error["code"] == "ENTITY_NOT_FOUND"
+        assert "without the 'group.' prefix" in error["suggestion"]
+        sent.assert_not_called()
+
+    async def test_yaml_group_removal_warns_it_returns(
+        self, hass: HomeAssistant, tools: GroupTools
+    ) -> None:
+        await _setup_groups(hass, YAML_GROUP)
+
+        result = await tools.ha_config_remove_group(object_id="from_yaml")
+
+        assert any("YAML" in w for w in result["warnings"])
+        assert hass.states.get("group.from_yaml") is None
+
+
+class TestGroupBackupRestore:
+    async def test_restore_clears_members_added_after_the_snapshot(
+        self, hass: HomeAssistant, core_client: HomeAssistantClient
+    ) -> None:
+        # Core's cv.entity_ids accepts [], and group.set with entities=[]
+        # empties an existing group; skipping the key would keep members a
+        # later edit added.
+        await _setup_groups(hass)
+        await _group_set(hass, "lights", entities=["light.a"])
+        manager = get_backup_manager(core_client, get_global_settings())
+        handler = manager.handler_for("group")
+        assert handler is not None
+
+        await handler.restore(
+            core_client,
+            "group.lights",
+            {"object_id": "lights", "name": "Lights", "entities": [], "icon": None},
+        )
+        await hass.async_block_till_done()
+
+        assert _members(hass, "group.lights") == []
+        state = hass.states.get("group.lights")
+        assert state is not None
+        assert state.name == "Lights"

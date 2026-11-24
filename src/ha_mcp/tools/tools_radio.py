@@ -3,8 +3,8 @@
 One multi-modal tool for managing every radio Home Assistant speaks — Z-Wave
 (zwave_js), Zigbee (ZHA), Matter, and Thread/OTBR. Read-only diagnostics also
 live in ``ha_get_device`` and ``ha_get_system_health`` (next to the existing
-Z-Wave/Zigbee surfaces); they are mirrored here so they are at hand mid-
-management. This tool additionally performs writes those read tools do not, so
+Z-Wave/Zigbee surfaces); smaller reads of the same networks are kept here so
+they are at hand mid-management. This tool additionally performs writes those read tools do not, so
 it is not a subset of either.
 
 Per-radio logic lives in ``radio/<name>.py``; this module is the dispatcher.
@@ -12,28 +12,28 @@ Per-radio logic lives in ``radio/<name>.py``; this module is the dispatcher.
 
 from __future__ import annotations
 
-import logging
 from typing import Annotated, Any, Literal
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
+
 from ..errors import ErrorCode, create_error_response
+from .coercion import JSON_STRING_COERCION
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
     raise_tool_error,
     register_tool_methods,
+    ws_failure_code,
 )
 from .radio import matter as matter_handler
 from .radio import thread as thread_handler
 from .radio import zigbee as zigbee_handler
 from .radio import zwave as zwave_handler
 from .radio.base import confirm_required, require
-from .util_helpers import JSON_STRING_COERCION, is_connection_error_message
-
-logger = logging.getLogger(__name__)
+from .tool_hints import write_hints
 
 HANDLERS: dict[str, Any] = {
     "zwave": zwave_handler,
@@ -62,20 +62,17 @@ class RadioTools:
             device_id = (result.get("result") or {}).get("device_id")
             if device_id:
                 return str(device_id)
-        else:
-            error = str(result.get("error", ""))
-            if is_connection_error_message(error):
-                # A transport drop is not evidence the entity is missing.
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.CONNECTION_FAILED,
-                        f"Could not resolve entity '{entity_id}': {error}",
-                        context={"entity_id": entity_id},
-                        suggestions=[
-                            "Home Assistant may be restarting or unreachable — retry shortly",
-                        ],
-                    )
+        elif result.get("error_code") != "not_found":
+            raise_tool_error(
+                create_error_response(
+                    ws_failure_code(result),
+                    str(result.get("error", "Entity registry lookup failed")),
+                    context={
+                        "entity_id": entity_id,
+                        "ha_error_code": result.get("error_code"),
+                    },
                 )
+            )
         raise_tool_error(
             create_error_response(
                 ErrorCode.ENTITY_NOT_FOUND,
@@ -89,12 +86,12 @@ class RadioTools:
     @tool(
         name="ha_manage_radio",
         tags={"Radio Management", "Z-Wave", "Zigbee", "Matter", "Thread"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "idempotentHint": False,
-            "title": "Manage Radios (Z-Wave / Zigbee / Matter / Thread)",
-        },
+        annotations=write_hints(
+            "Manage Radios (Z-Wave / Zigbee / Matter / Thread)",
+            destructive=True,
+            idempotent=False,
+            open_world=False,
+        ),
     )
     @log_tool_usage
     async def ha_manage_radio(
@@ -133,9 +130,10 @@ class RadioTools:
             JSON_STRING_COERCION,
             Field(
                 description=(
-                    "Action-specific parameters (e.g. code, pin, channel, "
-                    "property, value). An unknown action returns that radio's "
-                    "supported action list with one-line summaries."
+                    "Action-specific parameters (e.g. code, pin, channel, property, value). "
+                    "Z-Wave get_config_param: property (parameter number), endpoint "
+                    "(default 0), property_key (partial-parameter bit mask), refresh "
+                    "(default False; full root parameters only)."
                 ),
                 default=None,
             ),
@@ -143,25 +141,32 @@ class RadioTools:
         confirm: Annotated[
             bool,
             Field(
-                description="Required (True) to run destructive actions.", default=False
+                description=(
+                    "Required (True) to run destructive actions (e.g. "
+                    "remove_device, network restore, change_channel, "
+                    "hard_reset, remove_fabric)."
+                ),
+                default=False,
             ),
         ] = False,
     ) -> dict[str, Any]:
         """Manage Home Assistant radios — Z-Wave, Zigbee, Matter, and Thread.
 
-        For read-only inspection prefer ha_get_device / ha_get_system_health,
-        which mirror the 'diagnostics' and 'network_status' actions; use this
-        tool for writes and the active 'ping' probe (unique to this tool). Write
-        actions perform inclusion/commissioning, removal, healing,
+        For node diagnostics and network summaries prefer ha_get_device /
+        ha_get_system_health; 'diagnostics' and 'network_status' here return
+        this tool's own, smaller shapes.
+        This tool also exposes active 'ping' probes and parameter reads.
+        Z-Wave 'get_config_params' lists cached configuration values/metadata;
+        'get_config_param' reads one from the cache or explicitly from the device.
+        Neither enables or creates entities. Write actions perform
+        inclusion/commissioning, removal, healing,
         reconfiguration, firmware updates and credential provisioning.
 
-        Caveats: destructive actions (e.g. remove_device, network restore,
-        change_channel, hard_reset, remove_fabric) require confirm=True.
-        Long-running actions (inclusion, rebuild routes, firmware) start the
+        Caveats: long-running actions (inclusion, rebuild routes, firmware) start the
         operation and return immediately with long_running=true; completion
         happens out-of-band. Interactive Z-Wave S2 secure inclusion (read-the-
         PIN pairing) is not scriptable — use SmartStart/QR provisioning here or
-        the HA UI.
+        the HA UI. HA administrator access is required for parameter reads.
         """
         try:
             handler = HANDLERS[radio]
@@ -205,7 +210,7 @@ class RadioTools:
 
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             # exception_to_structured_error owns logging (it stays quiet for
             # classified errors and logs unclassified ones with a traceback);
             # a manual log here would double-log. Let the helper own it.

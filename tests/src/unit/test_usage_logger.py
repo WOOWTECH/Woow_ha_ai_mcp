@@ -1,23 +1,53 @@
-"""Unit tests for the usage logger with ring buffer."""
+"""Unit tests for the usage logger with ring buffer.
 
+What a tool call leaves in the usage log is reached the way the server
+reaches it: ``ha_call_service`` on a real Core records the call, the report
+``ha_report_issue`` builds lists it, and the server's own log file under its
+data directory holds it once the logger has stopped.
+"""
+
+import asyncio
+import builtins
+import errno
+import json
+import logging
+import os
+import stat
+import sys
 import tempfile
 import threading
 import time
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
+from homeassistant.core import HomeAssistant, ServiceCall
 
+from ha_mcp import redaction
+from ha_mcp.client.rest_client import HomeAssistantClient
+from ha_mcp.config import reset_global_settings
+from ha_mcp.tools.tools_service import ServiceTools
+from ha_mcp.utils.data_paths import get_data_dir
 from ha_mcp.utils.usage_logger import (
-    _MAX_REDACT_DEPTH,
-    _REDACTED_VALUE,
     AVG_LOG_ENTRIES_PER_TOOL,
     DEFAULT_RING_BUFFER_SIZE,
     UsageLogger,
-    _redact_parameters,
     get_recent_logs,
+    get_usage_logger,
     log_tool_call,
     shutdown_usage_logger,
 )
+
+from ._report_issue import report_issue
+
+
+@pytest.fixture(autouse=True)
+def _fresh_usage_logger() -> Iterator[None]:
+    """Each test starts the server's usage logger anew, under its own data dir."""
+    shutdown_usage_logger()
+    yield
+    shutdown_usage_logger()
 
 
 class TestUsageLoggerRingBuffer:
@@ -118,7 +148,7 @@ class TestUsageLoggerRingBuffer:
                         execution_time_ms=0,
                         success=True,
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 errors.append(e)
 
         def reader_thread():
@@ -126,7 +156,7 @@ class TestUsageLoggerRingBuffer:
                 for _ in range(50):
                     _ = logger.get_recent_entries(5)
                     time.sleep(0.001)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 errors.append(e)
 
         threads = []
@@ -175,21 +205,18 @@ class TestUsageLoggerDefaults:
 
     @pytest.fixture(autouse=True)
     def _reset_data_dir_cache(self):
-        from ha_mcp.utils.data_paths import get_data_dir
-
         get_data_dir.cache_clear()
         yield
         get_data_dir.cache_clear()
 
-    def test_default_log_path(self, monkeypatch):
+    def test_default_log_path(self, monkeypatch, tmp_path):
         """Default log path lives under ``~/.ha-mcp/logs/`` when no
         overrides are in play."""
         monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
         monkeypatch.delenv("HA_MCP_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         logger = UsageLogger()
-        assert (
-            logger.log_file_path == Path.home() / ".ha-mcp" / "logs" / "mcp_usage.jsonl"
-        )
+        assert logger.log_file_path == tmp_path / ".ha-mcp" / "logs" / "mcp_usage.jsonl"
         logger.shutdown()
 
     def test_honors_ha_mcp_config_dir(self, monkeypatch, tmp_path):
@@ -201,6 +228,84 @@ class TestUsageLoggerDefaults:
         logger = UsageLogger()
         assert logger.log_file_path == custom / "logs" / "mcp_usage.jsonl"
         logger.shutdown()
+
+
+def test_shutdown_wakes_the_idle_writer_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An idle writer used to sleep out a full 0.1 s poll on a fresh Event
+    before it saw the stop flag, so every shutdown (each server stop, each
+    unit test) waited. It now idles on the stop event itself.
+
+    The writer's waits are made to last until their event is set: one on
+    the stop event ends at ``shutdown()``, one on any other never does."""
+    before = set(threading.enumerate())
+    logger = UsageLogger(str(tmp_path / "usage.jsonl"))
+    (writer,) = set(threading.enumerate()) - before
+    real_wait = threading.Event.wait
+    idling = threading.Event()
+
+    def wait_until_set(self: threading.Event, timeout: float | None = None) -> bool:
+        if threading.current_thread() is not writer:
+            return real_wait(self, timeout)
+        idling.set()
+        return real_wait(self, None)
+
+    monkeypatch.setattr(threading.Event, "wait", wait_until_set)
+    assert idling.wait(timeout=5)
+    logger.shutdown()
+
+    assert not writer.is_alive()
+
+
+def test_calls_logged_just_before_shutdown_reach_the_disk(tmp_path: Path) -> None:
+    """``shutdown()`` used to stop the writer at the stop flag with entries
+    still queued, so calls logged just before it never reached the log file."""
+    log_path = tmp_path / "usage.jsonl"
+    logger = UsageLogger(str(log_path))
+    for n in range(20):
+        logger.log_tool_usage(
+            tool_name=f"ha_tool_{n}", parameters={}, execution_time_ms=1.0, success=True
+        )
+    logger.shutdown()
+
+    written = [
+        json.loads(line)["tool_name"] for line in log_path.read_text().splitlines()
+    ]
+    assert written == [f"ha_tool_{n}" for n in range(20)]
+
+
+def test_a_call_logged_as_shutdown_starts_reaches_the_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer used to see an empty queue, then the stop flag, and stop:
+    a call logged and a ``shutdown()`` between those two checks was lost.
+
+    The writer's first look at the stop flag is made to find exactly that:
+    the call is logged and the flag set just before it reads it."""
+    log_path = tmp_path / "usage.jsonl"
+    before = set(threading.enumerate())
+    logger = UsageLogger(str(log_path))
+    (writer,) = set(threading.enumerate()) - before
+    real_is_set = threading.Event.is_set
+    raced = threading.Event()
+
+    def logged_then_stopped(self: threading.Event) -> bool:
+        if threading.current_thread() is writer and not real_is_set(raced):
+            raced.set()
+            logger.log_tool_usage(
+                tool_name="ha_raced", parameters={}, execution_time_ms=1.0, success=True
+            )
+            self.set()
+        return real_is_set(self)
+
+    monkeypatch.setattr(threading.Event, "is_set", logged_then_stopped)
+    assert raced.wait(timeout=5)
+    logger.shutdown()
+
+    assert [
+        json.loads(line)["tool_name"] for line in log_path.read_text().splitlines()
+    ] == ["ha_raced"]
 
 
 class TestUsageLoggerConstants:
@@ -219,13 +324,6 @@ class TestUsageLoggerConstants:
 
 class TestUsageLoggerGlobalFunctions:
     """Test module-level convenience functions."""
-
-    @pytest.fixture(autouse=True)
-    def reset_global_logger(self):
-        """Reset the global logger before and after each test."""
-        shutdown_usage_logger()
-        yield
-        shutdown_usage_logger()
 
     def test_get_recent_logs_returns_list(self):
         """Test that get_recent_logs returns a list."""
@@ -251,116 +349,600 @@ class TestUsageLoggerGlobalFunctions:
         assert our_entry["success"] is True
 
 
+@pytest.fixture
+def known_secret(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """A secret value the server has seen, with redaction switched on."""
+    monkeypatch.setenv("REDACT_SECRETS", "true")
+    reset_global_settings()
+    remembered = redaction.known_secret_values()
+    redaction.clear_known_secret_values()
+    redaction.register_known_secret_values(["hunter2-secret"])
+    yield "hunter2-secret"
+    redaction.clear_known_secret_values()
+    redaction.register_known_secret_values(remembered)
+
+
+class TestLogToolUsageDecorator:
+    """Tests for the @log_tool_usage decorator in ha_mcp.tools.helpers."""
+
+    async def test_cancelled_call_is_not_logged_as_success(self):
+        """A cancelled tool call never completed, so recording it as a success
+        would make the usage log claim a result that was never produced.
+
+        ``CancelledError`` skips ``except Exception``, so the decorator's
+        handler must catch ``BaseException`` for the ``finally`` log to carry
+        ``success: False``; ``str()`` is empty on a bare ``CancelledError``, so
+        the class name stands in as the error message.
+        """
+        from ha_mcp.tools.helpers import log_tool_usage
+
+        @log_tool_usage
+        async def ha_cancelled_tool():
+            raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await ha_cancelled_tool()
+
+        entry = next(
+            e for e in get_recent_logs(5) if e["tool_name"] == "ha_cancelled_tool"
+        )
+        assert entry["success"] is False
+        assert entry["error_message"] == "CancelledError"
+
+    async def test_a_known_secret_in_the_error_is_scrubbed(
+        self, known_secret: str
+    ) -> None:
+        """The usage log keeps the error text, which RedactSecretsMiddleware
+        only scrubs on its way to the client."""
+        from ha_mcp.tools.helpers import log_tool_usage
+
+        @log_tool_usage
+        async def ha_failing_tool() -> None:
+            raise ValueError(f"login failed for {known_secret}")
+
+        with pytest.raises(ValueError, match=known_secret):
+            await ha_failing_tool()
+
+        entry = next(
+            e for e in get_recent_logs(5) if e["tool_name"] == "ha_failing_tool"
+        )
+        assert entry["error_message"] == "login failed for <redacted>"
+
+
+@pytest.fixture
+def service_tools(
+    hass: HomeAssistant, core_client: HomeAssistantClient
+) -> ServiceTools:
+    """``ha_call_service`` on a Core whose ``test.echo`` takes any data."""
+
+    async def echo(call: ServiceCall) -> None:
+        """A service without a schema, as many integrations register one."""
+
+    hass.services.async_register("test", "echo", echo)
+    return ServiceTools(core_client, None)
+
+
+async def _call(service_tools: ServiceTools, data: dict[str, Any]) -> None:
+    """``ha_call_service(data=data)``, recorded as every tool call is."""
+    await service_tools.ha_call_service(domain="test", service="echo", data=data)
+
+
+Reported = Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+@pytest.fixture
+def reported(service_tools: ServiceTools, core_client: HomeAssistantClient) -> Reported:
+    """What a bug report lists as the ``data`` of ``ha_call_service(data=...)``."""
+
+    async def report(data: dict[str, Any]) -> Any:
+        await _call(service_tools, data)
+        listed = (await report_issue(core_client, fields="recent_logs"))["recent_logs"]
+        assert listed[0]["tool_name"] == "ha_call_service"
+        return listed[0]["parameters"]["data"]
+
+    return report
+
+
+def _shown(logged: Any, *values: str) -> list[str]:
+    """Which of ``values`` the logged arguments still show."""
+    dumped = json.dumps(logged)
+    return [value for value in values if value in dumped]
+
+
+def _log_file() -> Path:
+    """The server's own usage log."""
+    return get_data_dir() / "logs" / "mcp_usage.jsonl"
+
+
+async def _stopped_log() -> str:
+    """Stop the usage logger, which writes what is queued first, and read its file."""
+    await asyncio.to_thread(shutdown_usage_logger)
+    return await asyncio.to_thread(_log_file().read_text)
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _plant_file(path: Path, mode: int) -> None:
+    """An existing log file of ``mode``, in a logs directory of this user."""
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_text("")
+    path.chmod(mode)
+
+
 class TestParameterRedaction:
-    """Tests for secret masking at the logging chokepoint (GHSA-mc92-ww4q-6fg4)."""
+    """Secrets in a call's arguments never reach the usage log (GHSA-mc92-ww4q-6fg4).
 
-    @pytest.fixture(autouse=True)
-    def reset_global_logger(self):
-        shutdown_usage_logger()
-        yield
-        shutdown_usage_logger()
+    ha_report_issue publishes the log and mcp_usage.jsonl keeps it in plain
+    text; each call goes through ``ha_call_service``'s ``data``."""
 
-    def test_nested_code_redacted_sibling_preserved(self):
+    async def test_nested_code_redacted_sibling_preserved(
+        self, reported: Reported
+    ) -> None:
         """ha_call_service(data={'code': ...}) leaks the code via the log; the
         recursive key match must mask it while keeping debug-useful siblings."""
-        result = _redact_parameters(
-            {"data": {"code": "4321", "entity_id": "lock.front", "brightness": 255}}
+        logged = await reported(
+            {"code": "code-4321", "entity_id": "lock.front", "brightness": 255}
         )
-        assert result["data"]["code"] == _REDACTED_VALUE
-        assert result["data"]["entity_id"] == "lock.front"
-        assert result["data"]["brightness"] == 255
+        assert _shown(logged, "code-4321") == []
+        assert sorted(logged) == ["brightness", "code", "entity_id"]
+        assert logged["entity_id"] == "lock.front"
+        assert logged["brightness"] == 255
 
-    def test_top_level_sensitive_keys_redacted(self):
-        result = _redact_parameters(
-            {"token": "abc", "password": "hunter2", "secret": "s", "api_key": "k"}
+    async def test_code_inside_a_json_string_redacted(self, reported: Reported) -> None:
+        """A stringified payload, such as an MQTT one, carries the code as text
+        the key match cannot see."""
+        logged = await reported(
+            {
+                "payload": '{"code": "code-4321", "entity_id": "lock.front"}',
+                "extra": {"payload": '{"code": "code-9876"}'},
+            }
         )
-        assert all(result[k] == _REDACTED_VALUE for k in result)
+        assert _shown(logged, "code-4321", "code-9876") == []
+        assert logged["payload"]["entity_id"] == "lock.front"
 
-    def test_suffix_match_redacts_token_family(self):
-        result = _redact_parameters({"auth_token": "x", "device_secret": "y"})
-        assert result["auth_token"] == _REDACTED_VALUE
-        assert result["device_secret"] == _REDACTED_VALUE
+    @pytest.mark.parametrize(
+        "truncated",
+        [
+            '{"code": "4321"',
+            '[{"code": "4321"}',
+            '[ [{"code": "4321"',
+            '[0, {"code": "4321"}',
+            '[{{"code":"4321"}]',
+            'note {\\"code\\": \\"4321\\"}',
+        ],
+    )
+    async def test_code_inside_unparsed_json_text_left_out(
+        self, reported: Reported, truncated: str
+    ) -> None:
+        """Text that names a sensitive key as a JSON member but does not
+        parse, whatever is wrong with it, still shows the code."""
+        assert _shown(await reported({"payload": truncated}), "4321") == []
 
-    def test_non_secret_code_key_suffixes_preserved(self):
+    async def test_unparsed_json_without_a_sensitive_key_stays_readable(
+        self, reported: Reported
+    ) -> None:
+        """A broken payload is what a report reader debugs with; only one
+        that names a sensitive key has to go."""
+        data = {"payload": '{"entity_id": "light.kitchen", "brightness": 255'}
+        assert await reported(data) == data
+
+    async def test_templates_and_bracketed_text_stay_readable(
+        self, reported: Reported
+    ) -> None:
+        """A Jinja template and a "[tag] message" start like JSON but are not;
+        they are what a report reader debugs with."""
+        data = {
+            "template": "{{ states('sensor.x') }}",
+            "block": "{% if a %}b{% endif %}",
+            "list": "[{{ a }}, {{ b }}",
+            "message": "[Alert] front door open",
+        }
+        assert await reported(data) == data
+
+    async def test_credential_keys_redacted(self, reported: Reported) -> None:
+        secrets = {
+            "token": "tok-1",
+            "password": "pw-2",
+            "secret": "sec-3",
+            "api_key": "key-4",
+        }
+        logged = await reported(secrets)
+        assert sorted(logged) == sorted(secrets)
+        assert _shown(logged, *secrets.values()) == []
+
+    async def test_suffix_match_redacts_token_family(self, reported: Reported) -> None:
+        logged = await reported({"auth_token": "tok-5", "device_secret": "sec-6"})
+        assert _shown(logged, "tok-5", "sec-6") == []
+
+    async def test_non_secret_code_key_suffixes_preserved(
+        self, reported: Reported
+    ) -> None:
         """status_code / cache_key are NOT secrets — _code/_key are deliberately
         excluded from suffix matching so debug value survives."""
-        result = _redact_parameters({"status_code": 500, "cache_key": "abc"})
-        assert result["status_code"] == 500
-        assert result["cache_key"] == "abc"
+        data = {"status_code": 500, "cache_key": "abc"}
+        assert await reported(data) == data
 
-    def test_case_insensitive(self):
-        result = _redact_parameters({"CODE": "1234", "Token": "t"})
-        assert result["CODE"] == _REDACTED_VALUE
-        assert result["Token"] == _REDACTED_VALUE
+    async def test_assist_sentence_redacted(self, reported: Reported) -> None:
+        """ha_manage_pipeline(action='process') carries user speech, which
+        ha_report_issue would otherwise publish verbatim."""
+        logged = await reported(
+            {"action": "process", "sentence": "unlock the front door for Alex"}
+        )
+        assert _shown(logged, "front door") == []
+        assert logged["action"] == "process"
 
-    def test_benign_params_unchanged(self):
-        params = {"entity_id": "light.test", "key": "value", "nested": {"a": 1}}
-        assert _redact_parameters(params) == params
+    async def test_a_settings_file_is_left_out(self, reported: Reported) -> None:
+        """An in-process server's export carries its secret path and signing keys
+        under names the key match does not know."""
+        logged = await reported(
+            {
+                "action": "import",
+                "settings_file": {
+                    "entries": {"server": {"data": {"secret_path": "/private_x"}}}
+                },
+            }
+        )
+        assert _shown(logged, "private_x") == []
+        assert logged["action"] == "import"
 
-    def test_list_of_dicts_recursed(self):
-        result = _redact_parameters({"items": [{"code": "1"}, {"entity_id": "x"}]})
-        assert result["items"][0]["code"] == _REDACTED_VALUE
-        assert result["items"][1]["entity_id"] == "x"
+    async def test_case_insensitive(self, reported: Reported) -> None:
+        logged = await reported({"CODE": "code-1234", "Token": "tok-7"})
+        assert _shown(logged, "code-1234", "tok-7") == []
 
-    def test_fail_closed_past_max_depth(self):
+    async def test_benign_params_unchanged(self, reported: Reported) -> None:
+        data = {"entity_id": "light.test", "key": "value", "nested": {"a": 1}}
+        assert await reported(data) == data
+
+    async def test_list_of_dicts_recursed(self, reported: Reported) -> None:
+        logged = await reported({"items": [{"code": "code-1"}, {"entity_id": "x"}]})
+        assert _shown(logged, "code-1") == []
+        assert logged["items"][1] == {"entity_id": "x"}
+
+    async def test_fail_closed_past_max_depth(self, reported: Reported) -> None:
         """A subtree nested past the recursion guard is masked wholesale, never
-        returned verbatim."""
-        deep = current = {}
-        for _ in range(_MAX_REDACT_DEPTH + 3):
-            current["next"] = {}
-            current = current["next"]
-        current["code"] = "leak"
-        result = _redact_parameters(deep)
-        # Walk down until we hit the masked cutoff; the deep 'code' must not survive.
-        flat = repr(result)
-        assert "leak" not in flat
-        assert _REDACTED_VALUE in flat
+        returned verbatim, whatever its keys are called."""
+        deep: dict[str, Any] = {"note": "deep-value"}
+        for _ in range(20):  # far deeper than the logger walks
+            deep = {"next": deep}
+        logged = await reported({"shallow": "kept", "deep": deep})
+        assert logged["shallow"] == "kept"
+        assert _shown(logged, "deep-value") == []
 
-    def test_does_not_mutate_input(self):
+    async def test_does_not_mutate_input(self, reported: Reported) -> None:
         """log_tool_usage receives the live kwargs dict — redaction must copy."""
-        original = {"data": {"code": "4321"}}
-        _redact_parameters(original)
-        assert original["data"]["code"] == "4321"
+        data = {"code": "code-4321"}
+        await reported(data)
+        assert data == {"code": "code-4321"}
 
-    def test_end_to_end_buffer_redacted(self):
-        """The ring buffer (read by ha_report_issue) must hold redacted params."""
-        log_tool_call(
-            tool_name="ha_call_service",
-            parameters={"data": {"code": "4321", "entity_id": "lock.front"}},
-            execution_time_ms=10.0,
-            success=False,
-        )
-        entry = next(
-            e for e in get_recent_logs(5) if e["tool_name"] == "ha_call_service"
-        )
-        assert entry["parameters"]["data"]["code"] == _REDACTED_VALUE
-        assert entry["parameters"]["data"]["entity_id"] == "lock.front"
-
-    def test_secrets_not_persisted_to_jsonl(self, tmp_path):
+    async def test_secrets_not_persisted_to_jsonl(
+        self, service_tools: ServiceTools
+    ) -> None:
         """The on-disk mcp_usage.jsonl must not contain raw secrets either — the
         redacted entry is what gets queued for the background disk write."""
-        import json
+        await _call(service_tools, {"code": "code-4321", "entity_id": "lock.front"})
 
-        log_path = tmp_path / "usage.jsonl"
-        logger = UsageLogger(str(log_path), ring_buffer_size=5)
+        content = await _stopped_log()
+
+        assert "code-4321" not in content
+        [entry] = [json.loads(line) for line in content.splitlines()]
+        assert sorted(entry["parameters"]["data"]) == ["code", "entity_id"]
+        assert entry["parameters"]["data"]["entity_id"] == "lock.front"
+
+
+def _disk_disabled_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "ha_mcp.utils.usage_logger" and r.levelno == logging.WARNING
+    ]
+
+
+def _watch_log_opens(
+    patched: pytest.MonkeyPatch, log_path: Path, error: OSError | None = None
+) -> threading.Event:
+    """Set the returned event once the writer has tried to open ``log_path``;
+    with ``error``, that open raises it instead."""
+    tried = threading.Event()
+    real_open = os.open
+
+    def watched(
+        path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if str(path) != str(log_path):
+            return real_open(path, flags, mode, dir_fd=dir_fd)
         try:
-            logger.log_tool_usage(
-                tool_name="ha_call_service",
-                parameters={"data": {"code": "4321", "entity_id": "lock.front"}},
-                execution_time_ms=10.0,
-                success=True,
-            )
-            # The disk write happens on a background thread; wait for it to flush.
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                if log_path.exists() and log_path.read_text().strip():
-                    break
-                time.sleep(0.05)
+            if error is not None:
+                raise error
+            return real_open(path, flags, mode, dir_fd=dir_fd)
         finally:
-            logger.shutdown()
+            tried.set()
 
-        content = log_path.read_text()
-        assert "4321" not in content
-        assert "lock.front" in content
-        entry = json.loads(content.splitlines()[0])
-        assert entry["parameters"]["data"]["code"] == _REDACTED_VALUE
+    patched.setattr(os, "open", watched)
+    return tried
+
+
+class TestLogFileMode:
+    """mcp_usage.jsonl records tool arguments and results, so only the owner reads it."""
+
+    @pytest.fixture
+    def permissive_umask(self) -> Iterator[None]:
+        """Run under the common ``022`` umask, which leaves new files ``0644``."""
+        previous = os.umask(0o022)
+        try:
+            yield
+        finally:
+            os.umask(previous)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    @pytest.mark.usefixtures("permissive_umask")
+    async def test_new_log_file_is_owner_only(
+        self, service_tools: ServiceTools
+    ) -> None:
+        await _call(service_tools, {"marker": "ha_written"})
+        await _stopped_log()
+        log_path = _log_file()
+        assert await asyncio.to_thread(_mode, log_path) == 0o600
+        assert await asyncio.to_thread(_mode, log_path.parent) == 0o700
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    async def test_existing_world_readable_log_is_tightened(
+        self, service_tools: ServiceTools
+    ) -> None:
+        log_path = _log_file()
+        await asyncio.to_thread(_plant_file, log_path, 0o644)
+        await _call(service_tools, {"marker": "ha_written"})
+        await _stopped_log()
+        assert await asyncio.to_thread(_mode, log_path) == 0o600
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    async def test_log_that_cannot_be_tightened_stops_file_writes_and_names_the_file(
+        self,
+        service_tools: ServiceTools,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        log_path = _log_file()
+        await asyncio.to_thread(_plant_file, log_path, 0o644)
+
+        def refuse(self: Path, mode: int) -> None:
+            raise PermissionError("not the owner")
+
+        monkeypatch.setattr(Path, "chmod", refuse)
+        caplog.set_level(logging.WARNING, logger="ha_mcp.utils.usage_logger")
+        await _call(service_tools, {"marker": "ha_written"})
+        content = await _stopped_log()
+        # One warning, at startup: the file is never tried.
+        [warning] = _disk_disabled_warnings(caplog)
+        # The directory exists and is writable; only the file's mode is at fault,
+        # so the operator must be pointed at the file, not told to fix a mkdir.
+        assert str(log_path) in warning
+        assert "could not create" not in warning
+        assert content == ""
+
+
+class TestLogPathControlledByOthers:
+    """Another local user must not be able to redirect or read the usage log."""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX owner and modes")
+    async def test_log_directory_owned_by_another_user_stops_file_writes(
+        self, service_tools: ServiceTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log_path = _log_file()
+        await asyncio.to_thread(log_path.parent.mkdir)
+        real_euid = os.geteuid()
+        monkeypatch.setattr(os, "geteuid", lambda: real_euid + 1)
+        await _call(service_tools, {"marker": "ha_written"})
+        await asyncio.to_thread(shutdown_usage_logger)
+        assert not await asyncio.to_thread(log_path.exists)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX owner and modes")
+    async def test_refused_log_file_keeps_recent_calls_for_bug_reports(
+        self,
+        service_tools: ServiceTools,
+        core_client: HomeAssistantClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The server's own usage log, in a logs directory of another user."""
+        await asyncio.to_thread(_log_file().parent.mkdir)
+        caplog.set_level(logging.WARNING, logger="ha_mcp.utils.usage_logger")
+        real_euid = os.geteuid()
+        with monkeypatch.context() as patched:
+            patched.setattr(os, "geteuid", lambda: real_euid + 1)
+            await _call(service_tools, {"marker": "ha_kept_in_memory"})
+
+        report = await report_issue(core_client, fields="recent_logs")
+
+        assert [e["parameters"]["data"] for e in report["recent_logs"]] == [
+            {"marker": "ha_kept_in_memory"}
+        ]
+        [warning] = _disk_disabled_warnings(caplog)
+        assert "owned by another user" in warning
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX owner and modes")
+    async def test_world_writable_log_directory_is_closed_to_other_writers(
+        self, service_tools: ServiceTools
+    ) -> None:
+        log_dir = _log_file().parent
+        await asyncio.to_thread(log_dir.mkdir)
+        await asyncio.to_thread(log_dir.chmod, 0o777)
+        await _call(service_tools, {"marker": "ha_written"})
+        assert "ha_written" in await _stopped_log()
+        assert (
+            await asyncio.to_thread(_mode, log_dir) & (stat.S_IWGRP | stat.S_IWOTH) == 0
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+    async def test_symlinked_log_directory_is_refused_and_left_unchanged(
+        self, service_tools: ServiceTools
+    ) -> None:
+        log_dir = _log_file().parent
+        target = log_dir.with_name("shared")
+
+        def plant() -> None:
+            target.mkdir()
+            target.chmod(0o777)
+            log_dir.symlink_to(target, target_is_directory=True)
+
+        await asyncio.to_thread(plant)
+        await _call(service_tools, {"marker": "ha_written"})
+        await asyncio.to_thread(shutdown_usage_logger)
+        assert not await asyncio.to_thread((target / _log_file().name).exists)
+        assert await asyncio.to_thread(_mode, target) == 0o777
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+    async def test_symlink_planted_before_startup_is_refused(
+        self, service_tools: ServiceTools
+    ) -> None:
+        log_path = _log_file()
+        target = log_path.parent.with_name("victim.txt")
+
+        def plant() -> None:
+            log_path.parent.mkdir(mode=0o700)
+            target.write_text("")
+            target.chmod(0o644)
+            log_path.symlink_to(target)
+
+        await asyncio.to_thread(plant)
+        await _call(service_tools, {"marker": "ha_written"})
+        await asyncio.to_thread(shutdown_usage_logger)
+        assert await asyncio.to_thread(target.read_text) == ""
+        assert await asyncio.to_thread(_mode, target) == 0o644
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX links")
+    @pytest.mark.parametrize("link", ["symlink", "hardlink"])
+    async def test_log_swapped_after_startup_receives_no_tool_data(
+        self, service_tools: ServiceTools, link: str
+    ) -> None:
+        await asyncio.to_thread(get_usage_logger)
+        log_path = _log_file()
+        target = log_path.parent.with_name("planted.jsonl")
+
+        def plant() -> None:
+            os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))
+            if link == "symlink":
+                log_path.symlink_to(target)
+            else:
+                os.link(target, log_path)
+
+        await asyncio.to_thread(plant)
+        for marker in ("ha_first", "ha_second"):
+            await _call(service_tools, {"marker": marker})
+        await asyncio.to_thread(shutdown_usage_logger)
+        assert await asyncio.to_thread(target.read_text) == ""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX owner and modes")
+    @pytest.mark.parametrize("change", ["group_readable", "other_owner"])
+    async def test_log_no_longer_private_after_startup_receives_no_tool_data(
+        self,
+        service_tools: ServiceTools,
+        monkeypatch: pytest.MonkeyPatch,
+        change: str,
+    ) -> None:
+        await asyncio.to_thread(get_usage_logger)
+        log_path = _log_file()
+        await asyncio.to_thread(_plant_file, log_path, 0o600)
+        if change == "group_readable":
+            await asyncio.to_thread(log_path.chmod, 0o644)
+        else:
+            real_euid = os.geteuid()
+            monkeypatch.setattr(os, "geteuid", lambda: real_euid + 1)
+        for marker in ("ha_first", "ha_second"):
+            await _call(service_tools, {"marker": marker})
+        assert await _stopped_log() == ""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs and modes")
+    @pytest.mark.parametrize("swap", ["fifo_without_reader", "unwritable_file"])
+    async def test_log_that_cannot_be_opened_after_startup_warns_once(
+        self,
+        service_tools: ServiceTools,
+        caplog: pytest.LogCaptureFixture,
+        swap: str,
+    ) -> None:
+        if swap == "unwritable_file" and os.geteuid() == 0:
+            pytest.skip("root bypasses file modes")
+        caplog.set_level(logging.WARNING, logger="ha_mcp.utils.usage_logger")
+        await asyncio.to_thread(get_usage_logger)
+        log_path = _log_file()
+        if swap == "fifo_without_reader":
+            await asyncio.to_thread(os.mkfifo, log_path, 0o600)
+        else:
+            await asyncio.to_thread(_plant_file, log_path, 0o000)
+        for marker in ("ha_first", "ha_second"):
+            await _call(service_tools, {"marker": marker})
+        await asyncio.to_thread(shutdown_usage_logger)
+        [warning] = _disk_disabled_warnings(caplog)
+        assert str(log_path) in warning
+
+    async def test_log_directory_removed_and_recreated_resumes_writing(
+        self,
+        service_tools: ServiceTools,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="ha_mcp.utils.usage_logger")
+        await asyncio.to_thread(get_usage_logger)
+        log_path = _log_file()
+        with monkeypatch.context() as patched:
+            tried = _watch_log_opens(patched, log_path)
+            await asyncio.to_thread(log_path.parent.rmdir)
+            await _call(service_tools, {"marker": "ha_while_gone"})
+            assert await asyncio.to_thread(tried.wait, 5)
+        await asyncio.to_thread(log_path.parent.mkdir, 0o700)
+        await _call(service_tools, {"marker": "ha_after_recreate"})
+        content = await _stopped_log()
+        assert "ha_after_recreate" in content
+        assert "ha_while_gone" not in content
+        assert _disk_disabled_warnings(caplog) == []
+
+    @pytest.mark.parametrize("err", [errno.EMFILE, errno.ENFILE])
+    async def test_out_of_descriptors_keeps_the_log_file_on(
+        self, service_tools: ServiceTools, monkeypatch: pytest.MonkeyPatch, err: int
+    ) -> None:
+        log_path = _log_file()
+        with monkeypatch.context() as patched:
+            tried = _watch_log_opens(patched, log_path, OSError(err, os.strerror(err)))
+            await _call(service_tools, {"marker": "ha_while_exhausted"})
+            assert await asyncio.to_thread(tried.wait, 5)
+        await _call(service_tools, {"marker": "ha_after_exhausted"})
+        content = await _stopped_log()
+        assert "ha_after_exhausted" in content
+        assert "ha_while_exhausted" not in content
+
+    async def test_descriptor_is_closed_when_the_file_object_cannot_be_made(
+        self, service_tools: ServiceTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log_path = _log_file()
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open = os.open
+        real_close = os.close
+        real_file_open = builtins.open
+
+        def tracking_open(
+            path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> int:
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            if str(path) == str(log_path):
+                opened.append(fd)
+            return fd
+
+        def failing_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if file in opened:
+                raise ValueError("cannot wrap the descriptor")
+            return real_file_open(file, *args, **kwargs)
+
+        def tracking_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(os, "open", tracking_open)
+            patched.setattr(os, "close", tracking_close)
+            patched.setattr(builtins, "open", failing_open)
+            await _call(service_tools, {"marker": "ha_written"})
+            await asyncio.to_thread(shutdown_usage_logger)
+        assert len(opened) == 1
+        assert opened[0] in closed

@@ -1,413 +1,381 @@
-"""Unit tests for AutomationConfigTools validation helpers.
+"""The input guards ha_config_set_automation applies itself.
 
-Covers:
-- _validate_required_fields: missing-field errors and the ha_config_set_script hint
-- _parse_and_validate_config: VALIDATION_INVALID_JSON error message and suggestions
-- _validate_required_fields: sun trigger event pre-validation
-
-The validators run on *normalized* configs (post ``_normalize_automation_config``),
-so the inputs here use HA's canonical plural root list keys
-('triggers'/'actions'/'conditions').
+Core validates the automation (required keys, root forms, trigger and
+condition keys); these are HA-MCP's own checks, which reject before anything is
+written: the script misroute hint, the runtime-only ``enabled`` key, the
+scene.create misroute, the duplicate-id guard and the JSON parse error. A config
+they let through is written to Core.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
-from fastmcp.exceptions import ToolError
+from homeassistant.core import HomeAssistant
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp.client.rest_client import HomeAssistantClient
 from ha_mcp.tools.tools_config_automations import AutomationConfigTools
 
+from ._config_writes import automation_tools
+from ._tool_errors import error_body, error_of
 
-def _body_from_tool_error(exc: ToolError) -> dict:
-    return json.loads(str(exc))
-
-
-def _error_from_tool_error(exc: ToolError) -> dict:
-    return _body_from_tool_error(exc)["error"]
+_TRIGGER = {"trigger": "state", "entity_id": "input_boolean.guest_mode", "to": "on"}
 
 
-class TestParseAndValidateConfig:
-    """Tests for _parse_and_validate_config JSON error suggestions."""
-
-    def test_invalid_json_string_suggests_dict(self) -> None:
-        """JSON parse error includes a 'pass as dict' suggestion."""
-        # Simulate a model sending config as a broken JSON string
-        # (e.g. unquoted key, which is a common model mistake)
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._parse_and_validate_config(
-                '{alias: "x", "triggers": []}'  # unquoted key — invalid JSON
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_JSON"
-        assert "dict" in json.dumps(error)
+@pytest.fixture
+async def tools(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AutomationConfigTools:
+    return await automation_tools(hass, core_client, monkeypatch)
 
 
-class TestValidateRequiredFields:
-    """Tests for the static _validate_required_fields helper."""
-
-    def test_valid_automation_passes(self) -> None:
-        """Complete automation config raises nothing."""
-        AutomationConfigTools._validate_required_fields(
-            {"alias": "x", "triggers": [], "actions": []},
-            identifier=None,
+async def _rejected(
+    tools: AutomationConfigTools, config: Any, **kwargs: Any
+) -> pytest.ExceptionInfo[ToolError]:
+    with pytest.raises(ToolError) as exc_info:
+        await tools.ha_config_set_automation(
+            config=config, MandatoryBPS=False, **kwargs
         )
-
-    def test_missing_trigger_without_sequence_uses_generic_error(self) -> None:
-        """Missing fields without a 'sequence' key emit the default suggestions."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {"alias": "x", "actions": []},
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "CONFIG_MISSING_REQUIRED_FIELDS"
-        assert "triggers" in error["message"]
-        # The generic suggestion should NOT mention ha_config_set_script.
-        all_text = json.dumps(error)
-        assert "ha_config_set_script" not in all_text
-
-    def test_sequence_in_config_hints_at_set_script(self) -> None:
-        """A config with 'sequence' and missing triggers/actions hints at ha_config_set_script."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {"alias": "Goodnight", "sequence": [{"action": "light.turn_off"}]},
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "CONFIG_MISSING_REQUIRED_FIELDS"
-        # Primary suggestion must name the correct tool.
-        assert "ha_config_set_script" in error.get("suggestion", "")
-        # And the mention of 'sequence' should appear in either details or suggestion list.
-        all_text = json.dumps(error)
-        assert "sequence" in all_text
-
-    def test_sequence_in_config_with_trigger_but_no_action_still_hints(self) -> None:
-        """Sequence + triggers but no actions still triggers the script hint."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {
-                    "alias": "x",
-                    "triggers": [],
-                    "sequence": [{"action": "light.turn_off"}],
-                },
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert "ha_config_set_script" in error.get("suggestion", "")
+    return exc_info
 
 
-class TestValidateConditionBlocks:
-    """Pre-validation of condition blocks for platform vs condition confusion.
-
-    Triggers use 'trigger' (legacy 'platform'); conditions use 'condition'.
-    Models familiar with trigger syntax often write {'platform': 'state', ...}
-    in condition lists, which HA accepts without a 400 but then crashes with an
-    unhelpful 500.
-    """
-
-    def _base_config(self, conditions: object) -> dict:
-        return {"alias": "x", "triggers": [], "actions": [], "conditions": conditions}
-
-    def test_valid_state_condition_passes(self) -> None:
-        AutomationConfigTools._validate_required_fields(
-            self._base_config(
-                [{"condition": "state", "entity_id": "input_boolean.x", "state": "on"}]
-            ),
-            identifier=None,
-        )
-
-    def test_valid_sun_condition_passes(self) -> None:
-        AutomationConfigTools._validate_required_fields(
-            self._base_config([{"condition": "sun", "after": "sunset"}]),
-            identifier=None,
-        )
-
-    def test_platform_key_without_condition_key_raises(self) -> None:
-        """{'platform': 'state'} in a condition list triggers the helpful error."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                self._base_config(
-                    [{"platform": "state", "entity_id": "input_boolean.x"}]
-                ),
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
-        blob = json.dumps(error)
-        assert "condition" in blob
-        assert "platform" in blob
-
-    def test_single_condition_dict_also_checked(self) -> None:
-        """Non-list condition (single dict) is also validated."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                self._base_config(
-                    {"platform": "state", "entity_id": "input_boolean.x"}
-                ),
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
-
-    def test_platform_with_condition_key_not_flagged(self) -> None:
-        """Item that has both 'platform' and 'condition' is left for HA to validate."""
-        AutomationConfigTools._validate_required_fields(
-            self._base_config(
-                [
-                    {
-                        "condition": "state",
-                        "platform": "extra",
-                        "entity_id": "x",
-                        "state": "on",
-                    }
-                ]
-            ),
-            identifier=None,
-        )
-
-
-class TestEmptyTriggerSceneCreateDefense:
-    """Issue #1169 misroute-defense gate."""
-
-    def test_empty_trigger_with_scene_create_service_key_rejected(self) -> None:
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {
-                    "alias": "Movie Snapshot",
-                    "triggers": [],
-                    "actions": [
-                        {
-                            "service": "scene.create",
-                            "data": {
-                                "scene_id": "movie_night",
-                                "snapshot_entities": ["light.living_room"],
-                            },
-                        }
-                    ],
-                },
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
-        assert "scene.create" in error["message"]
-        # Routing-hint suggestions must name BOTH ha_config_set_scene
-        # (the snapshot tool) and ha_config_set_helper (the
-        # template-derivation tool) — pinned to ``error["suggestions"]``
-        # so a stray reference elsewhere in the body wouldn't satisfy.
-        suggestions = error.get("suggestions") or []
-        suggestions_blob = " ".join(suggestions)
-        assert "ha_config_set_scene" in suggestions_blob
-        assert "ha_config_set_helper" in suggestions_blob
-
-    def test_empty_trigger_with_scene_create_action_key_rejected(self) -> None:
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {
-                    "alias": "Movie Snapshot",
-                    "triggers": [],
-                    "actions": [
-                        {
-                            "action": "scene.create",
-                            "data": {"scene_id": "movie_night"},
-                        }
-                    ],
-                },
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
-        suggestions_blob = " ".join(error.get("suggestions") or [])
-        assert "ha_config_set_scene" in suggestions_blob
-
-    def test_trigger_none_with_scene_create_rejected(self) -> None:
-        """R1 blocker 1: ``triggers: null`` reaches the gate. The
-        missing-fields check uses ``not in config_dict`` so present-but-null
-        slips through to here, where the gate normalises both ``[]`` and
-        ``None`` as empty-trigger."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {
-                    "alias": "Movie",
-                    "triggers": None,
-                    "actions": [{"service": "scene.create", "data": {"scene_id": "x"}}],
-                },
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
-        suggestions_blob = " ".join(error.get("suggestions") or [])
-        assert "ha_config_set_scene" in suggestions_blob
-
-    @pytest.mark.parametrize(
-        ("case_name", "wrapper_action"),
-        [
-            (
-                "sequence",
-                {"sequence": [{"service": "scene.create"}]},
-            ),
-            (
-                "parallel",
-                {"parallel": [{"service": "scene.create"}]},
-            ),
-            (
-                "choose-option-sequence",
-                {
-                    "choose": [
-                        {"conditions": [], "sequence": [{"service": "scene.create"}]}
-                    ]
-                },
-            ),
-            (
-                "choose-default",
-                {
-                    "choose": [{"conditions": [], "sequence": [{"service": "noop"}]}],
-                    "default": [{"service": "scene.create"}],
-                },
-            ),
-            (
-                "if-then",
-                {
-                    "if": [{"condition": "state"}],
-                    "then": [{"service": "scene.create"}],
-                },
-            ),
-            (
-                "if-else",
-                {
-                    "if": [{"condition": "state"}],
-                    "else": [{"service": "scene.create"}],
-                },
-            ),
-            (
-                "deep-nested",
-                {
-                    "choose": [
-                        {
-                            "conditions": [],
-                            "sequence": [{"sequence": [{"action": "scene.create"}]}],
-                        }
-                    ]
-                },
-            ),
-        ],
+async def _written(
+    tools: AutomationConfigTools, core_client: HomeAssistantClient, config: dict
+) -> dict[str, Any]:
+    """Create the automation and return what Core stored for it."""
+    result = await tools.ha_config_set_automation(config=config, MandatoryBPS=False)
+    assert result["success"] is True, result
+    stored: dict[str, Any] = await core_client.get_automation_config(
+        result["entity_id"]
     )
-    def test_nested_scene_create_caught(
-        self, case_name: str, wrapper_action: dict
-    ) -> None:
-        """R1 blocker 2: ``scene.create`` nested under HA's wrapper actions
-        (``sequence`` / ``parallel`` / ``choose[*].sequence`` / ``choose
-        default`` / ``if`` ``then``+``else``) is caught alongside the
-        top-level case."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {
-                    "alias": f"Nested-{case_name}",
-                    "triggers": [],
-                    "actions": [wrapper_action],
-                },
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
-        suggestions_blob = " ".join(error.get("suggestions") or [])
-        assert "ha_config_set_scene" in suggestions_blob
+    return stored
 
-    def test_action_as_single_dict_caught(self) -> None:
-        """R1 while-you're-in: ``actions`` accepted as a single dict (not a
-        list) — ``coerce_to_list`` lifts it; the gate must still catch
-        this shape so a regression that drops the coerce wouldn't silently
-        re-open the gate."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
-                {
-                    "alias": "Single dict action",
-                    "triggers": [],
-                    # NB: dict, not list-of-dict
-                    "actions": {"service": "scene.create", "data": {"scene_id": "x"}},
-                },
-                identifier=None,
-            )
-        error = _error_from_tool_error(exc_info.value)
-        assert error["code"] == "VALIDATION_INVALID_PARAMETER"
 
-    def test_empty_trigger_with_other_action_passes(self) -> None:
-        """Draft preservation: empty trigger paired with a non-scene.create
-        action passes through unchanged. Some users save automations as
-        drafts and add triggers later; this is not the misroute pattern."""
-        AutomationConfigTools._validate_required_fields(
-            {
-                "alias": "Draft",
-                "triggers": [],
-                "actions": [
-                    {"action": "light.turn_on", "target": {"entity_id": "light.x"}}
-                ],
+async def test_invalid_json_string_suggests_dict(tools: AutomationConfigTools) -> None:
+    """A config sent as broken JSON text suggests passing it as a dict."""
+    exc_info = await _rejected(tools, '{alias: "x", "triggers": []}')
+
+    error = error_of(exc_info)
+    assert error["code"] == "VALIDATION_INVALID_JSON"
+    assert "dict" in json.dumps(error)
+
+
+async def test_config_core_accepts_is_written_without_an_alias(
+    tools: AutomationConfigTools, core_client: HomeAssistantClient
+) -> None:
+    """Core names an automation without an alias itself; refusing it here rejected a config Home Assistant accepts."""
+    stored = await _written(tools, core_client, {"triggers": [_TRIGGER], "actions": []})
+
+    assert stored["triggers"] == [_TRIGGER]
+
+
+async def test_sequence_in_config_hints_at_set_script(
+    tools: AutomationConfigTools,
+) -> None:
+    """A config with 'sequence' and no actions hints at ha_config_set_script."""
+    exc_info = await _rejected(
+        tools, {"alias": "Goodnight", "sequence": [{"action": "light.turn_off"}]}
+    )
+
+    error = error_of(exc_info)
+    assert error["code"] == "CONFIG_MISSING_REQUIRED_FIELDS"
+    # Primary suggestion must name the correct tool.
+    assert "ha_config_set_script" in error.get("suggestion", "")
+    all_text = json.dumps(error)
+    assert "sequence" in all_text
+    assert "add 'triggers'" in all_text
+
+
+async def test_sequence_with_trigger_but_no_action_still_hints(
+    tools: AutomationConfigTools,
+) -> None:
+    """Sequence + triggers but no actions still gives the script hint, without asking for triggers."""
+    exc_info = await _rejected(
+        tools,
+        {"alias": "x", "triggers": [], "sequence": [{"action": "light.turn_off"}]},
+    )
+
+    error = error_of(exc_info)
+    assert "ha_config_set_script" in error.get("suggestion", "")
+    assert "add 'triggers'" not in json.dumps(error)
+
+
+@pytest.mark.parametrize("actions_key", ["actions", "action"])
+async def test_sequence_beside_actions_is_left_to_core(
+    tools: AutomationConfigTools, core_client: HomeAssistantClient, actions_key: str
+) -> None:
+    """With actions present the config is not script-shaped; Core judges the stray 'sequence' key."""
+    with pytest.raises(ToolError) as exc_info:
+        await tools.ha_config_set_automation(
+            config={
+                "triggers": [_TRIGGER],
+                "sequence": [],
+                actions_key: [{"action": "light.turn_off"}],
             },
-            identifier=None,
+            MandatoryBPS=False,
         )
 
-    def test_non_empty_trigger_with_scene_create_passes(self) -> None:
-        """Legitimate use case: a trigger-driven scene snapshot (capture the
-        current state when an event fires). Not the misroute pattern."""
-        AutomationConfigTools._validate_required_fields(
-            {
-                "alias": "Snapshot on guest mode",
-                "triggers": [
-                    {
-                        "trigger": "state",
-                        "entity_id": "input_boolean.guest_mode",
-                        "to": "on",
-                    }
-                ],
-                "actions": [
-                    {
-                        "service": "scene.create",
-                        "data": {"scene_id": "before_guests"},
-                    }
-                ],
-            },
-            identifier=None,
+    error = error_of(exc_info)
+    assert "ha_config_set_script" not in json.dumps(error)
+    assert "sequence" in error["message"]
+
+
+async def test_sequence_and_enabled_report_together(
+    tools: AutomationConfigTools,
+) -> None:
+    """A script-shaped config that also misplaces 'enabled' reports both violations in one rejection."""
+    exc_info = await _rejected(
+        tools, {"sequence": [{"action": "light.turn_on"}], "enabled": True}
+    )
+
+    body = error_body(exc_info)
+    assert body["invalid_key"] == "enabled"
+    error = body["error"]
+    all_text = json.dumps(error)
+    assert "ha_config_set_script" in all_text
+    assert "runtime-only" in all_text
+    # The two guidance sentences are separated, not run together.
+    assert ". 'enabled'" in error["message"]
+    suggestions = error.get("suggestions", [])
+    assert any("Remove 'enabled' from config" in s for s in suggestions)
+    assert "Use enabled=None to leave the current runtime state unchanged" in (
+        suggestions
+    )
+
+
+async def test_sequence_misroute_on_transform_points_at_transform(
+    tools: AutomationConfigTools, core_client: HomeAssistantClient
+) -> None:
+    """A transform producing 'sequence' gets transform-expression guidance, not config={...} (which write modes would reject)."""
+    created = await tools.ha_config_set_automation(
+        config={"alias": "Night", "triggers": [_TRIGGER], "actions": []},
+        MandatoryBPS=False,
+    )
+    current = await tools.ha_config_get_automation(entity_id=created["entity_id"])
+
+    with pytest.raises(ToolError) as exc_info:
+        await tools.ha_config_set_automation(
+            entity_id=created["entity_id"],
+            config_hash=current["config_hash"],
+            python_transform=(
+                "del config['actions']; "
+                "config['sequence'] = [{'action': 'light.turn_off'}]"
+            ),
+            MandatoryBPS=False,
         )
 
-    def test_use_blueprint_empty_trigger_strip_preserved(self) -> None:
-        """Backwards-compat: ``use_blueprint`` configs that pass empty
-        ``triggers: []`` have those stripped before validation (the
-        blueprint provides the trigger). The misroute gate must not
-        break that path."""
-        AutomationConfigTools._validate_required_fields(
-            {
-                "alias": "Motion Light",
-                "use_blueprint": {
-                    "path": "homeassistant/motion_light.yaml",
-                    "input": {
-                        "motion_entity": "binary_sensor.motion",
-                        "light_target": {"entity_id": "light.kitchen"},
+    error = error_of(exc_info)
+    assert error["code"] == "CONFIG_MISSING_REQUIRED_FIELDS"
+    all_text = json.dumps(error)
+    assert "python_transform expression" in all_text
+    assert "config={" not in all_text
+
+
+async def test_enabled_in_config_alone_still_rejected(
+    tools: AutomationConfigTools,
+) -> None:
+    """The runtime-only key is a tool parameter, not config."""
+    exc_info = await _rejected(
+        tools, {"alias": "x", "triggers": [], "actions": [], "enabled": True}
+    )
+
+    error = error_of(exc_info)
+    assert error["code"] == "VALIDATION_INVALID_PARAMETER"
+    assert "runtime-only" in error["message"]
+
+
+async def test_config_id_without_entity_id_is_refused_as_a_duplicate(
+    tools: AutomationConfigTools,
+) -> None:
+    """Creating with another automation's id would write a second one."""
+    exc_info = await _rejected(
+        tools, {"id": "1700000000000", "triggers": [], "actions": []}
+    )
+
+    assert "entity_id='1700000000000'" in json.dumps(error_of(exc_info))
+
+
+def _assert_routed_to_scene_tools(exc_info: pytest.ExceptionInfo[ToolError]) -> None:
+    error = error_of(exc_info)
+    assert error["code"] == "VALIDATION_INVALID_PARAMETER"
+    # Pinned to ``suggestions`` so a stray reference elsewhere in the body
+    # would not satisfy it.
+    suggestions_blob = " ".join(error.get("suggestions") or [])
+    assert "ha_config_set_scene" in suggestions_blob
+    assert "ha_config_set_helper" in suggestions_blob
+
+
+@pytest.mark.parametrize("key", ["service", "action"])
+async def test_empty_trigger_with_scene_create_is_routed_to_scene_tools(
+    tools: AutomationConfigTools, key: str
+) -> None:
+    """An automation that can never fire and only snapshots a scene is pointed at the scene and helper tools (#1169)."""
+    exc_info = await _rejected(
+        tools,
+        {
+            "alias": "Movie Snapshot",
+            "triggers": [],
+            "actions": [
+                {
+                    key: "scene.create",
+                    "data": {
+                        "scene_id": "movie_night",
+                        "snapshot_entities": ["light.living_room"],
                     },
-                },
-                # These should be stripped by the use_blueprint pre-pass and
-                # never reach the misroute gate.
-                "triggers": [],
-                "actions": [],
-            },
-            identifier=None,
-        )
+                }
+            ],
+        },
+    )
 
-    def test_empty_trigger_scene_create_indices_in_context(self) -> None:
-        """Multi-action lists surface the indices of the scene.create
-        actions in the error context for the LLM to pinpoint."""
-        with pytest.raises(ToolError) as exc_info:
-            AutomationConfigTools._validate_required_fields(
+    assert "scene.create" in error_of(exc_info)["message"]
+    _assert_routed_to_scene_tools(exc_info)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        # Written as given: singular root keys reach the gate unchanged.
+        {"trigger": [], "action": [{"action": "scene.create"}]},
+        # ``triggers: null`` counts as an empty trigger, like ``[]``.
+        {"triggers": None, "actions": [{"service": "scene.create"}]},
+        # A single action object, not a list.
+        {"triggers": [], "actions": {"service": "scene.create"}},
+    ],
+    ids=["singular-keys", "null-trigger", "single-action-object"],
+)
+async def test_scene_create_misroute_in_other_shapes(
+    tools: AutomationConfigTools, config: dict[str, Any]
+) -> None:
+    """The misroute is caught however the empty trigger and the actions are written."""
+    _assert_routed_to_scene_tools(await _rejected(tools, config))
+
+
+@pytest.mark.parametrize(
+    "wrapper_action",
+    [
+        {"sequence": [{"service": "scene.create"}]},
+        {"parallel": [{"service": "scene.create"}]},
+        {"choose": [{"conditions": [], "sequence": [{"service": "scene.create"}]}]},
+        {
+            "choose": [{"conditions": [], "sequence": [{"service": "noop"}]}],
+            "default": [{"service": "scene.create"}],
+        },
+        {"if": [{"condition": "state"}], "then": [{"service": "scene.create"}]},
+        {"if": [{"condition": "state"}], "else": [{"service": "scene.create"}]},
+        {
+            "choose": [
                 {
-                    "alias": "Multi",
-                    "triggers": [],
-                    "actions": [
-                        {"service": "light.turn_on"},
-                        {"service": "scene.create", "data": {"scene_id": "a"}},
-                        {"action": "scene.create", "data": {"scene_id": "b"}},
-                    ],
+                    "conditions": [],
+                    "sequence": [{"sequence": [{"action": "scene.create"}]}],
+                }
+            ]
+        },
+    ],
+    ids=[
+        "sequence",
+        "parallel",
+        "choose-option-sequence",
+        "choose-default",
+        "if-then",
+        "if-else",
+        "deep-nested",
+    ],
+)
+async def test_nested_scene_create_caught(
+    tools: AutomationConfigTools, wrapper_action: dict[str, Any]
+) -> None:
+    """``scene.create`` nested under Core's wrapper actions is caught like the top-level case."""
+    exc_info = await _rejected(
+        tools, {"alias": "Nested", "triggers": [], "actions": [wrapper_action]}
+    )
+
+    _assert_routed_to_scene_tools(exc_info)
+
+
+async def test_empty_trigger_scene_create_indices_in_context(
+    tools: AutomationConfigTools,
+) -> None:
+    """Multi-action lists name the indices of the scene.create actions."""
+    exc_info = await _rejected(
+        tools,
+        {
+            "alias": "Multi",
+            "triggers": [],
+            "actions": [
+                {"service": "light.turn_on"},
+                {"service": "scene.create", "data": {"scene_id": "a"}},
+                {"action": "scene.create", "data": {"scene_id": "b"}},
+            ],
+        },
+    )
+
+    assert error_body(exc_info).get("scene_create_action_indices") == [1, 2]
+
+
+async def test_empty_trigger_draft_is_written(
+    tools: AutomationConfigTools, core_client: HomeAssistantClient
+) -> None:
+    """A draft with no trigger yet and an ordinary action is not the misroute and is saved."""
+    action = {"action": "light.turn_on", "target": {"entity_id": "light.x"}}
+
+    stored = await _written(
+        tools, core_client, {"alias": "Draft", "triggers": [], "actions": [action]}
+    )
+
+    assert stored["actions"] == [action]
+
+
+async def test_triggered_scene_snapshot_is_written(
+    tools: AutomationConfigTools, core_client: HomeAssistantClient
+) -> None:
+    """A scene snapshot taken when a trigger fires is a real use and is saved."""
+    stored = await _written(
+        tools,
+        core_client,
+        {
+            "alias": "Snapshot on guest mode",
+            "triggers": [_TRIGGER],
+            "actions": [
+                {"action": "scene.create", "data": {"scene_id": "before_guests"}}
+            ],
+        },
+    )
+
+    assert stored["actions"][0]["action"] == "scene.create"
+
+
+async def test_use_blueprint_empty_lists_are_stripped(
+    hass: HomeAssistant,
+    tools: AutomationConfigTools,
+    core_client: HomeAssistantClient,
+) -> None:
+    """Core merges a blueprint instance's keys over the rendered blueprint, so an
+    empty list sent with ``use_blueprint`` would erase the blueprint's own
+    triggers or actions. Either root form is stripped before the write."""
+    await hass.async_block_till_done()  # Core copies its own blueprints in.
+
+    stored = await _written(
+        tools,
+        core_client,
+        {
+            "alias": "Motion Light",
+            "use_blueprint": {
+                "path": "homeassistant/motion_light.yaml",
+                "input": {
+                    "motion_entity": "binary_sensor.motion",
+                    "light_target": {"entity_id": "light.kitchen"},
                 },
-                identifier=None,
-            )
-        body = _body_from_tool_error(exc_info.value)
-        assert body.get("scene_create_action_indices") == [1, 2]
+            },
+            "triggers": [],
+            "action": [],
+        },
+    )
+
+    assert "use_blueprint" in stored
+    assert "triggers" not in stored
+    assert "action" not in stored

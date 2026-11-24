@@ -9,6 +9,189 @@ history from before the fork.
 -->
 
 
+## v3.0.6.dev3 (2026-11-19)
+
+- **BREAKING for none mode (OAuth off):** the sign-in redirect is only sent to
+  callbacks on a list. The built-in list covers Claude (claude.ai,
+  claude.com), Claude Code, ChatGPT and Gemini Enterprise. Any other client's
+  callback gets a page naming the address to add under the new "Allowed OAuth
+  callback URLs" option; "Allow any OAuth callback URL" restores the old
+  behaviour. Callbacks with a username or password are refused (#2653).
+- The app declares the `homeassistant_config` mount instead of the deprecated
+  `config` one; paths inside the app are unchanged (#3153).
+
+
+## v3.0.6.dev2 (2026-11-09)
+
+- The app (add-on) image is built on Python 3.14 (`python:3.14-slim`).
+
+
+## v3.0.6.dev1 (2026-11-09)
+
+Version line rebased onto stable 3.0.5 by the promotion workflow. The tool
+catalog suffixes, the `ha_auth` fix for Home Assistant serving HTTPS itself,
+the Claude.ai connector steps, the `PYTHON_BASE` build argument and the Core
+2026.11 type annotations developed through 3.0.5.dev6 now ship in stable 3.0.5.
+See the [stable release notes](../homeassistant-addon-webhook-proxy/CHANGELOG.md#v305-2026-11-09).
+Dev and stable runtime code are equivalent apart from flavor identity at this
+promotion.
+
+
+## v3.0.5.dev6 (2026-11-08)
+
+- Type annotations match Home Assistant Core 2026.11's own types (repairs
+  flow results, the webhook handler, the protected-resource view URL). No
+  behavior change.
+
+
+## v3.0.5.dev5 (2026-11-06)
+
+- The Claude.ai connector steps in DOCS.md follow the current connector
+  form: Settings → Customize → Add → Add custom connector (Customize reads
+  Plugins on accounts with the new Plugins page), Continue, the sign-in
+  settings Claude detects (No sign in, or Sign in now / Sign in when
+  needed with Use Claude's published identity for ha_auth and Use your own
+  OAuth client for legacy), Add, then Connect if the connector shows that
+  button. They also give the Team or Enterprise path, where an Owner or
+  Primary Owner adds the connector under Organization settings →
+  Connectors and members then connect it. They warn that with OAuth off or
+  in legacy mode every member who connects it gets the server's Home
+  Assistant access without signing in, and that in ha_auth mode any
+  account that can sign in gets the same admin-equivalent access.
+
+## v3.0.5.dev4 (2026-11-03)
+
+- The webhook also serves `/catalog/full` and `/catalog/search`, alone or
+  after `/readonly` (`/readonly/catalog/search`), forwarding each to the
+  server app's matching endpoint so a client can be given a fixed tool
+  catalog. Needs a server app that serves those endpoints.
+
+## v3.0.5.dev3 (2026-11-02)
+
+- `ha_auth` sign-in works when Home Assistant serves HTTPS itself: token and
+  revocation requests go to Core's own listener (its configured listen
+  address, or `127.0.0.1`) without verifying a certificate issued for Home
+  Assistant's hostname, instead of answering 503 (#2950).
+
+## v3.0.5.dev2 (2026-10-15)
+
+- The Dockerfile takes its python base image through a `PYTHON_BASE` build
+  arg (default unchanged), so CI can build from Docker Hub when ECR Public
+  rate-limits the pull.
+
+## v3.0.4.dev4 (2026-10-09)
+
+- Relay Nabu Casa cloudhooks (Settings → Home Assistant Cloud → Webhooks): read
+  the body the relay provides and return SSE replies buffered, since the relay
+  cannot stream. A reply that does not finish within 60 s is answered with 504,
+  and an unauthenticated request to an OAuth-gated cloudhook is refused with 400,
+  because the relay drops the `WWW-Authenticate` challenge so OAuth sign-in cannot
+  start there.
+
+## v3.0.4.dev3 (2026-10-07)
+
+- Give `/readonly` connections matching OAuth protected-resource metadata while
+  retaining the same authentication and existing base metadata URL.
+
+## v3.0.4.dev2 (2026-09-13)
+
+- Add `/api/webhook/<id>/readonly` connections using the existing authentication.
+  Requires an MCP server with read-only endpoint support.
+
+## v3.0.4.dev1 (2026-09-13)
+
+Version line rebased onto stable 3.0.3 by the promotion workflow. The discovery
+security and OAuth compatibility fixes, Claude.ai setup updates, and OAuth
+cleanup developed through 3.0.3.dev4 now ship in stable 3.0.3. See the
+[stable release notes](../homeassistant-addon-webhook-proxy/CHANGELOG.md#v303-2026-09-13)
+for details and webhook-rotation guidance. Dev and stable runtime code are
+equivalent apart from flavor identity at this promotion.
+
+
+## v3.0.3.dev2 (2026-08-30)
+
+### Security
+
+- The webhook id is no longer published by any anonymous discovery URL. The
+  fixed-path protected-resource document (`/api/mcp_proxy_dev/oauth/protected-resource`)
+  handed the full webhook URL to any unauthenticated GET while `ha_auth` or
+  `legacy` mode was on; it is removed. The webhook's 401 challenge now points at
+  the RFC 9728 path-scoped document, whose URL already contains the id.
+- After the operator rotates the webhook id (`/data/webhook_id.txt`), the old
+  id's discovery URL stops answering immediately instead of serving the new id
+  until the next Home Assistant restart. A restart Repair is raised so the new
+  id's discovery URL gets bound; existing installs that ran `ha_auth` or `legacy`
+  reachable from the internet before this version may wish to rotate once.
+
+### Bug Fixes
+
+- `ha_auth`: percent-encode the query forwarded to core's `/auth/authorize`, so a
+  native-app client's loopback callback is not rejected by reverse proxies that
+  block `=http://` in query strings (Nginx Proxy Manager "Block Common Exploits").
+
+
+## v3.0.1.dev1 (2026-08-16)
+
+Version line rebased onto the 3.0.0 stable base by the promote PR
+(`rebase_dev_version`). The OAuth surface overhaul developed on this channel as
+2.1.1.dev4 and .dev5 shipped in stable 3.0.0 — see the stable CHANGELOG for the
+user-facing notes; dev and stable are code-identical as of that promotion.
+
+
+## v2.1.1.dev3 (2026-07-31)
+
+Internal: lint cleanup (ruff pylint rules) — no behavior change.
+
+
+## v2.1.1.dev2 (2026-07-30)
+
+Documentation: warn Tailscale Funnel users that Claude.ai connectors require the
+standard HTTPS port 443 (#2080).
+
+
+## v2.1.1.dev1 (2026-07-26)
+
+Version line rebased onto the 2.1.0 stable base (no code changes — dev and
+stable are identical as of the 2.1.0 promotion). Future promotions carry this
+rebase inside the promote PR itself (`rebase_dev_version`).
+
+
+## v2.0.5.dev3 (2026-07-26)
+
+### Bug Fixes
+
+- Drop the 5-minute wall-clock `total` timeout from the relay's HTTP client so a
+  long-lived MCP response stream (the upcoming spec's `subscriptions/listen`) is
+  no longer cut every 300 s, forcing the client to re-subscribe. The `sock_read`
+  idle timeout still bounds a dead stream, and a new finite `connect` bound
+  keeps connection-pool acquisition from hanging new requests when long-lived
+  streams occupy the pool.
+
+
+## v2.0.5.dev2 (2026-07-25)
+
+### Features
+
+- Authorization responses from the add-on's own OAuth servers (the legacy
+  `/authorize` view and the none-mode auto-approve `/authorize` view) now carry
+  the RFC 9207 `iss` parameter naming the issuer that produced them, on both the
+  success redirect and the error redirects. The value is the same issuer the
+  add-on's RFC 8414 metadata document advertises. Clients that do not implement
+  RFC 9207 ignore the extra query parameter, so existing connectors are
+  unaffected.
+
+
+## v2.0.5.dev1 (2026-07-20)
+
+### Bug Fixes
+
+- Rebase the dev channel onto the 2.0.5 stable base and fold in the #1978
+  post-merge parity fixes now shipping in stable: the none-mode auto-approve
+  OAuth error responses carry `Cache-Control: no-store` / `Pragma: no-cache`
+  (matching the token responses and the custom-component twin), and the
+  `_active_oauth_mode` docstring documents its `none_autoapprove` return value.
+
+
 ## v2.0.3.dev3 (2026-07-19)
 
 ### Bug Fixes

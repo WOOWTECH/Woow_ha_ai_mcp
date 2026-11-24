@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import socket
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -131,6 +132,13 @@ SSH_ADDON_PASSWORD = os.environ.get("HAOS_TEST_SSH_PASSWORD", "haosdebug")
 SSHPASS_BIN = os.environ.get("HAOS_TEST_SSHPASS_BIN", "sshpass")
 
 
+# docker's two ways of saying the target container cannot be exec'd into: the
+# name matches nothing, or it matches a container that is not running. Both mean
+# the resolved name is stale, so both take the same re-resolve and both are
+# worth capturing VM state for.
+_CONTAINER_MISS_TOKENS = ("no such container", "is not running")
+
+
 def ssh_exec(
     cmd: list[str], *, timeout: float = 30.0
 ) -> subprocess.CompletedProcess[str]:
@@ -222,10 +230,88 @@ def ssh_exec(
             # and would otherwise be lost in CI output. Re-raise as
             # RuntimeError with full stderr+stdout so failures are
             # actionable.
+            diag = ""
+            if any(token in stderr for token in _CONTAINER_MISS_TOKENS):
+                diag = _container_miss_diagnostics(ssh_cmd, env)
             raise RuntimeError(
                 f"ssh_exec failed (exit {exc.returncode}, attempt={attempt}): "
-                f"cmd={cmd!r} stderr={exc.stderr!r} stdout={exc.stdout!r}"
+                f"cmd={cmd!r} stderr={exc.stderr!r} stdout={exc.stdout!r}{diag}"
             ) from exc
+
+
+def _container_miss_diagnostics(ssh_cmd: list[str], env: dict[str, str]) -> str:
+    """Best-effort VM state capture for a container miss.
+
+    A container docker reports as absent or stopped while the addon's HTTP
+    endpoint still serves means the container exists under a name the test
+    did not predict — so the failure message must carry the actual names.
+    This capture deliberately uses ``docker ps -a`` with statuses: unlike
+    resolution, seeing the exited containers is the point. Reuses the
+    caller's assembled ssh wrapper with the remote command swapped out;
+    failures here must never mask the original error.
+    """
+    captured: list[str] = []
+    for label, remote in (
+        ("docker_ps", "docker ps -a --format '{{.Names}} {{.Status}}'"),
+        ("ha_addons", "ha addons --raw-json | head -c 2000"),
+    ):
+        try:
+            probe = subprocess.run(
+                [*ssh_cmd[:-1], remote],
+                capture_output=True,
+                text=True,
+                timeout=20.0,
+                env=env,
+                check=False,
+            )
+            captured.append(f"{label}={probe.stdout.strip()!r}")
+        except Exception as probe_err:  # noqa: BLE001  # pragma: no cover - diagnostics best-effort
+            captured.append(f"{label}_error={probe_err!r}")
+    return " | " + " | ".join(captured)
+
+
+def _resolve_addon_container(addon_slug: str) -> str | None:
+    """Return the addon's actual container name on the booted HAOS.
+
+    Supervisor's addon container prefix changed from ``addon_`` to ``app_``
+    (the add-ons to apps rename), and HAOS self-updates Supervisor at boot,
+    so which prefix a CI VM uses depends on the Supervisor build it booted
+    with — run 30553159100's capture shows ``app_local_ha_mcp_dev`` running
+    while ``addon_local_ha_mcp_dev`` resolves to nothing. Read the name from
+    docker instead of assuming a prefix.
+
+    Only RUNNING containers are listed: ``docker exec`` requires one, so an
+    Exited leftover under either prefix is never the right answer. Candidates
+    are tested in a fixed order — ``app_`` before the legacy ``addon_`` — so a
+    VM that somehow carries both resolves to the current name deterministically
+    rather than by listing order.
+
+    A clean listing that carries neither name (e.g. the addon is mid-restart)
+    resolves to the legacy name. If the ``docker ps`` call itself fails this
+    returns ``None`` rather than propagating, so an unreadable listing degrades
+    to the caller trying both supported names instead of blocking an exec that
+    would have worked.
+    """
+    try:
+        listing = ssh_exec(["docker", "ps", "--format", "{{.Names}}"], timeout=20.0)
+    except (RuntimeError, subprocess.TimeoutExpired) as err:
+        LOG.debug("container listing failed (%s); trying both prefixes", err)
+        return None
+    running = set(listing.stdout.split())
+    for candidate in (f"app_{addon_slug}", f"addon_{addon_slug}"):
+        if candidate in running:
+            return candidate
+    return f"addon_{addon_slug}"
+
+
+def _is_container_miss(err: Exception) -> bool:
+    """Whether ``err`` is docker refusing the exec for want of a live container.
+
+    Both shapes count: the name matching nothing, and a container that stopped
+    between the listing and the exec.
+    """
+    text = str(err).lower()
+    return any(token in text for token in _CONTAINER_MISS_TOKENS)
 
 
 def docker_exec_in_addon(
@@ -234,19 +320,42 @@ def docker_exec_in_addon(
     """Run ``cmd`` inside an addon container via SSH + docker exec.
 
     ``addon_slug`` is the Supervisor slug (e.g. ``local_ha_mcp_dev``);
-    the helper resolves it to the Docker container name (
-    ``addon_<slug>``). Returns stdout of the command. Raises
-    ``RuntimeError`` with stderr+stdout context on non-zero exit
-    (via the wrapping in ``ssh_exec``).
+    the container name is resolved from docker via
+    :func:`_resolve_addon_container` (the prefix differs across Supervisor
+    builds). Returns stdout of the command. Raises ``RuntimeError`` with
+    stderr+stdout context on non-zero exit (via the wrapping in
+    ``ssh_exec``), carrying the ``docker ps`` and Supervisor addon list for a
+    container miss.
+
+    A miss fails fast — there is no retry window. It only costs one second
+    attempt: the resolved name can go stale (a listing taken while the addon is
+    mid-restart resolves to the legacy fallback, then the real container
+    returns under the other prefix; or the container stops between listing and
+    exec), so a miss re-resolves once and re-runs only when the name actually
+    changed. When the listing was unreadable to begin with, the second attempt
+    is the other prefix.
 
     Used by item 8's filesystem-poisoning E2E to make
     ``/data/saved_tools.json`` unwriteable inside the dev addon
     container mid-test, force the save-warning rollback, then chmod
     back in the test's finally block.
     """
-    container = f"addon_{addon_slug}"
-    result = ssh_exec(["docker", "exec", container, *cmd], timeout=timeout)
-    return result.stdout
+    resolved = _resolve_addon_container(addon_slug)
+    first = resolved if resolved is not None else f"addon_{addon_slug}"
+    try:
+        return ssh_exec(["docker", "exec", first, *cmd], timeout=timeout).stdout
+    except RuntimeError as err:
+        if not _is_container_miss(err):
+            raise
+        second = (
+            _resolve_addon_container(addon_slug)
+            if resolved is not None
+            else f"app_{addon_slug}"
+        )
+        if second is None or second == first:
+            raise
+        LOG.debug("container %r missing; retrying once as %r", first, second)
+        return ssh_exec(["docker", "exec", second, *cmd], timeout=timeout).stdout
 
 
 def is_haos_inaddon_mode() -> bool:
@@ -279,325 +388,119 @@ def is_haos_embedded_mode() -> bool:
     return os.environ.get("HAOS_TEST_MODE", "external") == "embedded"
 
 
+def is_haos_stdio_mode() -> bool:
+    """True iff this run targets the external stdio HAOS tier.
+
+    The stdio mode boots the same real HAOS backend as the external lane but
+    runs the server-under-test as the installed ``ha-mcp`` command and connects
+    through a real stdio JSON-RPC transport. This is distinct from both the
+    in-process FastMCP client used by the external lane and the embedded server
+    entry running inside Home Assistant.
+    """
+    return os.environ.get("HAOS_TEST_MODE", "external") == "stdio"
+
+
 def is_haos_backend_selected() -> bool:
     """True iff the workflow has staged a HAOS qcow2 for this run."""
     raw = os.environ.get(HAOS_IMAGE_ENV)
     return bool(raw and Path(raw).exists())
 
 
-def _execute_recorder_sql(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> Any:
-    """Run ``sql``; return the fetched row, or None if the table/column is absent."""
-    import sqlite3
-
-    try:
-        return conn.execute(sql, params).fetchone()
-    except sqlite3.OperationalError as exc:
-        msg = str(exc).lower()
-        if "no such table" in msg or "no such column" in msg:
-            return None
-        raise
-
-
-def _prepare_recorder_connection(conn: Any, db_local: Path) -> None:
-    """Checkpoint any preexisting WAL and switch the connection to DELETE mode."""
-    # The bake's seed DB is in WAL journal mode. Our copy-in only
-    # ships the .db file (not -wal / -shm) into the qcow2, so any
-    # pending WAL frames written during our UPDATE would land in
-    # the workdir alongside the .db and never reach HAOS — HA Core
-    # then sees a .db whose page tree is mid-transaction, raises
-    # ``sqlite3.DatabaseError: database disk image is malformed``,
-    # and renames the seed to ``.corrupt.<ts>`` before booting with
-    # an empty fresh DB. (Captured in PR #1361 diagnostics: see
-    # /supervisor/homeassistant/home-assistant_v2.db.corrupt.*.)
-    #
-    # Fix: checkpoint any preexisting WAL into the main file, then
-    # switch this connection to DELETE mode so our UPDATEs write
-    # straight to .db with no journal artefacts. End state on disk:
-    # one self-contained .db file. HA Core will switch it back to
-    # WAL on first boot — its preferred mode.
-    #
-    # Both PRAGMAs return rows we MUST inspect: a busy WAL
-    # checkpoint or a refused mode switch silently leaves the
-    # same corruption the comment above describes.
-    ckpt_row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-    # Result shape: (busy, log_pages, checkpointed_pages). busy=0
-    # means all frames were merged into the main DB.
-    if ckpt_row is not None and ckpt_row[0] not in (0, None):
-        raise RuntimeError(
-            f"wal_checkpoint(TRUNCATE) reported busy={ckpt_row[0]} on "
-            f"{db_local}; another connection is holding WAL frames. "
-            f"Aborting refresh — copy-in would still produce a "
-            f"WAL/SHM-mismatched DB inside the qcow2."
-        )
-    mode_row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-    if mode_row is None or mode_row[0] != "delete":
-        raise RuntimeError(
-            f"Failed to switch {db_local} to DELETE journal mode "
-            f"(got {mode_row!r}); subsequent UPDATEs would write WAL "
-            f"frames that the qcow2 copy-in won't include."
-        )
-
-
-def _apply_recorder_offset(
-    conn: Any, timestamp_columns: dict[str, tuple[str, ...]], offset: float
-) -> None:
-    """Shift every recorder timestamp column by ``offset`` seconds, then commit."""
-    for table, cols in timestamp_columns.items():
-        for col in cols:
-            _execute_recorder_sql(
-                conn,
-                f"UPDATE {table} SET {col} = {col} + ? WHERE {col} IS NOT NULL",
-                (offset,),
-            )
-    conn.commit()
-
-
-def _shift_recorder_timestamps(db_local: Path, target_age_seconds: float) -> bool:
-    """Shift ``db_local``'s recorder timestamps so the newest lands recently.
-
-    Returns True if a shift was applied (the DB must be copied back into the
-    qcow2), or False if the timestamps were already recent enough to skip.
-    """
-    import sqlite3
-
-    # Same logic as conftest._refresh_recorder_timestamps. Kept inline
-    # rather than importing because conftest pulls in heavy dev deps
-    # (docker, testcontainers) that the HAOS-only paths don't need.
-    TIMESTAMP_COLUMNS = {
-        "states": ("last_updated_ts", "last_changed_ts", "last_reported_ts"),
-        "events": ("time_fired_ts",),
-        "statistics": ("start_ts", "created_ts"),
-        "statistics_short_term": ("start_ts", "created_ts"),
-    }
-    conn = sqlite3.connect(str(db_local))
-    try:
-        _prepare_recorder_connection(conn, db_local)
-        newest = 0.0
-        matched_columns = 0
-        for table, cols in TIMESTAMP_COLUMNS.items():
-            for col in cols:
-                row = _execute_recorder_sql(conn, f"SELECT MAX({col}) FROM {table}")
-                if row is None:
-                    continue
-                matched_columns += 1
-                if row[0] is not None and isinstance(row[0], (int, float)):
-                    newest = max(newest, float(row[0]))
-
-        # Schema drift guard: if HAOS bumps the recorder schema and renames
-        # every column in TIMESTAMP_COLUMNS, the loop above silently
-        # `continue`s through all of them and newest stays 0. Without this
-        # check, history pagination tests would mysteriously fail with "no
-        # data" instead of pointing at the schema bump. Mirrors the
-        # testcontainer _refresh_recorder_timestamps "raise vs no-op"
-        # discipline.
-        if matched_columns == 0:
-            raise RuntimeError(
-                f"Recorder DB at {db_local} matched zero TIMESTAMP_COLUMNS "
-                f"entries — recorder schema may have drifted; update "
-                f"TIMESTAMP_COLUMNS to match the new column names."
-            )
-        if newest <= 0:
-            raise RuntimeError(
-                f"Recorder DB at {db_local} has no numeric timestamps in "
-                f"any of the {matched_columns} matched columns — the bake "
-                f"may have produced an empty DB; re-run "
-                f"`uv run python scripts/bake_pagination_seed.py`."
-            )
-
-        target = time.time() - target_age_seconds
-        offset = target - newest
-        if offset <= 0:
-            LOG.info(
-                "Recorder timestamps already recent (newest=%.0f, "
-                "target=%.0f); no shift needed",
-                newest,
-                target,
-            )
-            return False
-
-        _apply_recorder_offset(conn, TIMESTAMP_COLUMNS, offset)
-        LOG.info("Shifted recorder timestamps by %+.0fs", offset)
-        return True
-    finally:
-        conn.close()
-
-
-def refresh_recorder_in_qcow2(
-    image_path: Path, *, target_age_seconds: float = 300.0
-) -> None:
-    """Shift recorder timestamps inside the baked qcow2 to look ``recent``.
-
-    The image cache key is content-hashed, so a cache hit re-uses an image
-    whose ``home-assistant_v2.db`` timestamps are frozen at bake time —
-    once that exceeds the ~24h window history queries use, every history
-    pagination test silently regresses. This helper extracts the DB from
-    the qcow2, runs the same uniform timestamp shift the testcontainer
-    path does (``conftest._refresh_recorder_timestamps``), and copies the
-    file back in place. Done once per pytest session before QEMU boots.
-
-    Uses guestfish (libguestfs) for both copy-out and copy-in; sqlite3
-    stdlib for the shift itself. ~30s wall-clock overhead per session.
-    """
+def stage_recorder_seed_in_qcow2(image_path: Path, seed_db: Path) -> None:
+    """Put ``seed_db`` into the qcow2 as Core's recorder database, before boot."""
+    import shutil
     import tempfile
 
-    workdir = Path(tempfile.mkdtemp(prefix="haos-ts-refresh-"))
+    workdir = Path(tempfile.mkdtemp(prefix="haos-recorder-seed-"))
     db_local = workdir / "home-assistant_v2.db"
+    home = "/supervisor/homeassistant"
+    # copy-in keeps the source's basename. The bake leaves Core's -wal / -shm
+    # beside its own database: a stale WAL next to a different .db makes Core
+    # mark the database corrupt and boot with an empty one, so both go.
+    script = f"run : mount /dev/sda8 / : copy-in {db_local} {home}/"
+    script += f" : rm-f {home}/home-assistant_v2.db-wal"
+    script += f" : rm-f {home}/home-assistant_v2.db-shm"
+    command = ["guestfish", "--rw", "-a", str(image_path), *script.split()]
     try:
-        # copy-out the recorder DB from the qcow2's hassos-data partition.
-        subprocess.run(
-            [
-                "guestfish",
-                "--ro",
-                "-a",
-                str(image_path),
-                "run",
-                ":",
-                "mount",
-                "/dev/sda8",
-                "/",
-                ":",
-                "copy-out",
-                "/supervisor/homeassistant/home-assistant_v2.db",
-                str(workdir),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-
-        if not _shift_recorder_timestamps(db_local, target_age_seconds):
-            return
-
-        # copy-in the shifted DB, and PURGE any stale ``-wal`` / ``-shm``
-        # sidecars in the qcow2. Two-part fix: the PRAGMA block above
-        # handles the workdir DB (no WAL frames leaving our process); this
-        # block handles the qcow2 side.
-        #
-        # The bake (build_image.py) boots HA Core to bootstrap state — Core
-        # writes the recorder DB in WAL mode and leaves
-        # ``home-assistant_v2.db``, ``home-assistant_v2.db-wal``, and
-        # ``home-assistant_v2.db-shm`` in the supervisor data dir. Our
-        # copy-out only fetches the ``.db``, so when we copy the edited
-        # ``.db`` back, the old ``-wal`` / ``-shm`` from bake are still
-        # there — referencing page numbers from the pre-edit ``.db`` that
-        # no longer exist. On boot HA Core opens ``.db`` + ``-wal``
-        # together, sqlite finds the page-tree inconsistent, and raises
-        # ``sqlite3.DatabaseError: database disk image is malformed``
-        # (PR #1361 diagnostics: ha-core-runtime.log captured this exact
-        # message, plus ``home-assistant_v2.db-wal.corrupt.<ts>`` proving
-        # a WAL file was present). The seed is then renamed to
-        # ``.corrupt.<ts>`` and HA boots with a fresh empty DB — losing
-        # all the pre-baked history rows.
-        #
-        # --rw so guestfish opens the qcow2 for write; the file's
-        # owner/perms inside the qcow2 are preserved by libguestfs when
-        # overwriting an existing path.
-        try:
-            subprocess.run(
-                [
-                    "guestfish",
-                    "--rw",
-                    "-a",
-                    str(image_path),
-                    "run",
-                    ":",
-                    "mount",
-                    "/dev/sda8",
-                    "/",
-                    ":",
-                    "copy-in",
-                    str(db_local),
-                    "/supervisor/homeassistant/",
-                    ":",
-                    "rm-f",
-                    "/supervisor/homeassistant/home-assistant_v2.db-wal",
-                    ":",
-                    "rm-f",
-                    "/supervisor/homeassistant/home-assistant_v2.db-shm",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            # Partial-write recovery hint: the previous copy-out + sqlite
-            # mutate succeeded but the write-back is gone, so the qcow2's
-            # recorder DB is whatever the bake left there. Subsequent runs
-            # against this cached image will repeat the same shift on the
-            # original timestamps — safe but slow. If the recorder DB
-            # appears corrupt downstream, delete the image and let the
-            # next CI run rebuild.
-            LOG.error(
-                "guestfish copy-in failed for %s; cached qcow2 may need "
-                "a manual rebuild (delete /tmp/haos-test-image.qcow2 + "
-                "the matching cache key, then re-run)",
-                image_path,
-            )
-            raise
-        LOG.info("Refreshed recorder DB in %s", image_path)
+        shutil.copyfile(seed_db, db_local)
+        # This is a worker's first guestfish call, and one has run past its
+        # limit on a CI runner: a timeout gets one more try.
+        for last in (False, True):
+            try:
+                subprocess.run(
+                    command, check=True, capture_output=True, text=True, timeout=180
+                )
+                break
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+                LOG.error(
+                    "guestfish recorder seed copy-in failed (%s)\n"
+                    "stdout:\n%s\nstderr:\n%s",
+                    type(err).__name__,
+                    err.stdout,
+                    err.stderr,
+                )
+                if last or isinstance(err, subprocess.CalledProcessError):
+                    raise
+        LOG.info("Staged recorder seed in %s", image_path)
     finally:
-        import shutil
-
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def inject_hacs_token(config_entries_doc: dict[str, Any], token: str) -> bool:
-    """Set ``token`` as the HACS config entry's GitHub auth token.
+def remove_tools_entry(config_entries_doc: dict[str, Any]) -> list[str]:
+    """Drop the "File & YAML Tools" config entry from a parsed storage doc.
 
     Mutates ``config_entries_doc`` (a parsed ``.storage/core.config_entries``
-    document) in place, replacing the ``hacs`` entry's ``data`` with
-    ``{"token": token}`` — the same shape HACS' own config flow persists
-    after device-flow auth. Returns True if a ``hacs`` entry was found and
-    patched, False if the document has none (doc left untouched).
+    document) in place, removing every ``ha_mcp_tools`` entry that is NOT the
+    in-process server entry — i.e. the tools entry, whose baked ``entry_id`` is
+    ``e2e_test_ha_mcp_tools_entry``. The discriminator is
+    ``data.entry_type == "server"``, the same one the component itself uses
+    (a missing ``entry_type`` means tools), so the staged (disabled) server
+    entry survives and only the privileged filesystem / YAML services go away.
+
+    Returns the list of removed ``entry_id`` values; empty means the document
+    carried no tools entry (doc left untouched).
     """
-    for entry in config_entries_doc.get("data", {}).get("entries", []):
-        if entry.get("domain") == "hacs":
-            entry["data"] = {"token": token}
-            return True
-    return False
-
-
-def inject_hacs_token_in_qcow2(image_path: Path) -> None:
-    """Authenticate HACS inside the qcow2 with the CI GitHub token.
-
-    The baked HACS config entry carries no token, so HACS calls the GitHub
-    API unauthenticated — 60 requests/hour per IP, shared across GitHub-
-    hosted runners. When that budget is exhausted every HACS repository add
-    fails ("<Integration ...> GitHub Ratelimit error" in the HA core log)
-    until the hourly window resets, which no in-test wait or rerun can
-    outlast — the long-standing source of the HACS-install e2e flake. The
-    testcontainer path already injects GITHUB_TOKEN into the seeded entry
-    (see conftest's container setup); this brings the HAOS backend to
-    parity by editing the config entry inside the per-worker qcow2 before
-    boot. GITHUB_TOKEN gets 1,000 requests/hour scoped per repository, so
-    the shared-IP limit stops applying.
-
-    Token lifecycle is safe by construction: the workflow saves the image
-    cache BEFORE the test step runs, and xdist workers boot per-run
-    overlays, so the cached base image never carries a token (which would
-    be expired next run anyway — GITHUB_TOKEN dies with the job).
-
-    No-op with a log line when GITHUB_TOKEN is unset (local runs). A
-    guestfish failure degrades LOUDLY to a warning instead of failing the
-    session: the suite then runs exactly as it did before this helper
-    existed (unauthenticated HACS, rate-limit flakes possible).
-    """
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if not token:
-        LOG.info(
-            "GITHUB_TOKEN not set — HACS in %s stays unauthenticated "
-            "(GitHub rate-limit flakes possible)",
-            image_path,
+    entries = config_entries_doc.get("data", {}).get("entries", [])
+    removed: list[str] = []
+    kept: list[Any] = []
+    for entry in entries:
+        is_tools_entry = (
+            isinstance(entry, dict)
+            and entry.get("domain") == HA_MCP_SERVER_DOMAIN
+            and (entry.get("data") or {}).get("entry_type") != "server"
         )
-        return
+        if is_tools_entry:
+            removed.append(str(entry.get("entry_id")))
+        else:
+            kept.append(entry)
+    if removed:
+        config_entries_doc["data"]["entries"] = kept
+    return removed
 
+
+def remove_tools_entry_in_qcow2(image_path: Path) -> None:
+    """Delete the baked File & YAML Tools config entry from the qcow2 (#2292).
+
+    The no-tools lanes (``E2E_NO_TOOLS_ENTRY=1``) prove that the privileged
+    ``ha_mcp_tools`` services are unavailable when the user never added the
+    "HA-MCP File & YAML Tools" entry. On HAOS that entry is baked into the
+    image, so it is removed here — a pre-boot offline qcow2 edit on the
+    per-worker overlay, the same mechanism as the recorder / Marketplace-token
+    refreshers and for the same reason: HA Core owns ``.storage`` once it
+    boots. The component files and the staged (disabled) in-process server
+    entry are deliberately left alone, so the ``haos_embedded`` lane still
+    gets its server-entry-only topology.
+
+    Unlike the best-effort Marketplace-token injection in ``marketplace_token``,
+    every failure RAISES:
+    a silent no-op would leave the tools entry in place and the whole lane
+    would then re-test the ordinary topology while reporting green.
+    """
     import shutil
     import tempfile
 
     storage_path = "/supervisor/homeassistant/.storage/core.config_entries"
-    workdir = Path(tempfile.mkdtemp(prefix="haos-hacs-token-"))
+    workdir = Path(tempfile.mkdtemp(prefix="haos-drop-tools-entry-"))
     try:
         try:
             subprocess.run(
@@ -623,13 +526,14 @@ def inject_hacs_token_in_qcow2(image_path: Path) -> None:
             )
             local = workdir / "core.config_entries"
             doc = json.loads(local.read_text(encoding="utf-8"))
-            if not inject_hacs_token(doc, token):
-                LOG.warning(
-                    "No hacs config entry in %s — token not injected; HACS "
-                    "stays unauthenticated (GitHub rate-limit flakes possible)",
-                    image_path,
+            removed = remove_tools_entry(doc)
+            if not removed:
+                raise RuntimeError(
+                    f"No {HA_MCP_SERVER_DOMAIN} tools config entry in {image_path} "
+                    "— nothing to remove, so an E2E_NO_TOOLS_ENTRY=1 run would "
+                    "silently re-test the ordinary topology. Check that the bake "
+                    "still seeds it (build_image.bake_test_state)."
                 )
-                return
             local.write_text(json.dumps(doc, indent=2), encoding="utf-8")
             subprocess.run(
                 [
@@ -652,16 +556,27 @@ def inject_hacs_token_in_qcow2(image_path: Path) -> None:
                 text=True,
                 timeout=180,
             )
-            LOG.info("Injected GITHUB_TOKEN into HACS config entry in %s", image_path)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            stderr = (getattr(exc, "stderr", "") or "").strip()
-            LOG.warning(
-                "HACS token injection failed for %s (%s%s) — HACS stays "
-                "unauthenticated (GitHub rate-limit flakes possible)",
+            LOG.info(
+                "Removed %s tools config entries %s from %s (E2E_NO_TOOLS_ENTRY=1)",
+                HA_MCP_SERVER_DOMAIN,
+                removed,
                 image_path,
-                type(exc).__name__,
-                f": {stderr[-300:]}" if stderr else "",
             )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            OSError,
+        ) as exc:
+            stderr = (getattr(exc, "stderr", "") or "").strip()
+            raise RuntimeError(
+                f"Failed to remove the File & YAML Tools config entry from "
+                f"{image_path} ({type(exc).__name__}"
+                + (f": {stderr[-300:]}" if stderr else f": {exc}")
+                + "). The no-tools lane needs that entry gone; aborting session "
+                "setup rather than running the whole lane against the ordinary "
+                "topology."
+            ) from exc
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -677,8 +592,8 @@ def _build_embedded_server_wheel(dest_dir: Path) -> Path:
     under ``uv run pytest`` in a uv-created venv that ships no ``pip``, so a
     ``python -m pip wheel`` call exits non-zero (verified on CI run 28705609217 —
     it is also why the container-lane embedded test silently skips). ``uv`` is
-    always on PATH (setup-uv) and provisions the setuptools build backend from
-    its cache (already warmed by the lane's ``uv sync``). Returns the wheel path.
+    always on PATH (setup-uv) and builds with its own ``uv_build`` backend.
+    Returns the wheel path.
     """
     import shutil as _shutil
 
@@ -698,20 +613,19 @@ def _build_embedded_server_wheel(dest_dir: Path) -> Path:
     return wheels[0]
 
 
-def _set_embedded_server_pip_spec(
-    config_entries_doc: dict[str, Any], pip_spec: str
+def set_embedded_server_pip_spec(
+    config_entries_doc: dict[str, Any], pip_spec: str, admin_token: str
 ) -> bool:
-    """Point the baked server entry's ``options.pip_spec`` at ``pip_spec``.
+    """Point the baked server entry at ``pip_spec`` and its token (#2427).
 
     Mutates ``config_entries_doc`` (a parsed ``.storage/core.config_entries``)
-    in place. Matches by entry_id, not domain: the domain (ha_mcp_tools) is
-    shared with the tools services entry, so only the entry_id uniquely
-    identifies the in-process server entry. Returns True if it was found and
-    patched, False if the document has none (doc left untouched).
+    in place, matching by entry_id because the tools entry shares the domain.
+    Returns True if it was found and patched, False if the document has none.
     """
     for entry in config_entries_doc.get("data", {}).get("entries", []):
         if entry.get("entry_id") == HA_MCP_SERVER_ENTRY_ID:
             entry.setdefault("options", {})["pip_spec"] = pip_spec
+            entry.setdefault("data", {})["admin_token"] = admin_token
             return True
     return False
 
@@ -752,11 +666,11 @@ def read_embedded_staging_status() -> dict[str, Any] | None:
     """Return this worker's in-process server wheel-staging outcome, or None if unset."""
     try:
         return json.loads(_embedded_staging_status_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return None
 
 
-def stage_embedded_server_wheel_in_qcow2(image_path: Path) -> None:
+def stage_embedded_server_wheel_in_qcow2(image_path: Path, admin_token: str) -> None:
     """Deliver the checkout's ha-mcp wheel into the qcow2 for the embedded E2E.
 
     Builds a ``--no-deps`` ha-mcp wheel from the working tree, copies it into the
@@ -765,7 +679,7 @@ def stage_embedded_server_wheel_in_qcow2(image_path: Path) -> None:
     pointing at it — so when the HAOS embedded-server test enables the entry, the
     in-process server installs from the PR's own source (checkout fidelity for
     the ``src/ha_mcp`` embedded-mode routing under test) rather than PyPI. Runs
-    once per session before ``boot_haos_qemu``, like the recorder / HACS-token
+    once per session before ``boot_haos_qemu``, like the recorder / Marketplace-token
     qcow2 refreshers.
 
     Best-effort by design: on the external HAOS lane the baked entry stays
@@ -829,7 +743,7 @@ def stage_embedded_server_wheel_in_qcow2(image_path: Path) -> None:
             local = workdir / "core.config_entries"
             doc = json.loads(local.read_text(encoding="utf-8"))
             pip_spec = f"ha-mcp @ file:///config/{wheel.name}"
-            if not _set_embedded_server_pip_spec(doc, pip_spec):
+            if not set_embedded_server_pip_spec(doc, pip_spec, admin_token):
                 detail = (
                     "no in-process server config entry in the image — the bake may "
                     "not have seeded it (check build_image.bake_test_state)"
@@ -894,11 +808,133 @@ def stage_embedded_server_wheel_in_qcow2(image_path: Path) -> None:
 # runtime); kept in step with the container backend's ``_EMBEDDED_SERVER_CONFIG_SUBDIR``.
 _HAOS_CONFIG_DIR = "/supervisor/homeassistant"
 _HAOS_EMBEDDED_SERVER_DATA_DIR = f"{_HAOS_CONFIG_DIR}/.ha_mcp"
+_HAOS_TLS_DIR = f"{_HAOS_CONFIG_DIR}/ssl"
+_HAOS_TLS_CERT_NAME = "haos-e2e-cert.pem"
+_HAOS_TLS_KEY_NAME = "haos-e2e-key.pem"
+HAOS_TLS_CERTIFICATE_PATH = f"/config/ssl/{_HAOS_TLS_CERT_NAME}"
+HAOS_TLS_KEY_PATH = f"/config/ssl/{_HAOS_TLS_KEY_NAME}"
+_HA_HTTP_CONFIG_META_KEYS = frozenset({"created_at", "error", "error_message"})
+
+
+def clean_home_assistant_http_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Strip read-only metadata from an HTTP config returned by Core."""
+    return {
+        key: value
+        for key, value in config.items()
+        if key not in _HA_HTTP_CONFIG_META_KEYS
+    }
+
+
+def build_home_assistant_tls_config(
+    stable: dict[str, Any], *, certificate_path: str, key_path: str
+) -> dict[str, Any]:
+    """Build a pending TLS trial while preserving the active HTTP settings."""
+    return {
+        **clean_home_assistant_http_config(stable),
+        "ssl_certificate": certificate_path,
+        "ssl_key": key_path,
+    }
+
+
+def stage_home_assistant_tls_in_qcow2(image_path: Path) -> Path:
+    """Stage a hostname-only Core certificate without enabling TLS yet.
+
+    The certificate is deliberately valid for ``haos-e2e.local`` but not
+    ``127.0.0.1``. Trusting it from the host therefore reproduces issue #2241's
+    exact IP-address-mismatch failure when the legacy app proxy uses HTTPX's
+    default verification. The final E2E enables it at runtime through Core's
+    supported HTTP configuration API, in the worker's already-running VM.
+
+    Returns the host-side certificate path — the caller exports it as
+    ``HAOS_TEST_TLS_CA_PATH`` so the test can trust it via ``SSL_CERT_FILE``.
+    That trust path is also why the self-signed cert carries
+    ``basicConstraints=CA:TRUE``: the host uses the same file as its CA.
+    """
+    import atexit
+    import shutil
+    import tempfile
+
+    workdir = Path(tempfile.mkdtemp(prefix="haos-core-tls-"))
+    certificate = workdir / _HAOS_TLS_CERT_NAME
+    key = workdir / _HAOS_TLS_KEY_NAME
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-nodes",
+                # Staging reruns per image prep, but VM clock drift or an
+                # image reused across a day boundary would turn a 1-day cert
+                # into a confusing "certificate has expired" failure.
+                "-days",
+                "30",
+                "-subj",
+                "/CN=haos-e2e.local",
+                "-addext",
+                "subjectAltName=DNS:haos-e2e.local",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign",
+                "-addext",
+                "extendedKeyUsage=serverAuth",
+                "-keyout",
+                str(key),
+                "-out",
+                str(certificate),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        subprocess.run(
+            [
+                "guestfish",
+                "--rw",
+                "-a",
+                str(image_path),
+                "run",
+                ":",
+                "mount",
+                "/dev/sda8",
+                "/",
+                ":",
+                "mkdir-p",
+                _HAOS_TLS_DIR,
+                ":",
+                "copy-in",
+                str(certificate),
+                _HAOS_TLS_DIR,
+                ":",
+                "copy-in",
+                str(key),
+                _HAOS_TLS_DIR,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise RuntimeError(
+            f"Failed to stage Home Assistant TLS files into {image_path}: {exc}"
+        ) from exc
+    LOG.info("Staged HA Core TLS files into %s (host CA: %s)", image_path, certificate)
+    # The caller reads the certificate as a trust anchor for the rest of the
+    # session, so remove the workdir (and its private key) only at exit.
+    atexit.register(shutil.rmtree, workdir, ignore_errors=True)
+    return certificate
 
 
 def stage_embedded_server_feature_flags_in_qcow2(
     image_path: Path,
-    feature_flags: dict[str, bool],
+    feature_flags: dict[str, bool | str],
     *,
     filename: str = "feature_flags.json",
 ) -> None:
@@ -923,11 +959,11 @@ def stage_embedded_server_feature_flags_in_qcow2(
 
     Delivered pre-boot via guestfish (mkdir-p the data dir + copy-in the file),
     the same offline-qcow2 mechanism as ``stage_embedded_server_wheel_in_qcow2``
-    and the recorder / HACS-token refreshers — deterministic (present before HA
+    and the recorder / Marketplace-token refreshers — deterministic (present before HA
     boots and before the entry is enabled) with no post-boot service-availability
     or ordering dependency, which is why it's preferred over calling the baked
     ``ha_mcp_tools`` write_file service after boot. The integration's
-    ``_prepare_config_dir`` does ``os.makedirs(..., exist_ok=True)``, so a
+    ``prepare_config_dir`` does ``os.makedirs(..., exist_ok=True)``, so a
     pre-created dir + file is picked up rather than clobbered (proven on the
     container embedded lane, which pre-seeds the identical files).
 
@@ -986,6 +1022,170 @@ def stage_embedded_server_feature_flags_in_qcow2(
         )
     finally:
         _shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _ws_connect_error_is_transient(error: Exception) -> bool:
+    """A restarting Core refuses, times out, or answers 502-504 through a proxy."""
+    import websockets.exceptions
+
+    if isinstance(
+        error, ssl.SSLCertVerificationError | websockets.exceptions.InvalidURI
+    ):
+        return False
+    if isinstance(error, websockets.exceptions.InvalidStatus):
+        return error.response.status_code in (502, 503, 504)
+    return True
+
+
+def _connect_home_assistant_ws(
+    ws_url: str, ssl_context: ssl.SSLContext | None, deadline: float
+) -> Any:
+    """Open the Core WebSocket, retrying transient failures until ``deadline``.
+
+    Right after a Core restart the HTTP endpoints answer before the WebSocket
+    handshake does.
+    """
+    import websockets.exceptions
+    import websockets.sync.client
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out opening {ws_url}")
+        try:
+            return websockets.sync.client.connect(
+                ws_url,
+                max_size=None,
+                open_timeout=min(remaining, 30.0),
+                ssl=ssl_context,
+            )
+        except (
+            OSError,
+            TimeoutError,
+            websockets.exceptions.WebSocketException,
+        ) as error:
+            if (
+                not _ws_connect_error_is_transient(error)
+                or time.monotonic() + 2.0 >= deadline
+            ):
+                raise
+            LOG.debug("Core WebSocket %s not ready yet: %r", ws_url, error)
+            time.sleep(2.0)
+
+
+def _home_assistant_ws_command(
+    base_url: str,
+    token: str,
+    command: dict[str, Any],
+    *,
+    timeout: float = 60.0,
+    verify_ssl: bool = True,
+) -> Any:
+    """Run one authenticated Home Assistant WebSocket command within ``timeout``."""
+    deadline = time.monotonic() + timeout
+    ws_url = (
+        base_url.replace("http://", "ws://").replace("https://", "wss://")
+        + "/api/websocket"
+    )
+    ssl_context: ssl.SSLContext | None = None
+    if ws_url.startswith("wss://"):
+        ssl_context = ssl.create_default_context()
+        if not verify_ssl:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+    with _connect_home_assistant_ws(ws_url, ssl_context, deadline) as ws:
+        first = json.loads(ws.recv(timeout=max(deadline - time.monotonic(), 0.0)))
+        if first.get("type") != "auth_required":
+            raise RuntimeError(f"WS handshake: expected auth_required, got {first!r}")
+        ws.send(json.dumps({"type": "auth", "access_token": token}))
+        auth_resp = json.loads(ws.recv(timeout=max(deadline - time.monotonic(), 0.0)))
+        if auth_resp.get("type") != "auth_ok":
+            raise RuntimeError(f"WS auth rejected: {auth_resp}")
+
+        msg_id = 1
+        ws.send(json.dumps({"id": msg_id, **command}))
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                raw = ws.recv(timeout=remaining)
+            except TimeoutError:
+                continue
+            if not isinstance(raw, str):
+                raw = raw.decode()
+            response = json.loads(raw)
+            if response.get("id") != msg_id:
+                continue
+            if not response.get("success", False):
+                raise RuntimeError(
+                    f"Home Assistant WS command {command.get('type')!r} failed: "
+                    f"{response.get('error') or response!r}"
+                )
+            return response.get("result")
+    raise TimeoutError(
+        f"Home Assistant WS command {command.get('type')!r} got no response "
+        f"within {timeout}s"
+    )
+
+
+def get_home_assistant_http_config(
+    base_url: str,
+    token: str,
+    *,
+    timeout: float = 60.0,
+    verify_ssl: bool = True,
+) -> dict[str, Any]:
+    """Read Core's stable, pending, default, and active HTTP config slots."""
+    result = _home_assistant_ws_command(
+        base_url,
+        token,
+        {"type": "http/config"},
+        timeout=timeout,
+        verify_ssl=verify_ssl,
+    )
+    config: dict[str, Any] = result
+    return config
+
+
+def configure_home_assistant_http(
+    base_url: str,
+    token: str,
+    config: dict[str, Any],
+    *,
+    timeout: float = 60.0,
+    verify_ssl: bool = True,
+) -> bool:
+    """Stage an HTTP config and return whether Core scheduled its restart.
+
+    The underlying ``http/config/configure`` WS command requires an admin
+    token and a Core in ``CoreState.running`` — mid-restart Core rejects it
+    with ``not_running``, which surfaces here as ``RuntimeError``.
+    """
+    result = _home_assistant_ws_command(
+        base_url,
+        token,
+        {"type": "http/config/configure", "config": config},
+        timeout=timeout,
+        verify_ssl=verify_ssl,
+    )
+    restart: bool = result["restart"]
+    return restart
+
+
+def promote_home_assistant_http_config(
+    base_url: str,
+    token: str,
+    *,
+    timeout: float = 60.0,
+    verify_ssl: bool = True,
+) -> None:
+    """Promote Core's live pending HTTP config to the stable slot."""
+    _home_assistant_ws_command(
+        base_url,
+        token,
+        {"type": "http/config/promote"},
+        timeout=timeout,
+        verify_ssl=verify_ssl,
+    )
 
 
 def enable_config_entry(
@@ -1099,7 +1299,21 @@ def _resolve_local_store_dir(image_path: Path) -> str:
     return "/supervisor/apps/local"
 
 
-def refresh_dev_addon_source_in_qcow2(image_path: Path) -> None:
+# Files the dev addon's Dockerfile copies from the stable addon dir (staged at
+# the build-context root) and the other repo files it copies, besides src/.
+# Both must match build_image's (kept in sync by hand like
+# HA_MCP_TEST_SECRET_PATH; test_haos_dev_addon_context checks both).
+STABLE_ADDON_FILES = ("start.py", "app_options.json")
+DEV_ADDON_REPO_FILES = (
+    "pyproject.toml",
+    "uv.lock",
+    "README.md",
+    "LICENSE",
+    "tests/test-env/pyproject.toml",
+)
+
+
+def refresh_dev_addon_source_in_qcow2(image_path: Path) -> None:  # noqa: PLR0915
     """Overwrite the staged ha-mcp dev addon source with the PR's current source.
 
     The cached qcow2 ships with the addon installed + Docker image built
@@ -1108,17 +1322,15 @@ def refresh_dev_addon_source_in_qcow2(image_path: Path) -> None:
 
     1. Walks the working tree for the addon-build-context files
        (homeassistant-addon-dev/* + start.py from homeassistant-addon/ +
-       pyproject.toml + uv.lock + src/ha_mcp/).
+       ``DEV_ADDON_REPO_FILES`` + src/ha_mcp/).
     2. Bumps the addon's config.yaml ``version:`` so Supervisor's
        local-store scanner reports an update-available on next boot.
        Bump format: ``<base>-pr-<GITHUB_SHA[:7] or "local">`` so every
        distinct PR commit produces a distinct version (Supervisor caches
        by exact version string).
-    3. libguestfs replaces the ``ha_mcp_dev/`` directory (rm-rf + tar-in of
-       parent) under the live Supervisor local store on the offline qcow2:
-       ``apps/local`` on Supervisor >= 2026.06.0, else the legacy
-       ``addons/local`` (resolved by ``_resolve_local_store_dir``; the rename
-       landed in home-assistant/supervisor#6865).
+    3. libguestfs replaces ``ha_mcp_dev/`` (rm-rf + tar-in of parent) in the
+       Supervisor local store of the offline qcow2 (``apps/local``, else the
+       legacy ``addons/local``; see ``_resolve_local_store_dir``).
 
     Subsequent boot + ``addons/{slug}/update`` via Supervisor WS picks up
     the new files and rebuilds the addon's Docker image. Because the
@@ -1144,12 +1356,11 @@ def refresh_dev_addon_source_in_qcow2(image_path: Path) -> None:
 
         # Same file-shaping as build_image.stage_dev_addon_source so the
         # build context matches what the cached Docker layers expect.
-        _shutil.copy(
-            repo_root / "homeassistant-addon" / "start.py",
-            staging / "start.py",
-        )
-        _shutil.copy(repo_root / "pyproject.toml", staging / "pyproject.toml")
-        _shutil.copy(repo_root / "uv.lock", staging / "uv.lock")
+        for name in STABLE_ADDON_FILES:
+            _shutil.copy(repo_root / "homeassistant-addon" / name, staging / name)
+        for name in DEV_ADDON_REPO_FILES:
+            (staging / name).parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy(repo_root / name, staging / name)
         addon_src_dir = staging / "src"
         if addon_src_dir.exists():
             _shutil.rmtree(addon_src_dir)
@@ -1158,12 +1369,14 @@ def refresh_dev_addon_source_in_qcow2(image_path: Path) -> None:
 
         # Dockerfile shape fixup (same as bake).
         dockerfile = staging / "Dockerfile"
-        dockerfile.write_text(
-            dockerfile.read_text().replace(
-                "COPY homeassistant-addon/start.py /",
-                "COPY start.py /",
+        patched = dockerfile.read_text()
+        for name in STABLE_ADDON_FILES:
+            patched = patched.replace(
+                f"COPY homeassistant-addon/{name} /", f"COPY {name} /"
             )
-        )
+        from haos_python_base import rewrite_python_base
+
+        dockerfile.write_text(rewrite_python_base(patched))  # ECR 429 fallback
 
         # Strip image: from config.yaml — Supervisor pulls from GHCR when
         # image: is set, but the per-PR version we bump to below doesn't
@@ -1374,6 +1587,197 @@ def wait_for_addon_mcp_ready(*, timeout: float = 300.0) -> str:
     )
 
 
+# Budget for the addon's Home Assistant link once its own listener answers.
+# Core is normally accepting within seconds of it, so this is only consumed
+# when something is genuinely wrong.
+_ADDON_HA_LINK_TIMEOUT_S = 180.0
+_ADDON_HA_LINK_POLL_S = 3.0
+# Ceiling for ONE attempt. Long enough for a healthy connect + initialize +
+# tool round trip on a loaded runner, short enough that a stalled attempt is
+# abandoned and retried inside the overall budget instead of monopolizing it.
+_ADDON_HA_LINK_PROBE_S = 30.0
+
+
+def _addon_link_transient_leaves() -> tuple[type[BaseException], ...]:
+    """Return the leaf errors that mean "not linked yet" rather than "broken".
+
+    Mirrors the suite's canonical MCP-polling set
+    (``e2e/utilities/wait_helpers._POLLING_TRANSIENT_ERRORS``) plus httpx
+    transport errors — the same combination ``test_addon_debug_log_level``
+    uses for this exact target. Copied by value rather than imported because
+    this module is also imported bare (``from haos_runtime import ...``), so a
+    package-relative import of the e2e tree would not resolve;
+    ``test_haos_addon_ha_link_wait`` pins that it stays a superset of the
+    canonical tuple.
+    """
+    import anyio
+    import httpx
+    import httpx2
+
+    from ha_mcp._vendor.fastmcp.exceptions import ClientError, FastMCPError, McpError
+
+    return (
+        McpError,
+        FastMCPError,
+        ClientError,
+        RuntimeError,
+        OSError,
+        TimeoutError,
+        httpx.HTTPError,
+        # FastMCP's client transport raises httpx2 errors.
+        httpx2.HTTPError,
+        # Cancelling a stalled attempt tears the streamable-HTTP memory
+        # streams down mid-read. These are plain Exceptions, not OSError.
+        anyio.ClosedResourceError,
+        anyio.BrokenResourceError,
+        anyio.EndOfStream,
+    )
+
+
+def _addon_link_transient_errors() -> tuple[type[BaseException], ...]:
+    """Return the ``except`` target for one probe attempt.
+
+    Includes ``BaseExceptionGroup`` because bounding an attempt means
+    cancelling a live anyio task group, whose teardown groups our
+    ``CancelledError`` with any child failure — and a group carrying a
+    ``BaseException`` leaf is not an ``Exception``, so it would otherwise
+    escape the poll loop as a raw anyio traceback, losing both the retry
+    budget and the caller's diagnostics pointer. A caught group must still
+    pass :func:`_is_transient_link_error`, or a genuine bug inside the group
+    would be relabelled "not linked yet" (same rule as
+    ``custom_components/ha_mcp_tools/llm_api.py::_transport_errors``).
+    """
+    return (*_addon_link_transient_leaves(), BaseExceptionGroup)
+
+
+def _is_transient_link_error(err: BaseException) -> bool:
+    """Return True when every leaf of ``err`` is a transient link failure.
+
+    A group counts only when EVERY leaf (nested groups included) is
+    transient: a group carrying any other member is a real bug that must
+    propagate with its traceback instead of being retried until the deadline.
+    """
+    import asyncio
+
+    if isinstance(err, BaseExceptionGroup):
+        return all(_is_transient_link_error(exc) for exc in err.exceptions)
+    # CancelledError counts only as a group leaf — it is this module's own
+    # wait_for abandoning a stalled attempt. A *bare* CancelledError is not in
+    # the except target above, so an outside cancellation still propagates.
+    return isinstance(err, (*_addon_link_transient_leaves(), asyncio.CancelledError))
+
+
+def probe_addon_ha_link(addon_mcp_url: str, budget: float) -> None:
+    """Make one MCP call that needs Home Assistant; raise if it does not work.
+
+    ``budget`` bounds this single attempt. Without it the attempt inherits
+    FastMCP's Streamable HTTP default of ``httpx.Timeout(30.0, read=300.0)``
+    (``client/transports/http.py`` — the one place this default is cited), so a
+    listener that accepts the connection but stalls on initialize or the tool
+    response holds the poll loop for up to 300s, far past the caller's own
+    deadline, delaying the fixture failure and its HAOS diagnostics.
+
+    FastMCP's own deadlines are set strictly tighter than the outer backstop.
+    Each starts its clock later than the one around it — ``init_timeout``
+    after session setup, the read timeout at request send — so with equal
+    values the backstop would always win the race and their phase-naming
+    errors ("Failed to initialize server session", the session read timeout)
+    could never fire, degrading every stall to a message-less ``TimeoutError``.
+    The raw TCP connect keeps httpx's own fixed connect timeout rather than
+    ``budget``; the outer coroutine bound is what covers a stall there.
+    """
+    import asyncio
+
+    from ha_mcp._vendor.fastmcp import Client
+    from ha_mcp._vendor.fastmcp.client.transports import StreamableHttpTransport
+
+    inner = max(budget * 0.8, budget - 2.0)
+
+    async def _call() -> None:
+        # Fresh client per attempt: the server is stateless, and a long-lived
+        # session would not survive the addon restarting mid-poll.
+        async with Client(
+            StreamableHttpTransport(url=addon_mcp_url),
+            timeout=inner,
+            init_timeout=inner,
+        ) as client:
+            await client.call_tool("ha_get_app", {}, timeout=inner)
+
+    async def _bounded() -> None:
+        try:
+            await asyncio.wait_for(_call(), timeout=budget)
+        except TimeoutError as exc:
+            # wait_for raises a bare TimeoutError(), whose repr carries nothing.
+            # Name the target so the loop's final report is actionable.
+            raise TimeoutError(
+                f"ha_get_app at {addon_mcp_url} did not answer within "
+                f"{budget:.1f}s (fastmcp's own {inner:.1f}s deadlines did not "
+                f"fire, so the stall was not in initialize or the read)"
+            ) from exc
+
+    asyncio.run(_bounded())
+
+
+def wait_for_addon_ha_link_ready(
+    addon_mcp_url: str, *, timeout: float = _ADDON_HA_LINK_TIMEOUT_S
+) -> bool:
+    """Poll the addon until a tool call that needs Home Assistant answers.
+
+    ``wait_for_addon_mcp_ready`` gates on the addon's own HTTP listener, which
+    is a different layer from the one tools depend on: the addon reaches Core
+    over the Supervisor WebSocket proxy, and that proxy answers HTTP 502 for a
+    beat after boot while Core comes up behind it. Gating only on the listener
+    lets setup return half-ready, so the session's first HA-backed tool call
+    can land in that window and fail with ``CONNECTION_FAILED`` — which reads
+    as a product bug rather than a setup race.
+
+    ``ha_get_app`` is the probe because it needs both legs of that path (the
+    Core WebSocket and the Supervisor API) and is the call that surfaced the
+    race. Returns False on timeout so the caller can fail with context.
+    Transient errors are retried; bugs propagate.
+
+    Each attempt is capped by ``_ADDON_HA_LINK_PROBE_S`` and by the time left
+    on the deadline, so a single stalled attempt is abandoned and retried
+    rather than consuming the whole window. ``timeout`` is the ceiling up to
+    FastMCP's disconnect timeout: tearing down a cancelled attempt runs
+    shielded cleanup scopes (``client_disconnect_timeout``, 5s default) that
+    cancellation cannot interrupt, so the total can overshoot by a few seconds.
+    """
+    deadline = time.monotonic() + timeout
+    transient = _addon_link_transient_errors()
+    last_err: BaseException | None = None
+    attempts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        try:
+            probe_addon_ha_link(addon_mcp_url, min(remaining, _ADDON_HA_LINK_PROBE_S))
+        except transient as e:
+            if not _is_transient_link_error(e):
+                raise
+            last_err = e
+            # The e2e harness logs at INFO, so a DEBUG-only cause would leave a
+            # failed link reported with no explanation at all. First cause at
+            # INFO, the repeats at DEBUG so a slow boot stays quiet.
+            log = LOG.info if attempts == 1 else LOG.debug
+            log("Addon -> Home Assistant link not ready yet: %r", e)
+        else:
+            elapsed = int(time.monotonic() - (deadline - timeout))
+            LOG.info("Addon -> Home Assistant link ready after ~%ds", elapsed)
+            return True
+        # Never sleep past the deadline, so the loop does not add a whole
+        # extra poll interval on top of the budget.
+        time.sleep(min(_ADDON_HA_LINK_POLL_S, max(0.0, deadline - time.monotonic())))
+    LOG.error(
+        "Addon -> Home Assistant link never came up within %.0fs (last_exc=%r)",
+        timeout,
+        last_err,
+    )
+    return False
+
+
 def _http(
     method: str,
     url: str,
@@ -1402,7 +1806,7 @@ def _http(
         # names the specific validation that failed.
         try:
             err_body = e.read().decode()
-        except (OSError, UnicodeDecodeError):
+        except OSError, UnicodeDecodeError:
             err_body = ""
         LOG.error("%s %s → HTTP %s: %s", method, url, e.code, err_body)
         raise
@@ -1422,12 +1826,17 @@ def _wait_port(port: int, host: str = "127.0.0.1", timeout: float = 180.0) -> No
     raise TimeoutError(f"{host}:{port} did not open within {timeout}s")
 
 
-def _wait_http_ok(url: str, timeout: float = 300.0) -> None:
+def _wait_http_ok(url: str, timeout: float = 300.0, *, verify_ssl: bool = True) -> None:
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
+    context: ssl.SSLContext | None = None
+    if url.startswith("https://") and not verify_ssl:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=5.0) as resp:
+            with urllib.request.urlopen(url, timeout=5.0, context=context) as resp:
                 if resp.status == 200:
                     return
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
@@ -1682,14 +2091,48 @@ def boot_haos_qemu(image_path: Path, serial_log: Path | None = None) -> Iterator
             proc.wait()
 
 
+def _poll_sleep(deadline: float) -> None:
+    """Sleep up to 10s, never past ``deadline`` (mirrors the bake's probe budget)."""
+    time.sleep(max(0.0, min(10.0, deadline - time.monotonic())))
+
+
+def _is_transient_supervisor_info_error(err: Any) -> bool:
+    """Return whether a failed ``supervisor/api`` read frame is worth re-polling.
+
+    Mirrors ``build_image._is_transient_supervisor_readiness_error``: while
+    Supervisor restarts, Core's proxy answers with no code, ``unknown_command``
+    (hassio handler not yet registered) or a blank ``unknown_error``, and
+    Supervisor's own middleware answers ``System is not ready with state: ...``
+    until it accepts API calls. Anything else (``unauthorized``, a validation
+    error, ...) is a permanent failure the caller must surface at once.
+    """
+    if not isinstance(err, dict):
+        return True
+    code = err.get("code")
+    if code is None or code == "unknown_command":
+        return True
+    if code != "unknown_error":
+        return False
+    message = err.get("message")
+    return not message or (
+        isinstance(message, str)
+        and message.startswith("System is not ready with state: ")
+    )
+
+
 def _recv_supervisor_info_frame(
-    ws: Any, info_id: int, deadline: float
+    ws: Any,
+    info_id: int,
+    deadline: float,
+    *,
+    endpoint: str = "/supervisor/info",
 ) -> tuple[dict | None, str | None]:
-    """Read frames until the ``/supervisor/info`` answer for ``info_id``.
+    """Read frames until the ``endpoint`` answer for ``info_id``.
 
     Returns ``(result, None)`` on success, ``(None, error)`` on a transient
-    Supervisor failure frame, or ``(None, None)`` if the deadline passes with no
-    matching frame.
+    Supervisor failure frame (see ``_is_transient_supervisor_info_error``), or
+    ``(None, None)`` if the deadline passes with no matching frame. A permanent
+    failure frame raises ``RuntimeError`` immediately.
     """
     while time.monotonic() < deadline:
         remaining = max(deadline - time.monotonic(), 1.0)
@@ -1703,14 +2146,15 @@ def _recv_supervisor_info_frame(
             resp = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError(
-                f"supervisor/api /supervisor/info: malformed WS frame: "
-                f"{exc} (raw={raw!r})"
+                f"supervisor/api {endpoint}: malformed WS frame: {exc} (raw={raw!r})"
             ) from exc
         if resp.get("id") != info_id:
             continue
         if not resp.get("success", False):
             err = resp.get("error") or resp
-            return None, f"supervisor/api /supervisor/info failed: {err!r}"
+            if not _is_transient_supervisor_info_error(err):
+                raise RuntimeError(f"supervisor/api {endpoint} failed: {err!r}")
+            return None, f"supervisor/api {endpoint} failed: {err!r}"
         return resp.get("result") or {}, None
     return None, None
 
@@ -1728,7 +2172,7 @@ def _wait_supervisor_update_done(
     head. ``/store/reload`` and ``/addons/{slug}/update`` are both
     SUPERVISOR_UPDATED-guarded and error ("supervisor needs to be updated
     first" / "No update available", #1594) if they fire while need_update is
-    still True. Mirror ``build_image._wait_supervisor_ready``: wait until
+    still True. Mirror ``build_image.wait_supervisor_ready``: wait until
     update_available is false (and a version_latest is present, so a pre-fetch
     latest=None does not read as a false clear).
 
@@ -1765,7 +2209,7 @@ def _wait_supervisor_update_done(
         if error is not None:
             last_error = error
             log.debug("Transient /supervisor/info failure: %s", last_error)
-            time.sleep(10.0)
+            _poll_sleep(deadline)
             continue
         if result is None:
             break
@@ -1780,11 +2224,81 @@ def _wait_supervisor_update_done(
             result.get("version"),
             result.get("version_latest"),
         )
-        time.sleep(10.0)
+        _poll_sleep(deadline)
     suffix = f"; last error: {last_error}" if last_error else ""
     raise TimeoutError(
         f"Supervisor did not finish self-updating before the update deadline{suffix}"
     )
+
+
+def _wait_supervisor_running(
+    ws: Any,
+    deadline: float,
+    next_id: Callable[[], int],
+    *,
+    log: logging.Logger = LOG,
+) -> None:
+    """Poll the Supervisor root ``/info`` until its core state is ``running``.
+
+    Supervisor 2026.09.3+ (home-assistant/supervisor#7194) rejects app
+    start/restart/rebuild/update with a 503 ("Supervisor is not ready to
+    perform this operation") until it has finished its own boot sequence.
+    Core answers its API well before that point, so the harness reaches
+    ``/addons/{slug}/update`` while Supervisor is still starting apps.
+    ``/supervisor/info`` does not carry the state; the root ``/info`` does.
+    Same frame tolerance as ``_wait_supervisor_update_done``.
+    """
+    last_error: str | None = None
+    last_state: object = None
+    while time.monotonic() < deadline:
+        info_id = next_id()
+        ws.send(
+            json.dumps(
+                {
+                    "id": info_id,
+                    "type": "supervisor/api",
+                    "endpoint": "/info",
+                    "method": "get",
+                    "timeout": 30,
+                }
+            )
+        )
+        result, error = _recv_supervisor_info_frame(
+            ws, info_id, deadline, endpoint="/info"
+        )
+        if error is not None:
+            last_error = error
+            log.debug("Transient /info failure: %s", last_error)
+            _poll_sleep(deadline)
+            continue
+        if result is None:
+            break
+        last_state = result.get("state")
+        if last_state == "running":
+            log.info("Supervisor core state is running; proceeding")
+            return
+        log.info("Supervisor core state is %r; waiting before app ops", last_state)
+        _poll_sleep(deadline)
+    suffix = f"; last error: {last_error}" if last_error else ""
+    raise TimeoutError(
+        f"Supervisor did not reach the running state before the update deadline "
+        f"(last state: {last_state!r}){suffix}"
+    )
+
+
+# Error texts Supervisor returns for conditions that clear on their own within
+# seconds: a per-addon job-group collision, and (2026.09.3+, supervisor#7194)
+# the 503 for app lifecycle calls made before its core state is RUNNING.
+_TRANSIENT_SUPERVISOR_JOB_ERRORS = (
+    "another job is running",
+    "not ready to perform this operation",
+)
+
+
+def _is_transient_supervisor_job_error(message: str) -> bool:
+    """Return whether a Supervisor job rejection is worth retrying shortly."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _TRANSIENT_SUPERVISOR_JOB_ERRORS)
 
 
 def _authenticate_ws_supervisor(ws: Any, token: str) -> None:
@@ -1884,7 +2398,7 @@ def trigger_dev_addon_update(
         _await_supervisor_ws_result(ws, msg_id, op_endpoint, op_deadline)
 
     def _supervisor_post_with_job_retry(
-        endpoint: str, op_timeout: int, *, data: dict | None = None
+        endpoint: str, op_timeout: float, *, data: dict | None = None
     ) -> None:
         """POST a Supervisor endpoint, retrying the transient per-addon
         ``Another job is running for job group ...`` collision.
@@ -1898,10 +2412,12 @@ def trigger_dev_addon_update(
         to N*op_timeout). Each attempt uses a fresh ``_next_id()`` so HA Core's
         ERR_ID_REUSE guard never trips.
 
-        The collision is matched as a case-insensitive substring on the error
-        text Supervisor returns (surfaced by ``_await_supervisor_result`` as the
-        ``RuntimeError`` message); any other failure is re-raised immediately,
-        so this never masks a real error.
+        The collision, and Supervisor's not-ready 503 (see
+        ``_wait_supervisor_running``), are matched as case-insensitive
+        substrings on the error text Supervisor returns (surfaced by
+        ``_await_supervisor_result`` as the ``RuntimeError`` message); any
+        other failure is re-raised immediately, so this never masks a real
+        error.
         """
         retry_deadline = time.monotonic() + 60
         attempt = 0
@@ -1923,11 +2439,11 @@ def trigger_dev_addon_update(
                 return
             except RuntimeError as err:
                 if (
-                    "another job is running" in str(err).lower()
+                    _is_transient_supervisor_job_error(str(err))
                     and time.monotonic() < retry_deadline
                 ):
                     LOG.warning(
-                        "Supervisor %s collided with an in-flight job-group job "
+                        "Supervisor %s rejected a transient condition "
                         "(attempt %d): %s; waiting 5s and retrying",
                         endpoint,
                         attempt,
@@ -1941,6 +2457,7 @@ def trigger_dev_addon_update(
         _authenticate_ws_supervisor(ws, token)
 
         _wait_supervisor_update_done(ws, time.monotonic() + timeout, _next_id)
+        _wait_supervisor_running(ws, time.monotonic() + timeout, _next_id)
 
         # Reload the Supervisor store BEFORE asking for the update: the
         # refresh bumped the local addon's version, but Supervisor's persisted

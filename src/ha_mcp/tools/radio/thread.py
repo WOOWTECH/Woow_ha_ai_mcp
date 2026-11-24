@@ -4,10 +4,10 @@ Thread is network-scoped, not per-device: operations target the Thread network
 and its border router rather than an individual node. Border-router writes use
 the ``otbr/*`` WebSocket API and take an OTBR ``extended_address`` — resolved
 from ``otbr/info`` when the caller omits it, which covers the common
-single-OTBR setup. Dataset listing and router discovery use the
+single-OTBR setup. Dataset management and router discovery use the
 integration-wide ``thread/*`` API. When no OTBR is configured the read-only
-``network_status`` degrades to an ``available: False`` payload; the write
-actions raise instead so an unconfigured integration is not a silent no-op.
+``network_status`` degrades to an ``available: False`` payload; border-router
+writes raise instead so an unconfigured integration is not a silent no-op.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from typing import Any
 from .base import (
     ActionSpec,
     integration_not_found,
-    integration_required,
     ok,
     resolve_entry_id,
     ws_call,
@@ -30,6 +29,17 @@ SUPPORTED: dict[str, ActionSpec] = {
     ),
     "list_datasets": ActionSpec(
         "List stored Thread operational datasets (the preferred network + others)."
+    ),
+    "set_preferred_dataset": ActionSpec(
+        "Make a stored dataset preferred in Home Assistant. Does not change the "
+        "OTBR's active network; use set_network for that.",
+        required=("dataset_id",),
+    ),
+    "delete_dataset": ActionSpec(
+        "Delete a stored Thread dataset. To delete the preferred dataset, "
+        "make another dataset preferred first.",
+        destructive=True,
+        required=("dataset_id",),
     ),
     "discover_routers": ActionSpec(
         "Start mDNS discovery of Thread border routers. Results arrive as an "
@@ -60,17 +70,19 @@ SUPPORTED: dict[str, ActionSpec] = {
 }
 
 
-async def _resolve_extended_address(client: Any, args: dict[str, Any]) -> str | None:
+async def _resolve_extended_address(client: Any, args: dict[str, Any]) -> str:
     """Return the target OTBR extended address.
 
     Uses the caller-supplied value, else the first (typically only) border
-    router reported by ``otbr/info``. Returns None when no OTBR is present.
+    router reported by ``otbr/info``. Core answers ``otbr/info`` with an error
+    when no OTBR entry is loaded, which ``ws_call`` raises, so a successful
+    reply always names at least one border router.
     """
     addr = args.get("extended_address")
     if addr:
         return str(addr)
     info = await ws_call(client, "otbr/info")
-    return next(iter(info or {}), None)
+    return str(next(iter(info)))
 
 
 async def handle(client: Any, action: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -114,12 +126,20 @@ async def handle(client: Any, action: str, args: dict[str, Any]) -> dict[str, An
         )
         return ok("thread", "add_dataset", result=result)
 
-    # Remaining actions (create_network / set_network / set_channel) are writes
-    # targeting a specific OTBR border router; an absent OTBR must error, not
-    # degrade to a no-op success.
+    if action in ("set_preferred_dataset", "delete_dataset"):
+        result = await ws_call(
+            client, f"thread/{action}", dataset_id=args.get("dataset_id")
+        )
+        return ok("thread", action, result=result)
+
+    return await _handle_otbr(client, action, args)
+
+
+async def _handle_otbr(
+    client: Any, action: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Execute a border-router write against a configured OTBR."""
     extended_address = await _resolve_extended_address(client, args)
-    if not extended_address:
-        integration_required("thread", "otbr")
     ctx = {"extended_address": extended_address}
 
     if action == "create_network":

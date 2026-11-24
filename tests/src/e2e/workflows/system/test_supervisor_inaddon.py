@@ -24,16 +24,13 @@ inside HAOS, with assertions adapted for live responses
   per assertion. The 401 wire-contract coverage stays in the mock-tier
   suite; this module covers the 403 path against a real
   insufficient-role token (the SSH addon's ``hassio_role: default``).
-
-See ``docs/superpowers/specs/2026-05-18-1349-closeout-design.md`` — the
-"Token-missing + bad-token paths" section under spec-review fixes for
-the design rationale.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 import pytest
 from haos_runtime import HA_MCP_DEV_ADDON_SLUG
@@ -41,6 +38,10 @@ from haos_runtime import HA_MCP_DEV_ADDON_SLUG
 from ...utilities.assertions import MCPAssertions
 
 pytestmark = [pytest.mark.inaddon_only]
+
+# An hours_back reaching before 1970, which the window defines as the whole
+# journal, so it holds entries whenever the journal does.
+_WHOLE_JOURNAL = 10**12
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,43 @@ class TestGetLogsSystemServiceReal:
         assert result.get("total_lines", 0) >= 1, (
             f"Expected total_lines >= 1 for service={service!r}, "
             f"got total_lines={result.get('total_lines')!r}"
+        )
+
+
+@pytest.mark.system
+class TestGetLogsHoursBackReal:
+    """hours_back sends the journal a time Range through Supervisor.
+
+    The page reads themselves run on every HAOS lane, in
+    ``haos_only/test_supervisor_log_window.py``; the dev app's own log is
+    only certain to have entries here, where it is the server under test.
+    """
+
+    @pytest.mark.parametrize(
+        ("source", "slug"),
+        [
+            ("system_service", "supervisor"),
+            ("supervisor", HA_MCP_DEV_ADDON_SLUG),
+        ],
+    )
+    async def test_a_whole_journal_window_has_entries(
+        self, mcp_client, source: str, slug: str
+    ) -> None:
+        """Supervisor and the dev app both have journal entries on a lane."""
+        async with MCPAssertions(mcp_client) as mcp:
+            result = await mcp.call_tool_success(
+                "ha_get_logs",
+                {
+                    "source": source,
+                    "slug": slug,
+                    "hours_back": _WHOLE_JOURNAL,
+                    "limit": 500,
+                },
+            )
+
+        assert result["log"], "Expected entries in the journal"
+        assert datetime.fromisoformat(result["window_start"]) < datetime.fromisoformat(
+            result["read_at"]
         )
 
 
@@ -386,8 +424,8 @@ class TestMockResilienceReal:
 
     # NOTE: ``test_insufficient_role_supervisor_call_surfaces_403`` was
     # deleted in this commit. Premise was: pass empty ``options={}`` to
-    # ha_manage_addon to surface Supervisor's role-check 403. Reality
-    # (verified on PR #1375 CI 287c5ced): ha_manage_addon's TOOL-side
+    # ha_manage_app to surface Supervisor's role-check 403. Reality
+    # (verified on PR #1375 CI 287c5ced): ha_manage_app's TOOL-side
     # input validation fires FIRST and returns VALIDATION_FAILED before
     # the Supervisor call is even made — "Must provide either 'path'
     # for proxy mode or at least one config parameter (options/network/

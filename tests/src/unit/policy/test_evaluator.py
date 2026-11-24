@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 from ha_mcp.policy.evaluator import (
@@ -7,8 +9,9 @@ from ha_mcp.policy.evaluator import (
     iter_path_values,
     match_predicate,
     match_rule,
+    normalize_stringified_containers,
 )
-from ha_mcp.policy.model import Policy, Predicate, Rule
+from ha_mcp.policy.model import Policy, Predicate, PredicateOp, Rule
 
 
 # --- iter_path_values ---
@@ -82,13 +85,14 @@ class TestMatchPredicate:
     def test_missing_path_never_matches_except_exists(self):
         # Use op-appropriate values so the Predicate field_validator doesn't
         # reject at construction; we're testing the matcher's missing-path branch.
-        for op, value in [
+        cases: list[tuple[PredicateOp, Any]] = [
             ("eq", "anything"),
             ("in", ["anything"]),
             ("regex", "anything"),
             ("contains", "anything"),
             ("gt", 1),
-        ]:
+        ]
+        for op, value in cases:
             p = Predicate(path="args.x", op=op, value=value)
             assert match_predicate(p, {}) is False
 
@@ -100,6 +104,73 @@ class TestMatchPredicate:
         assert match_predicate(p_gt, {"x": "not-a-number"}) is False
         p_lt = Predicate(path="args.x", op="lt", value=5)
         assert match_predicate(p_lt, {"x": "not-a-number"}) is False
+
+
+# --- normalize_stringified_containers ---
+class TestNormalizeStringifiedContainers:
+    def test_top_level_json_object_string_is_parsed(self):
+        assert normalize_stringified_containers(
+            {"selector": '{"domain": "light"}'}
+        ) == {"selector": {"domain": "light"}}
+
+    def test_json_array_string_is_parsed(self):
+        assert normalize_stringified_containers({"area_ids": '["salon"]'}) == {
+            "area_ids": ["salon"]
+        }
+
+    def test_nested_stringified_value_is_also_parsed(self):
+        assert normalize_stringified_containers(
+            {"selector": {"area_ids": '["salon"]'}}
+        ) == {"selector": {"area_ids": ["salon"]}}
+
+    def test_stringified_value_inside_a_list_is_parsed(self):
+        assert normalize_stringified_containers(
+            {"operations": ['{"entity_id": "light.one"}']}
+        ) == {"operations": [{"entity_id": "light.one"}]}
+
+    def test_plain_string_passes_through_unchanged(self):
+        assert normalize_stringified_containers({"action": "off"}) == {"action": "off"}
+
+    def test_jinja_template_string_passes_through_unchanged(self):
+        template = "{{ states('sensor.x') }}"
+        assert normalize_stringified_containers({"template": template}) == {
+            "template": template
+        }
+
+    def test_malformed_container_like_string_left_alone_not_raised(self):
+        """Policy evaluation is not the place to surface a JSON syntax
+        error -- that belongs to the tool's own validation, with a properly
+        attributed parameter name."""
+        malformed = '{"domain": "light"'
+        assert normalize_stringified_containers({"selector": malformed}) == {
+            "selector": malformed
+        }
+
+    def test_non_string_scalars_pass_through_unchanged(self):
+        assert normalize_stringified_containers(
+            {"validate_first": True, "timeout_seconds": 5, "extra": None}
+        ) == {"validate_first": True, "timeout_seconds": 5, "extra": None}
+
+    def test_deeply_nested_input_propagates_recursion_error(self):
+        """A RecursionError from this function's OWN dict/list recursion
+        (not json.loads's, which loads_if_json_container_str already
+        guards -- so a still-stringified value can never reach this
+        function's own recursion at deep nesting) must PROPAGATE, not be
+        swallowed. Swallowing it would let a security gate evaluate (and
+        hash) unnormalized args and silently ALLOW a call a rule scoped to
+        a nested field should have required approval for -- the caller
+        (PolicyMiddleware.on_call_tool) is responsible for catching this
+        and failing the call closed, matching the corrupt-policy-file
+        precedent it already applies.
+        """
+        import sys
+
+        nested: object = "leaf"
+        for _ in range(sys.getrecursionlimit() + 100):
+            nested = {"nested": nested}
+
+        with pytest.raises(RecursionError):
+            normalize_stringified_containers({"selector": nested})
 
 
 # --- match_rule ---
@@ -166,6 +237,37 @@ class TestEvaluate:
         first = find_matching_rule("ha_call_service", {}, p)
         assert first is not None
         assert first.remember_minutes == 10
+
+    def test_any_of_multiple_same_tool_rules_gates(self):
+        """Each UI 'condition' persists as its own rule; the tool gates if ANY
+        of them matches (OR across rules), even when the others don't. This is
+        the semantics behind the ALL->ANY policy-editor change (PR #1993)."""
+        p = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_call_service",
+                    when=[Predicate(path="args.domain", op="eq", value="lock")],
+                ),
+                Rule(
+                    tool_name="ha_call_service",
+                    when=[
+                        Predicate(
+                            path="args.domain", op="eq", value="alarm_control_panel"
+                        )
+                    ],
+                ),
+            ],
+        )
+        assert (
+            evaluate("ha_call_service", {"domain": "lock"}, p)
+            == Verdict.REQUIRE_APPROVAL
+        )
+        assert (
+            evaluate("ha_call_service", {"domain": "alarm_control_panel"}, p)
+            == Verdict.REQUIRE_APPROVAL
+        )
+        # Neither condition matches -> allowed.
+        assert evaluate("ha_call_service", {"domain": "light"}, p) == Verdict.ALLOW
 
 
 # --- case-insensitive string comparison ---
@@ -370,3 +472,325 @@ class TestWsCommandEscapeHatch:
             evaluate("ha_call_service", {"ws_command": "repairs/ignore_issue"}, p)
             == Verdict.REQUIRE_APPROVAL
         )
+
+
+class TestBulkSelectorFailSafe:
+    """Structural selectors cannot bypass operation-shaped approval rules."""
+
+    def test_operations_rule_force_gates_selector(self):
+        """A selector is gated when its eventual leaves cannot be inspected yet."""
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_bulk_control",
+                    when=[
+                        Predicate(
+                            path="args.operations.*.entity_id",
+                            op="regex",
+                            value=r"^lock\.",
+                        )
+                    ],
+                )
+            ]
+        )
+
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "light", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+
+    def test_wildcard_operations_rule_force_gates_selector(self):
+        """A wildcard path that reaches operations rows is not a literal-prefix dodge.
+
+        ``args.*.*.entity_id`` fans out over every top-level key (including
+        ``operations``) and every item at the next level, so it matches
+        ``operations[i].entity_id`` exactly like ``args.operations.*.entity_id``
+        does — but as a bare string it doesn't start with "args.operations".
+        The fail-safe must recognize the wildcard can reach unresolved
+        operation rows, not just the literal prefix, or a selector call could
+        bypass approval a rule like this would have required.
+        """
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_bulk_control",
+                    when=[
+                        Predicate(
+                            path="args.*.*.entity_id",
+                            op="regex",
+                            value=r"^lock\.",
+                        )
+                    ],
+                )
+            ]
+        )
+
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "light", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+        # The same wildcard rule keeps its normal, precise semantics for the
+        # operations-mode calls it was actually written to inspect.
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"operations": [{"entity_id": "light.sofa", "action": "off"}]},
+                policy,
+            )
+            == Verdict.ALLOW
+        )
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"operations": [{"entity_id": "lock.front", "action": "lock"}]},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+
+    def test_single_wildcard_to_dict_field_stays_conditional(self):
+        """A single-wildcard path landing on a dict field is not operations-sensitive.
+
+        ``args.*.domain`` CAN yield ``args.selector.domain`` (``selector`` is
+        a dict), but it can never yield anything from ``args.operations``
+        (a list) — ``walk()`` only descends into a literal segment like
+        ``domain`` when the current node is a dict. Treating every leading
+        wildcard as operations-sensitive (the bug the previous fix
+        introduced) would force-gate a "light" selector call for a rule that
+        was written to conditionally match only ``selector.domain == "lock"``
+        and, after ``find_matching_rule`` correctly finds no match, has
+        nothing left to reach in ``args.operations`` either.
+        """
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_bulk_control",
+                    when=[Predicate(path="args.*.domain", op="eq", value="lock")],
+                )
+            ]
+        )
+
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "light", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.ALLOW
+        )
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "lock", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+
+    def test_stringified_selector_argument_would_bypass_rules_pre_normalization(self):
+        """Documents the exact bypass a raw ``evaluate()`` call is vulnerable to.
+
+        This is what ``evaluate()`` sees BEFORE ``PolicyMiddleware`` applies
+        ``normalize_stringified_containers`` (see test_middleware_gating.py's
+        end-to-end coverage) -- a client that sends ``selector`` as a JSON
+        string (Claude Desktop stdio does this; see
+        ``tools/coercion.py``'s ``JSON_STRING_COERCION``) makes
+        ``args.selector.domain`` yield nothing, so a rule scoped to
+        ``selector.domain == "lock"`` never matches even for a lock
+        selector. This test pins that ``evaluate()`` itself has no
+        opinion on wire shape -- normalization is the middleware's job,
+        not this pure function's.
+        """
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_bulk_control",
+                    when=[
+                        Predicate(path="args.selector.domain", op="eq", value="lock")
+                    ],
+                )
+            ]
+        )
+        stringified_args = {"selector": '{"domain": "lock", "area_ids": ["entry"]}'}
+
+        assert evaluate("ha_bulk_control", stringified_args, policy) == Verdict.ALLOW
+
+    def test_selector_remains_allowed_without_applicable_rules(self):
+        """Unrelated or absent rules preserve the policy engine's allow default."""
+        selector_args = {"selector": {"domain": "light", "area_ids": ["salon"]}}
+
+        assert evaluate("ha_bulk_control", selector_args, Policy()) == Verdict.ALLOW
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                selector_args,
+                Policy(rules=[Rule(tool_name="ha_config_set_dashboard")]),
+            )
+            == Verdict.ALLOW
+        )
+
+    def test_operations_calls_keep_normal_predicate_semantics(self):
+        """The selector fail-safe does not broaden ordinary operations calls."""
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_bulk_control",
+                    when=[
+                        Predicate(
+                            path="args.operations.*.entity_id",
+                            op="regex",
+                            value=r"^lock\.",
+                        )
+                    ],
+                )
+            ]
+        )
+
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"operations": [{"entity_id": "light.sofa", "action": "off"}]},
+                policy,
+            )
+            == Verdict.ALLOW
+        )
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"operations": [{"entity_id": "lock.front", "action": "lock"}]},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+
+    def test_wildcard_tool_rule_force_gates_selector(self):
+        """A "*" rule counts too, not just one scoped to ha_bulk_control by name.
+
+        ``match_rule`` treats ``tool_name="*"`` as applying to every tool, so
+        an operator-wide rule that reaches unresolved operation rows (e.g.
+        ``args.operations.*.entity_id``) signals MORE caution than a
+        service-scoped one, not less. Every other test in this class uses
+        ``tool_name="ha_bulk_control"`` explicitly, leaving the fail-safe's
+        own ``rule.tool_name in ("ha_bulk_control", "*")`` "*" arm unexercised
+        -- a regression there (e.g. dropping the "*" case) would let a
+        selector call bypass a broad operator-wide gate silently.
+        """
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="*",
+                    when=[
+                        Predicate(
+                            path="args.operations.*.entity_id",
+                            op="regex",
+                            value=r"^lock\.",
+                        )
+                    ],
+                )
+            ]
+        )
+
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "light", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+
+    def test_nonmatching_selector_only_rule_stays_allowed(self):
+        """A rule fully expressed over selector fields keeps its condition.
+
+        The fail-safe must only widen rules that depend on unresolved
+        ``args.operations`` data. A rule scoped to
+        ``args.selector.domain == "lock"`` already got a precise match
+        attempt in ``find_matching_rule``; a "light" selector call must not
+        be swept into approval just because a same-named rule exists.
+        """
+        policy = Policy(
+            rules=[
+                Rule(
+                    tool_name="ha_bulk_control",
+                    when=[
+                        Predicate(path="args.selector.domain", op="eq", value="lock")
+                    ],
+                )
+            ]
+        )
+
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "light", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.ALLOW
+        )
+        assert (
+            evaluate(
+                "ha_bulk_control",
+                {"selector": {"domain": "lock", "area_ids": ["salon"]}},
+                policy,
+            )
+            == Verdict.REQUIRE_APPROVAL
+        )
+
+
+class TestListAndCommaArguments:
+    """Require-approval mode: Home Assistant reads a list argument as its
+    items and a comma-separated string as its stripped parts, so a gate on
+    one value must hold for those shapes too, or the shape bypasses it."""
+
+    GATE = Policy(
+        rules=[
+            Rule(
+                tool_name="ha_get_history",
+                when=[
+                    Predicate(path="args.entity_ids", op="eq", value="sun.sun"),
+                    Predicate(path="args.source", op="eq", value="statistics"),
+                ],
+            )
+        ]
+    )
+
+    @pytest.mark.parametrize(
+        "entity_ids",
+        [
+            ["sun.sun"],
+            "sun.sun,zone.home",
+            [["sun.sun"]],
+            ["zone.home, sun.sun"],
+        ],
+    )
+    def test_every_shape_of_the_gated_entity_is_gated(self, entity_ids):
+        args = {"entity_ids": entity_ids, "source": "statistics"}
+        assert evaluate("ha_get_history", args, self.GATE) == Verdict.REQUIRE_APPROVAL
+
+    @pytest.mark.parametrize("entity_ids", [["zone.home"], "zone.home,light.a"])
+    def test_other_entities_still_run(self, entity_ids):
+        args = {"entity_ids": entity_ids, "source": "statistics"}
+        assert evaluate("ha_get_history", args, self.GATE) == Verdict.ALLOW
+
+    @pytest.mark.parametrize(
+        ("op", "value", "arg"),
+        [
+            # A negated op matched the whole list before; reading its items
+            # must not lose that match.
+            ("neq", "sun.sun", ["sun.sun"]),
+            ("not_in", ["sun.sun"], ["sun.sun"]),
+            # Surrounding whitespace without a comma is stripped too.
+            ("eq", "sun.sun", " sun.sun"),
+        ],
+    )
+    def test_op_matches_the_whole_value_or_a_part(self, op, value, arg):
+        predicate = Predicate(path="args.entity_ids", op=op, value=value)
+        assert match_predicate(predicate, {"entity_ids": arg})

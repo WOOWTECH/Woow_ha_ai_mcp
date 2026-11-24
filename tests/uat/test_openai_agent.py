@@ -22,13 +22,26 @@ class TestArgParsing:
     """Test CLI argument parsing."""
 
     def test_missing_required_args_exits(self):
-        """Script exits with error when required args are missing."""
+        """Script exits with argparse's usage error when required args are missing."""
         result = subprocess.run(
             [sys.executable, str(AGENT_SCRIPT)],
             capture_output=True,
             text=True,
+            check=False,
         )
-        assert result.returncode != 0
+        # 2 is argparse's usage-error code; any other non-zero exit means the
+        # script failed somewhere other than argument validation — before it
+        # (an import or startup error) or after it.
+        assert result.returncode == 2, f"stderr: {result.stderr}"
+        # Match the whole missing-arguments list in one assertion. Substring
+        # checks per flag would not discriminate: the usage block above the
+        # error prints every flag either way, so dropping required=True from
+        # one of them still leaves its name in stderr — as "[--base-url URL]".
+        # argparse emits this line unwrapped, so an exact match is safe.
+        assert (
+            "the following arguments are required: "
+            "--prompt, --mcp-config, --base-url" in result.stderr
+        ), f"stderr: {result.stderr}"
 
     def test_help_flag(self):
         """Script shows help text."""
@@ -36,11 +49,42 @@ class TestArgParsing:
             [sys.executable, str(AGENT_SCRIPT), "--help"],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode == 0
         assert "--prompt" in result.stdout
         assert "--base-url" in result.stdout
         assert "--mcp-config" in result.stdout
+
+
+class TestAgentLogsReachStderr:
+    """The agent's log lines are the BAT runner's only view of a run: the
+    runner copies ``[tool]`` lines into ``tool_trace`` and shows stderr for a
+    failed phase. If they never reach stderr, a failed run reports nothing."""
+
+    def test_warmup_failure_is_reported_on_stderr(self):
+        """A backend that is down fails the warmup; the reason must be on stderr."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(AGENT_SCRIPT),
+                "--prompt",
+                "hi",
+                "--mcp-config",
+                "unused.json",
+                "--base-url",
+                "http://127.0.0.1:9/v1",
+                "--model",
+                "any-model",
+                "--timeout",
+                "5",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1, f"stderr: {result.stderr}"
+        assert "Model warmup failed" in result.stderr, f"stderr: {result.stderr}"
 
 
 class TestToolConversion:
@@ -51,7 +95,7 @@ class TestToolConversion:
         mcp_tool = MagicMock()
         mcp_tool.name = "search_entities"
         mcp_tool.description = "Search for entities"
-        mcp_tool.inputSchema = {
+        mcp_tool.input_schema = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search term"},
@@ -81,7 +125,7 @@ class TestToolConversion:
         mcp_tool = MagicMock()
         mcp_tool.name = "get_version"
         mcp_tool.description = "Get HA version"
-        mcp_tool.inputSchema = None
+        mcp_tool.input_schema = None
 
         result = openai_agent.mcp_tool_to_openai(mcp_tool)
 

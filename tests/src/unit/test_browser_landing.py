@@ -4,22 +4,24 @@ import logging
 
 import httpx
 import pytest
-from fastmcp import FastMCP
 
 from ha_mcp.__main__ import ProbeAccessLogFilter, register_browser_landing
-from ha_mcp.browser_landing import _registered_landing_paths
+from ha_mcp._vendor.fastmcp import FastMCP
 
 
 @pytest.fixture(autouse=True)
-def _clear_landing_registry():
-    """Clear the registered-paths set and access-log filters between tests."""
-    _registered_landing_paths.clear()
-    yield
-    _registered_landing_paths.clear()
+def _clear_access_log_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test a uvicorn access logger without probe filters.
+
+    Registration is remembered per server instance, and every test builds its
+    own, so only the process-wide uvicorn logger needs putting back.
+    """
     access_logger = logging.getLogger("uvicorn.access")
-    access_logger.filters = [
-        f for f in access_logger.filters if not isinstance(f, ProbeAccessLogFilter)
-    ]
+    monkeypatch.setattr(
+        access_logger,
+        "filters",
+        [f for f in access_logger.filters if not isinstance(f, ProbeAccessLogFilter)],
+    )
 
 
 @pytest.fixture
@@ -134,12 +136,6 @@ def test_filter_drops_405_with_query_and_trailing_slash():
     assert f.filter(_access_record("GET", "/private_abc/?x=1", 405)) is False
 
 
-def test_filter_keeps_405_when_drop_disabled_for_sse():
-    """SSE mode (drop_mcp_405=False) keeps the 405 line — there it's a real fault."""
-    f = ProbeAccessLogFilter("/mcp", drop_mcp_405=False)
-    assert f.filter(_access_record("GET", "/mcp", 405)) is True
-
-
 def test_filter_keeps_post_200_tool_call():
     """Real POST tool-call access lines are never dropped."""
     f = ProbeAccessLogFilter("/mcp")
@@ -223,15 +219,12 @@ async def test_get_405_logs_annotated_note(mcp_app, caplog):
             resp = await client.get("/mcp")
 
     assert resp.status_code == 405
-    assert any(
-        "NORMAL for most non-SSE connections" in r.getMessage() for r in caplog.records
-    )
-
-
-def test_filter_drops_favicon_404_even_in_sse_mode():
-    """Favicon 404s are dropped regardless of drop_mcp_405 (SSE mode included)."""
-    f = ProbeAccessLogFilter("/mcp", drop_mcp_405=False)
-    assert f.filter(_access_record("GET", "/favicon.ico", 404)) is False
+    landing = [
+        r.getMessage() for r in caplog.records if r.name == "ha_mcp.browser_landing"
+    ]
+    assert any("NORMAL for most non-SSE connections" in m for m in landing)
+    # The path is the secret path on the in-process server and the app.
+    assert not any("/mcp" in m for m in landing)
 
 
 def test_filter_drops_favicon_with_query_and_slash():
@@ -270,17 +263,6 @@ def test_register_does_not_double_attach_same_path():
     access_logger = logging.getLogger("uvicorn.access")
     attached = [f for f in access_logger.filters if isinstance(f, ProbeAccessLogFilter)]
     assert len(attached) == 1
-
-
-def test_register_quiet_probe_log_false_keeps_mcp_405():
-    """quiet_probe_log=False (SSE) wires drop_mcp_405=False, so the attached filter
-    keeps a /mcp GET-405 instead of dropping it."""
-    server = FastMCP("test")
-    register_browser_landing(server, "/mcp", quiet_probe_log=False)
-    access_logger = logging.getLogger("uvicorn.access")
-    attached = [f for f in access_logger.filters if isinstance(f, ProbeAccessLogFilter)]
-    assert len(attached) == 1
-    assert attached[0].filter(_access_record("GET", "/mcp", 405)) is True
 
 
 @pytest.mark.asyncio

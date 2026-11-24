@@ -1,1145 +1,114 @@
 """
 Utility tools for Home Assistant MCP server.
 
-This module provides general-purpose utility tools including log access,
-template evaluation, and domain documentation retrieval.
+Template and condition evaluation. The log tools that used to share this module
+are in ``tools_logs`` and its helpers, split out under `.gemini/styleguide.md` §
+Tool Consolidation and Module Size.
 """
 
 import logging
-import re
-import time
-from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Literal, NoReturn
+from typing import Annotated, Any, NoReturn
 
-from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from .._version import is_running_in_addon
-from ..client.rest_client import (
-    HomeAssistantAPIError,
-    HomeAssistantAuthError,
-    HomeAssistantConnectionError,
-)
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+
+from ..client.exceptions import http_failure_status
+from ..client.rest_client import HomeAssistantCommandError, HomeAssistantCommandTimeout
+from ..client.websocket_client import get_websocket_client
+from ..error_wording import render_timed_out
 from ..errors import ErrorCode, create_error_response
-from .helpers import exception_to_structured_error, log_tool_usage, raise_tool_error
-from .util_helpers import (
-    add_timezone_metadata,
-    normalize_log_level,
+from .coercion import JSON_STRING_COERCION
+from .component_api import (
+    component_supports,
+    get_component_caps,
+    invalidate_caps,
+    is_unknown_command,
 )
+from .helpers import (
+    core_error_message,
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+)
+from .tool_hints import read_only_hints
 
 logger = logging.getLogger(__name__)
 
-# Fields to keep in compact logbook mode (strips attribute dictionaries
-# and other bulky fields that can cause context exhaustion — see #683)
-COMPACT_LOGBOOK_FIELDS = {
-    "when",
-    "entity_id",
-    "state",
-    "name",
-    "message",
-    "domain",
-    "context_id",
-    "source",
-}
+TEMPLATE_ERROR_SUGGESTIONS = [
+    "Fix the template at the reported line, if one is given, then evaluate it again",
+    "Use default values for missing data: {{ states('sensor.temp') | float(0) }}",
+    "Verify entity_ids exist using ha_get_state() or ha_search()",
+    "Pass values the template expects through 'variables'",
+]
+
+TEMPLATE_TIMEOUT_SUGGESTIONS = ["Simplify the template or raise 'timeout'"]
+
+CONDITION_ERROR_SUGGESTIONS = [
+    "Check the condition against the Home Assistant condition schema",
+    "Verify entity_ids exist using ha_get_state() or ha_search()",
+    "See ha_get_skill_guide for native condition examples",
+]
 
 
-# Supervisor-managed system services exposed via /<slug>/logs. Set mirrors
-# HA Core's hassio HTTP proxy ``PATHS_ADMIN`` whitelist in
-# ``homeassistant/components/hassio/http.py``. See #1116 (original 7-service
-# scope) and #1260 (cli added — proxy supported it the whole time).
-SYSTEM_SERVICE_SLUGS = frozenset(
-    {"supervisor", "host", "core", "dns", "audio", "cli", "multicast", "observer"}
-)
-
-DEFAULT_LIMIT = 50
-DEFAULT_LOG_LIMIT = 100
-# Journald window to request from Supervisor when a search filter is
-# active: matches are found within the fetched window only, so a
-# search over the caller's (often small) limit needs more history
-# behind it than the limit itself.
-SUPERVISOR_SEARCH_WINDOW_LINES = 2000
-MAX_LIMIT = 500
-
-# Regex to match log level at the start of a log line
-_LOG_LEVEL_RE = re.compile(
-    r"(?:^|\s)(DEBUG|INFO|WARNING|ERROR|CRITICAL)(?:\s|:|\])", re.IGNORECASE
-)
-
-VALID_LOG_LEVELS = ("ERROR", "WARNING", "INFO", "DEBUG")
-
-
-def _compact_logbook_entries(entries: list[Any]) -> list[dict[str, Any]]:
-    """Strip logbook entries to essential fields only.
-
-    Returns entries with only the fields in COMPACT_LOGBOOK_FIELDS,
-    filtering out any non-dict entries.
-    """
-    return [
-        {k: v for k, v in entry.items() if k in COMPACT_LOGBOOK_FIELDS}
-        for entry in entries
-        if isinstance(entry, dict)
-    ]
+def _render_outcome(
+    error: str,
+    report_errors: bool,
+    result: dict[str, Any],
+    diagnosis: dict[str, Any] | None,
+) -> tuple[str, bool]:
+    """The error to report for a failed render, and whether it timed out."""
+    if not result.get("no_verdict"):
+        return error, False
+    # HA sent no verdict. With report_errors it always sends one, so the render
+    # outran the wait; without it, silence is how HA answers a failed render.
+    # The in-process render, when there is one, is the only place the actual
+    # outcome is known.
+    if diagnosis is not None:
+        if diagnosis.get("error"):
+            return diagnosis["error"], False
+        if diagnosis.get("stage") == "timeout":
+            return error, True
+    return error, report_errors
 
 
 class UtilityTools:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    @staticmethod
-    def _coerce_limit(
-        limit: int | None,
-        default: int = DEFAULT_LIMIT,
-        suggestion_example: str = "50",
-    ) -> int:
-        """Validate a limit parameter, raising a structured tool error on failure."""
-        effective = limit if limit is not None else default
-        if effective < 1:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    f"limit must be at least 1, got {effective}",
-                    suggestions=[
-                        f"Provide limit as an integer (e.g., {suggestion_example})"
-                    ],
-                )
-            )
-        return min(effective, MAX_LIMIT)
-
-    @staticmethod
-    def _validate_log_level(level: str | None) -> str | None:
-        if level is None:
-            return None
-        level_upper = level.strip().upper()
-        if level_upper not in VALID_LOG_LEVELS:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    f"Invalid level '{level}'. Must be one of: {', '.join(VALID_LOG_LEVELS)}",
-                    suggestions=["Use level='ERROR' to see only errors"],
-                )
-            )
-        return level_upper
-
-    @staticmethod
-    def _collect_log_warnings(
-        source: str,
-        level: str | None,
-        entity_id: str | None,
-        end_time: str | None,
-        slug: str | None,
-        order: Literal["newest", "oldest"],
-    ) -> list[str]:
-        warnings: list[str] = []
-        if source == "logger" and order != "newest":
-            warnings.append(
-                "Parameter 'order' does not apply to source='logger' "
-                "(entries are sorted by integration name); ignored"
-            )
-        if source != "logbook" and any(p is not None for p in [entity_id, end_time]):
-            ignored = [
-                p
-                for p, v in [("entity_id", entity_id), ("end_time", end_time)]
-                if v is not None
-            ]
-            warnings.append(
-                f"Parameters {', '.join(ignored)} only apply to source='logbook'; "
-                f"ignored for source='{source}'"
-            )
-        if (
-            source in ("logbook", "logger", "supervisor", "system_service")
-            and level is not None
-        ):
-            warnings.append(
-                "Parameter 'level' only applies to source='system' or 'error_log'; "
-                f"ignored for source='{source}'"
-            )
-        if source not in ("supervisor", "system_service") and slug is not None:
-            warnings.append(
-                "Parameter 'slug' only applies to source='supervisor' or "
-                f"'system_service'; ignored for source='{source}'"
-            )
-        return warnings
-
-    @staticmethod
-    def _validate_log_slug(source: str, slug: str | None) -> None:
-        if source == "system_service":
-            if not slug:
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.VALIDATION_INVALID_PARAMETER,
-                        "The 'slug' parameter is required for source='system_service'",
-                        suggestions=[
-                            "Provide a service name, e.g. slug='supervisor' "
-                            f"(allowed: {', '.join(sorted(SYSTEM_SERVICE_SLUGS))})",
-                        ],
-                    )
-                )
-            if slug not in SYSTEM_SERVICE_SLUGS:
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.VALIDATION_INVALID_PARAMETER,
-                        f"Invalid system_service slug '{slug}'. Must be one of: "
-                        f"{', '.join(sorted(SYSTEM_SERVICE_SLUGS))}",
-                        suggestions=[
-                            "Pick a valid service name (e.g. 'supervisor', 'host')",
-                            "For add-on container logs use source='supervisor' with "
-                            + "the add-on slug instead",
-                        ],
-                    )
-                )
-        elif source == "supervisor" and not slug:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    "The 'slug' parameter is required for source='supervisor'",
-                    suggestions=[
-                        "Provide the add-on slug, e.g. slug='core_mosquitto'",
-                        "Use ha_get_addon() to list installed add-on slugs",
-                    ],
-                )
-            )
-
-    async def _fetch_log_source(
-        self,
-        source: str,
-        limit: int | None,
-        search: str | None,
-        hours_back: int,
-        entity_id: str | None,
-        end_time: str | None,
-        offset: int,
-        compact: bool,
-        level: str | None,
-        slug: str | None,
-        order: Literal["newest", "oldest"],
-    ) -> dict[str, Any]:
-        if source == "logbook":
-            return await self._get_logbook(
-                hours_back=hours_back,
-                entity_id=entity_id,
-                end_time=end_time,
-                limit=limit,
-                offset=offset,
-                search=search,
-                compact=compact,
-                order=order,
-            )
-        if source == "system":
-            return await self._get_system_log(
-                limit=limit, search=search, level=level, order=order
-            )
-        if source == "error_log":
-            return await self._get_error_log(
-                limit=limit, search=search, level=level, order=order
-            )
-        if source == "logger":
-            # logger reports per-integration levels, not time-ordered events;
-            # 'order' does not apply (a warning is emitted upstream).
-            return await self._get_logger_info(limit=limit, search=search)
-        if source == "system_service":
-            assert slug is not None  # guaranteed by _validate_log_slug
-            return await self._get_system_service_log(
-                service=slug, limit=limit, search=search, order=order
-            )
-        assert slug is not None  # guaranteed by _validate_log_slug
-        return await self._get_supervisor_log(
-            slug=slug, limit=limit, search=search, order=order
-        )
-
-    async def get_logs(
-        self,
-        source: str,
-        limit: int | None,
-        search: str | None,
-        hours_back: int,
-        entity_id: str | None,
-        end_time: str | None,
-        offset: int,
-        compact: bool,
-        level: str | None,
-        slug: str | None,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> dict[str, Any]:
-        level = self._validate_log_level(level)
-        warnings = self._collect_log_warnings(
-            source, level, entity_id, end_time, slug, order
-        )
-        self._validate_log_slug(source, slug)
-        result = await self._fetch_log_source(
-            source,
-            limit,
-            search,
-            hours_back,
-            entity_id,
-            end_time,
-            offset,
-            compact,
-            level,
-            slug,
-            order,
-        )
-        if warnings:
-            result["warnings"] = warnings
-        return result
-
-    @staticmethod
-    def _coerce_logbook_params(
-        hours_back: int,
-        limit: int | None,
-        offset: int,
-    ) -> tuple[int, int, int]:
-        effective_limit = UtilityTools._coerce_limit(limit)
-        return hours_back, effective_limit, offset
-
-    @staticmethod
-    def _build_pagination_hint(
-        offset_int: int,
-        effective_limit: int,
-        total_entries: int,
-        paginated_entries: Any,
-        hours_back_int: int,
-        end_time: str | None,
-        entity_id: str | None,
-        search: str | None,
-        compact_bool: bool,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> str:
-        """Build reproducible pagination hint string for logbook results."""
-        next_offset = offset_int + effective_limit
-        param_parts = [
-            f"hours_back={hours_back_int}",
-            f"limit={effective_limit}",
-            f"offset={next_offset}",
-        ]
-        if entity_id:
-            param_parts.append(f"entity_id={entity_id}")
-        if end_time:
-            param_parts.append(f"end_time={end_time}")
-        if search:
-            param_parts.append(f"search={search}")
-        if not compact_bool:
-            param_parts.append("compact=False")
-        if order != "newest":
-            param_parts.append(f"order={order}")
-        param_str = ", ".join(param_parts)
-        return (
-            f"Showing entries {offset_int + 1}-{offset_int + len(paginated_entries)} of {total_entries}. "
-            f"To get the next page, use: ha_get_logs({param_str})"
-        )
-
-    @staticmethod
-    def _filter_logbook_by_search(
-        response: Any, search: str | None
-    ) -> tuple[Any, dict[str, str]]:
-        """Filter logbook entries by search term across name/message/entity_id.
-
-        Returns the (possibly filtered) response and a filters_applied dict
-        recording which filters were used.
-        """
-        filters_applied: dict[str, str] = {}
-        if search and isinstance(response, list):
-            search_lower = search.lower()
-            response = [
-                e
-                for e in response
-                if isinstance(e, dict)
-                and (
-                    search_lower in str(e.get("name", "")).lower()
-                    or search_lower in str(e.get("message", "")).lower()
-                    or search_lower in str(e.get("entity_id", "")).lower()
-                )
-            ]
-            filters_applied["search"] = search
-        return response, filters_applied
-
-    @staticmethod
-    def _paginate_logbook_entries(
-        response: Any,
-        offset_int: int,
-        effective_limit: int,
-        order: Literal["newest", "oldest"],
-    ) -> tuple[Any, int, bool]:
-        """Slice logbook entries into the requested page.
-
-        HA's /logbook returns entries oldest-first. Takes a window from
-        the end for newest-first (default), or from the start for
-        oldest-first, with offset paging deeper in the chosen order.
-        """
-        total_entries = len(response) if isinstance(response, list) else 1
-
-        if isinstance(response, list):
-            if order == "newest":
-                end = total_entries - offset_int
-                start = max(end - effective_limit, 0)
-                paginated_entries = (
-                    list(reversed(response[start:end])) if end > 0 else []
-                )
-            else:
-                paginated_entries = response[offset_int : offset_int + effective_limit]
-            has_more = offset_int + len(paginated_entries) < total_entries
-        else:
-            paginated_entries = response
-            has_more = False
-
-        return paginated_entries, total_entries, has_more
-
-    @staticmethod
-    def _logbook_error_suggestions(error_str: str) -> list[str]:
-        """Build remediation suggestions for a logbook fetch failure.
-
-        Adds server-crash-specific guidance when the error indicates a 500
-        (heavy query causing HA to fail) on top of the general tips.
-        """
-        if "500" in error_str:
-            return [
-                "The query returned too many results causing a server error (500).",
-                "This often happens with very active entities or long time periods.",
-                "Try reducing 'hours_back' parameter (e.g., from 24 to 1 hour)",
-                "Add a specific 'entity_id' filter to narrow down results",
-                "If debugging an automation, filter by that automation's entity_id",
-                "Use ha_bug_report tool to check Home Assistant logs for crash details",
-            ]
-        return [
-            "Try reducing 'hours_back' parameter (e.g., from 24 to 1 hour)",
-            "Add a specific 'entity_id' filter to narrow down results",
-        ]
-
-    async def _get_logbook(
-        self,
-        hours_back: int = 1,
-        entity_id: str | None = None,
-        end_time: str | None = None,
-        limit: int | None = None,
-        offset: int = 0,
-        search: str | None = None,
-        compact: bool = True,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> dict[str, Any]:
-        """Fetch logbook entries with search and pagination."""
-        hours_back_int, effective_limit, offset_int = self._coerce_logbook_params(
-            hours_back, limit, offset
-        )
-
-        if end_time:
-            end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        else:
-            end_dt = datetime.now(UTC)
-
-        start_dt = end_dt - timedelta(hours=hours_back_int)
-        start_timestamp = start_dt.isoformat()
-
-        try:
-            response = await self._client.get_logbook(
-                entity_id=entity_id, start_time=start_timestamp, end_time=end_time
-            )
-
-            response, filters_applied = self._filter_logbook_by_search(response, search)
-
-            paginated_entries, total_entries, has_more = self._paginate_logbook_entries(
-                response, offset_int, effective_limit, order
-            )
-
-            # In compact mode, strip entries to essential fields only.
-            # This prevents full attribute dictionaries from exhausting
-            # the LLM context window during debugging workflows.
-            if compact and isinstance(paginated_entries, list):
-                paginated_entries = _compact_logbook_entries(paginated_entries)
-
-            logbook_data: dict[str, Any] = {
-                "success": True,
-                "source": "logbook",
-                "entries": paginated_entries,
-                "period": f"{hours_back_int} hours back from {end_dt.isoformat()}",
-                "start_time": start_timestamp,
-                "end_time": end_dt.isoformat(),
-                "entity_filter": entity_id,
-                "total_entries": total_entries,
-                "returned_entries": len(paginated_entries)
-                if isinstance(paginated_entries, list)
-                else 1,
-                "limit": effective_limit,
-                "offset": offset_int,
-                "order": order,
-                "has_more": has_more,
-            }
-            if filters_applied:
-                logbook_data["filters_applied"] = filters_applied
-            if has_more:
-                logbook_data["pagination_hint"] = self._build_pagination_hint(
-                    offset_int,
-                    effective_limit,
-                    total_entries,
-                    paginated_entries,
-                    hours_back_int,
-                    end_time,
-                    entity_id,
-                    search,
-                    compact,
-                    order,
-                )
-
-            return await add_timezone_metadata(self._client, logbook_data)
-
-        except ToolError:
-            raise
-        except Exception as e:
-            exception_to_structured_error(
-                e,
-                context={
-                    "period": f"{hours_back_int} hours back from {end_dt.isoformat()}",
-                },
-                suggestions=self._logbook_error_suggestions(str(e)),
-            )
-            raise  # unreachable: exception_to_structured_error always raises
-
-    @staticmethod
-    def _system_log_sort_key(entry: Any) -> float:
-        """Total-order-safe sort key for system_log entries.
-
-        ``system_log/list`` does not guarantee a numeric ``timestamp`` on every
-        record. Coerce a missing / non-numeric / non-dict entry to ``0.0`` so
-        sorting never raises a cross-type ``TypeError`` (bools are excluded so
-        a stray ``True`` doesn't read as ``1.0``).
-        """
-        if not isinstance(entry, dict):
-            return 0.0
-        ts = entry.get("timestamp")
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-            return 0.0
-        return float(ts)
-
-    async def _get_system_log(
-        self,
-        limit: int | None = None,
-        search: str | None = None,
-        level: str | None = None,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> dict[str, Any]:
-        """Fetch structured system log entries via system_log/list."""
-        effective_limit = self._coerce_limit(limit)
-
-        try:
-            result = await self._client.send_websocket_message(
-                {"type": "system_log/list"}
-            )
-
-            if not result.get("success"):
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        result.get("error", "Failed to retrieve system log"),
-                        suggestions=["Check Home Assistant connection"],
-                    )
-                )
-
-            entries = result.get("result", [])
-            if not isinstance(entries, list):
-                entries = []
-
-            filters_applied: dict[str, str] = {}
-
-            if level:
-                entries = [
-                    e for e in entries if str(e.get("level", "")).upper() == level
-                ]
-                filters_applied["level"] = level
-
-            if search:
-                search_lower = search.lower()
-                entries = [
-                    e
-                    for e in entries
-                    if search_lower in str(e.get("message", "")).lower()
-                    or search_lower in str(e.get("name", "")).lower()
-                ]
-                filters_applied["search"] = search
-
-            # system_log/list entries carry a 'timestamp' (epoch float, last
-            # occurrence), but HA does not guarantee it on every record. Sort
-            # with a total-order-safe key so 'order' is deterministic regardless
-            # of HA's native ordering (newest-first by default) and a missing /
-            # non-numeric / non-dict entry can never raise a cross-type
-            # TypeError out of this method's narrow except clause.
-            entries.sort(
-                key=self._system_log_sort_key,
-                reverse=(order == "newest"),
-            )
-
-            total_entries = len(entries)
-            entries = entries[:effective_limit]
-
-            data: dict[str, Any] = {
-                "success": True,
-                "source": "system",
-                "entries": entries,
-                "total_entries": total_entries,
-                "returned_entries": len(entries),
-                "limit": effective_limit,
-                "order": order,
-            }
-            if filters_applied:
-                data["filters_applied"] = filters_applied
-
-            return data
-
-        except ToolError:
-            raise
-        except (
-            HomeAssistantConnectionError,
-            HomeAssistantAPIError,
-            TimeoutError,
-            OSError,
-        ) as e:
-            exception_to_structured_error(
-                e,
-                context={"source": "system"},
-                suggestions=[
-                    "Check Home Assistant WebSocket connection",
-                    "Verify system_log integration is enabled",
-                ],
-            )
-            raise  # unreachable: exception_to_structured_error always raises
-
-    async def _get_error_log(
-        self,
-        limit: int | None = None,
-        search: str | None = None,
-        level: str | None = None,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> dict[str, Any]:
-        """Fetch raw error log text from home-assistant.log."""
-        effective_limit = self._coerce_limit(
-            limit, default=DEFAULT_LOG_LIMIT, suggestion_example="100"
-        )
-
-        try:
-            raw_log = await self._client.get_error_log()
-            lines = raw_log.splitlines() if raw_log else []
-
-            filters_applied: dict[str, str] = {}
-
-            if level:
-
-                def _line_has_level(ln: str, target: str) -> bool:
-                    m = _LOG_LEVEL_RE.search(ln)
-                    return m is not None and m.group(1).upper() == target
-
-                lines = [ln for ln in lines if _line_has_level(ln, level)]
-                filters_applied["level"] = level
-
-            if search:
-                search_lower = search.lower()
-                lines = [ln for ln in lines if search_lower in ln.lower()]
-                filters_applied["search"] = search
-
-            total_lines = len(lines)
-            # Always take the most-recent window (the tail of the chronological
-            # file); 'order' controls only the display direction of that window.
-            lines = lines[-effective_limit:]
-            if order == "newest":
-                lines = list(reversed(lines))
-
-            data: dict[str, Any] = {
-                "success": True,
-                "source": "error_log",
-                "log": "\n".join(lines),
-                "total_lines": total_lines,
-                "returned_lines": len(lines),
-                "limit": effective_limit,
-                "order": order,
-                "note": "Returned the most recent log lines matching filters",
-            }
-            if filters_applied:
-                data["filters_applied"] = filters_applied
-
-            return data
-
-        except ToolError:
-            raise
-        except (
-            HomeAssistantConnectionError,
-            HomeAssistantAPIError,
-            TimeoutError,
-            OSError,
-        ) as e:
-            exception_to_structured_error(
-                e,
-                context={"source": "error_log"},
-                suggestions=[
-                    "Check Home Assistant connection",
-                    "The error log may be empty if no errors have occurred",
-                ],
-            )
-            raise  # unreachable: exception_to_structured_error always raises
-
-    @staticmethod
-    def _parse_logger_entry(entry: Any) -> dict[str, Any] | None:
-        if not isinstance(entry, dict):
-            return None
-        domain = entry.get("domain")
-        if not isinstance(domain, str) or not domain:
-            return None
-        raw_level = entry.get("level")
-        level_name = normalize_log_level(raw_level)
-        if level_name is None:
-            return None
-        return {
-            "domain": domain,
-            "level": level_name,
-            "level_raw": raw_level if isinstance(raw_level, int) else None,
-        }
-
-    async def _get_logger_info(
-        self,
-        limit: int | None = None,
-        search: str | None = None,
-    ) -> dict[str, Any]:
-        """Fetch per-integration log levels via the ``logger/log_info`` WS command."""
-        effective_limit = self._coerce_limit(limit)
-
-        try:
-            result = await self._client.send_websocket_message(
-                {"type": "logger/log_info"}
-            )
-
-            if not result.get("success"):
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        result.get("error", "Failed to retrieve logger info"),
-                        suggestions=[
-                            "Verify the 'logger' integration is enabled in Home Assistant",
-                            "Check Home Assistant WebSocket connection",
-                        ],
-                    )
-                )
-
-            raw_entries = result.get("result", [])
-            if not isinstance(raw_entries, list):
-                raw_entries = []
-
-            loggers: list[dict[str, Any]] = []
-            for entry in raw_entries:
-                parsed = self._parse_logger_entry(entry)
-                if parsed is not None:
-                    loggers.append(parsed)
-
-            filters_applied: dict[str, str] = {}
-            if search:
-                search_lower = search.lower()
-                loggers = [
-                    entry
-                    for entry in loggers
-                    if search_lower in entry["domain"].lower()
-                ]
-                filters_applied["search"] = search
-
-            loggers.sort(key=lambda entry: entry["domain"])
-
-            total_entries = len(loggers)
-            loggers = loggers[:effective_limit]
-
-            data: dict[str, Any] = {
-                "success": True,
-                "source": "logger",
-                "loggers": loggers,
-                "total_entries": total_entries,
-                "returned_entries": len(loggers),
-                "limit": effective_limit,
-            }
-            if filters_applied:
-                data["filters_applied"] = filters_applied
-
-            return data
-
-        except ToolError:
-            raise
-        except (
-            HomeAssistantConnectionError,
-            HomeAssistantAPIError,
-            TimeoutError,
-            OSError,
-        ) as e:
-            exception_to_structured_error(
-                e,
-                context={"source": "logger"},
-                suggestions=[
-                    "Check Home Assistant WebSocket connection",
-                    "Verify the 'logger' integration is enabled",
-                ],
-            )
-            raise  # unreachable: exception_to_structured_error always raises
-
-    async def _get_supervisor_log(
-        self,
-        slug: str,
-        limit: int | None = None,
-        search: str | None = None,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> dict[str, Any]:
-        """Fetch add-on container logs.
-
-        Delegates to ``HomeAssistantClient.get_addon_logs`` which branches on
-        ``is_running_in_addon()``: inside the add-on container hits Supervisor
-        directly at ``http://supervisor/addons/<slug>/logs`` (the HA-Core
-        proxy at ``/api/hassio/addons/<slug>/logs`` rejects the Supervisor
-        token there — see #1116); on non-addon installs falls back to the
-        HA-Core proxy. Both paths return ``text/plain``.
-        """
-        effective_limit = self._coerce_limit(
-            limit, default=DEFAULT_LOG_LIMIT, suggestion_example="100"
-        )
-
-        # Request a journald window sized to the caller's limit —
-        # Supervisor's /logs endpoints default to their last-100-lines
-        # window, which silently capped any larger limit before ?lines=
-        # was plumbed through (found via #1721's e2e).
-        fetch_lines = (
-            max(effective_limit, SUPERVISOR_SEARCH_WINDOW_LINES)
-            if search
-            else effective_limit
-        )
-
-        try:
-            log_text = await self._client.get_addon_logs(slug, lines=fetch_lines)
-
-            lines = log_text.splitlines() if log_text else []
-
-            filters_applied: dict[str, str] = {}
-
-            if search:
-                search_lower = search.lower()
-                lines = [ln for ln in lines if search_lower in ln.lower()]
-                filters_applied["search"] = search
-
-            total_lines = len(lines)
-            # Always take the most-recent window (the tail); 'order' controls
-            # only the display direction of that window.
-            lines = lines[-effective_limit:]
-            if order == "newest":
-                lines = list(reversed(lines))
-
-            data: dict[str, Any] = {
-                "success": True,
-                "source": "supervisor",
-                "slug": slug,
-                "log": "\n".join(lines),
-                "total_lines": total_lines,
-                "returned_lines": len(lines),
-                "limit": effective_limit,
-                "order": order,
-            }
-            if filters_applied:
-                data["filters_applied"] = filters_applied
-
-            return data
-
-        except ToolError:
-            raise
-        except HomeAssistantAuthError as e:
-            # Listed before HomeAssistantAPIError because AuthError is a sibling,
-            # not a subclass — without this explicit clause the 401 from
-            # _supervisor_logs_get / _raw_request propagates raw to FastMCP and
-            # surfaces without a structured `code` field.
-            #
-            # Suggestions branch on is_running_in_addon(): addon installs go
-            # direct to Supervisor (the failure mode is a missing/rotated
-            # SUPERVISOR_TOKEN), non-addon installs hit HA Core's hassio
-            # proxy with the user's LLA (the failure mode is a non-admin or
-            # expired LLA — SUPERVISOR_TOKEN doesn't even apply).
-            exception_to_structured_error(
-                e,
-                context={"source": "supervisor", "slug": slug},
-                suggestions=self._addon_auth_error_suggestions(),
-            )
-        except HomeAssistantAPIError as e:
-            status = getattr(e, "status_code", None)
-            if status == 400:
-                # Supervisor-side rejection — not caller validation. The default
-                # `exception_to_structured_error` path would map 400 →
-                # VALIDATION_INVALID_PARAMETER, which reads as "caller passed
-                # bad input"; a downstream proxy rejection is better modelled
-                # as SERVICE_CALL_FAILED.
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        str(e),
-                        context={"source": "supervisor", "slug": slug},
-                        suggestions=[
-                            f"Supervisor rejected the request for '{slug}' — "
-                            "verify slug format or that the add-on is installed "
-                            "and running",
-                            "Use ha_get_addon() to list installed add-on slugs",
-                            "Ensure Supervisor is available (HA OS or Supervised install)",
-                        ],
-                    )
-                )
-            if status == 404:
-                first_suggestion = f"Add-on '{slug}' not found or not installed"
-            else:
-                first_suggestion = f"Verify add-on slug '{slug}' is correct"
-            exception_to_structured_error(
-                e,
-                context={"source": "supervisor", "slug": slug},
-                suggestions=[
-                    first_suggestion,
-                    "Use ha_get_addon() to list installed add-on slugs",
-                    "Ensure Supervisor is available (HA OS or Supervised install)",
-                ],
-            )
-        except (
-            HomeAssistantConnectionError,
-            TimeoutError,
-            OSError,
-        ) as e:
-            exception_to_structured_error(
-                e,
-                context={"source": "supervisor", "slug": slug},
-                suggestions=[
-                    "Check Home Assistant connection",
-                    f"Verify add-on slug '{slug}' is correct",
-                    "Use ha_get_addon() to list installed add-on slugs",
-                    "Ensure Supervisor is available (HA OS or Supervised install)",
-                ],
-            )
-            raise  # unreachable: exception_to_structured_error always raises
-        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
-
-    @staticmethod
-    def _addon_auth_error_suggestions() -> list[str]:
-        if is_running_in_addon():
-            return [
-                "Verify SUPERVISOR_TOKEN is set correctly inside the add-on",
-                "Reinstall the add-on if the token may have rotated",
-            ]
-        return [
-            "Verify HOMEASSISTANT_TOKEN is a valid admin Long-Lived Access Token (Settings → Profile → Long-Lived Access Tokens)",
-            "Re-create the LLAT if it has expired or been revoked",
-        ]
-
-    def _handle_system_service_api_error(
-        self, e: HomeAssistantAPIError, service: str
-    ) -> NoReturn:
-        """Raise a structured error for a Supervisor per-service-logs failure.
-
-        Branches on HTTP status: 403 (role/permission, addon vs. non-addon
-        remediation differs), 404 (service not exposed on this HA OS
-        version), else falls through to a generic Supervisor-error message.
-        """
-        status = getattr(e, "status_code", None)
-        if status == 403:
-            # In-addon: Supervisor returns 403 when the addon's hassio_role
-            # is below 'manager'. Non-addon: HA Core's hassio proxy returns
-            # 403 when the LLA's user lacks admin — completely different
-            # remediation. Branch on the gate accordingly.
-            if is_running_in_addon():
-                suggestions = [
-                    "Addon's hassio_role must be 'manager' or higher to "
-                    + "read /<service>/logs",
-                    "Verify the addon was reinstalled after the role bump "
-                    + "took effect",
-                ]
-            else:
-                suggestions = [
-                    "The Long-Lived Access Token must belong to a user "
-                    + "with admin privileges",
-                    "Generate a new LLAT under an admin account and set "
-                    + "HOMEASSISTANT_TOKEN to it",
-                ]
-            exception_to_structured_error(
-                e,
-                context={"source": "system_service", "slug": service},
-                suggestions=suggestions,
-            )
-        if status == 404:
-            exception_to_structured_error(
-                e,
-                context={"source": "system_service", "slug": service},
-                suggestions=[
-                    f"Service '{service}' not found at "
-                    f"http://supervisor/{service}/logs — Supervisor may "
-                    "not expose it on this HA OS version",
-                    f"Allowed services: {', '.join(sorted(SYSTEM_SERVICE_SLUGS))}",
-                ],
-            )
-        exception_to_structured_error(
-            e,
-            context={"source": "system_service", "slug": service},
-            suggestions=[
-                f"Supervisor returned an error for /{service}/logs",
-                "Ensure Supervisor is available (HA OS or Supervised install)",
-            ],
-        )
-
-    async def _get_system_service_log(
-        self,
-        service: str,
-        limit: int | None = None,
-        search: str | None = None,
-        order: Literal["newest", "oldest"] = "newest",
-    ) -> dict[str, Any]:
-        """Fetch HA system-service logs from Supervisor's per-service endpoint.
-
-        ``service`` ∈ ``SYSTEM_SERVICE_SLUGS`` (the eight Supervisor-managed
-        services: supervisor, host, core, dns, audio, cli, multicast, observer).
-        Caller (``ha_get_logs(source='system_service')``) validates against
-        ``SYSTEM_SERVICE_SLUGS`` before dispatch. Routed through
-        ``HomeAssistantClient._get_system_service_logs`` which gates on
-        ``is_running_in_addon()``: addon installs hit Supervisor directly at
-        ``http://supervisor/<service>/logs`` (requires ``hassio_role: manager``
-        in the addon manifest), non-addon installs fall back to the HA Core
-        proxy at ``/api/hassio/<service>/logs`` (requires an admin LLA).
-        """
-        effective_limit = self._coerce_limit(
-            limit, default=DEFAULT_LOG_LIMIT, suggestion_example="100"
-        )
-
-        fetch_lines = (
-            max(effective_limit, SUPERVISOR_SEARCH_WINDOW_LINES)
-            if search
-            else effective_limit
-        )
-
-        try:
-            log_text = await self._client._get_system_service_logs(
-                service, lines=fetch_lines
-            )
-
-            lines = log_text.splitlines() if log_text else []
-
-            filters_applied: dict[str, str] = {}
-            if search:
-                search_lower = search.lower()
-                lines = [ln for ln in lines if search_lower in ln.lower()]
-                filters_applied["search"] = search
-
-            total_lines = len(lines)
-            # Always take the most-recent window (the tail); 'order' controls
-            # only the display direction of that window.
-            lines = lines[-effective_limit:]
-            if order == "newest":
-                lines = list(reversed(lines))
-
-            data: dict[str, Any] = {
-                "success": True,
-                "source": "system_service",
-                "slug": service,
-                "log": "\n".join(lines),
-                "total_lines": total_lines,
-                "returned_lines": len(lines),
-                "limit": effective_limit,
-                "order": order,
-            }
-            if filters_applied:
-                data["filters_applied"] = filters_applied
-
-            return data
-
-        except ToolError:
-            raise
-        except HomeAssistantAuthError as e:
-            # Listed before HomeAssistantAPIError because AuthError is a sibling,
-            # not a subclass — without this explicit clause the 401 from
-            # _supervisor_logs_get / _raw_request propagates raw to FastMCP and
-            # surfaces without a structured `code` field.
-            #
-            # Suggestions branch on is_running_in_addon() (see _get_supervisor_log
-            # for the rationale): SUPERVISOR_TOKEN suggestions only make sense
-            # inside the addon container; non-addon installs need admin-LLA hints.
-            exception_to_structured_error(
-                e,
-                context={"source": "system_service", "slug": service},
-                suggestions=self._addon_auth_error_suggestions(),
-            )
-        except HomeAssistantAPIError as e:
-            self._handle_system_service_api_error(e, service)
-        except (
-            HomeAssistantConnectionError,
-            TimeoutError,
-            OSError,
-        ) as e:
-            exception_to_structured_error(
-                e,
-                context={"source": "system_service", "slug": service},
-                suggestions=[
-                    "Check Home Assistant connection",
-                    "Ensure Supervisor is available (HA OS or Supervised install)",
-                ],
-            )
-            raise  # unreachable: exception_to_structured_error always raises
-        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
-
     async def eval_template(
-        self, template: str, timeout: int, report_errors: bool
+        self,
+        template: str | None,
+        condition: dict[str, Any] | None,
+        variables: dict[str, Any] | None,
+        strict: bool,
+        timeout: int,
+        report_errors: bool,
     ) -> dict[str, Any]:
-
-        try:
-            request_id = int(time.time() * 1000) % 1000000  # Simple unique ID
-
-            message: dict[str, Any] = {
-                "type": "render_template",
-                "template": template,
-                "timeout": timeout,
-                "report_errors": report_errors,
-                "id": request_id,
-            }
-
-            result = await self._client.send_websocket_message(message)
-
-            if result.get("success"):
-                if "event" in result and "result" in result["event"]:
-                    template_result = result["event"]["result"]
-                    listeners = result["event"].get("listeners", {})
-
-                    return {
-                        "success": True,
-                        "template": template,
-                        "result": template_result,
-                        "listeners": listeners,
-                        "request_id": request_id,
-                        "evaluation_time": timeout,
-                    }
-                else:
-                    return {
-                        "success": True,
-                        "template": template,
-                        "result": result.get("result"),
-                        "request_id": request_id,
-                        "evaluation_time": timeout,
-                    }
-            else:
-                error_info = result.get("error", "Unknown error occurred")
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        str(error_info)
-                        if not isinstance(error_info, str)
-                        else error_info,
-                        context={"template": template, "request_id": request_id},
-                        suggestions=[
-                            "Check template syntax - ensure proper Jinja2 formatting",
-                            "Verify entity_ids exist using ha_get_state()",
-                            "Use default values: {{ states('sensor.temp') | float(0) }}",
-                            "Check for typos in function names and entity references",
-                            "Test simpler templates first to isolate issues",
-                        ],
-                    )
+        if (template is None) == (condition is None):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "Provide exactly one of 'template' or 'condition'",
+                    suggestions=[
+                        "Use 'template' to render a Jinja2 template",
+                        "Use 'condition' to test an automation condition",
+                    ],
                 )
-
+            )
+        try:
+            if condition is not None:
+                return await self._test_condition(condition, variables)
+            assert template is not None
+            return await self._render_template(
+                template, variables, strict, timeout, report_errors
+            )
         except ToolError:
             raise
         except Exception as e:
-            error_str = str(e)
-            suggestions = [
-                "Check Home Assistant WebSocket connection",
-                "Verify template syntax is valid Jinja2",
-                "Try a simpler template to test basic functionality",
-                "Check if referenced entities exist",
-                "Ensure template doesn't exceed timeout limit",
-            ]
+            suggestions = ["Check Home Assistant WebSocket connection"]
 
-            # Add specific suggestions for 403 errors
-            if "403" in error_str and "Forbidden" in error_str:
+            if http_failure_status(e) == 403:
                 suggestions = [
                     "The request was blocked (403 Forbidden) - this may be caused by:",
                     "  • Reverse proxy security rules (Apache, Nginx, Traefik)",
@@ -1147,16 +116,206 @@ class UtilityTools:
                     "  • Complex template triggering security filters",
                     "Try simplifying the template (remove newlines, reduce complexity)",
                     "Break complex templates into multiple simpler calls",
-                    "Use ha_bug_report tool to check Home Assistant logs for details",
+                    "Use ha_report_issue to check Home Assistant logs for details",
                 ] + suggestions
 
             exception_to_structured_error(
                 e,
-                context={"template": template},
+                context=(
+                    {"condition": condition}
+                    if condition is not None
+                    else {"template": template}
+                ),
                 suggestions=suggestions,
             )
             raise  # unreachable: exception_to_structured_error always raises
-        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
+
+    async def _render_template(
+        self,
+        template: str,
+        variables: dict[str, Any] | None,
+        strict: bool,
+        timeout: int,
+        report_errors: bool,
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "type": "render_template",
+            "template": template,
+            "timeout": timeout,
+            "report_errors": report_errors,
+            "strict": strict,
+        }
+        if variables is not None:
+            message["variables"] = variables
+
+        result = await self._client.send_websocket_message(message)
+
+        if result.get("success"):
+            response: dict[str, Any] = {
+                "success": True,
+                "template": template,
+                "result": result.get("result"),
+                "listeners": result.get("listeners", {}),
+            }
+            if result.get("warnings"):
+                response["warnings"] = result["warnings"]
+            return response
+
+        await self._raise_render_failure(
+            template, variables, strict, timeout, report_errors, result
+        )
+        raise AssertionError("unreachable: _raise_render_failure always raises")
+
+    async def _raise_render_failure(
+        self,
+        template: str,
+        variables: dict[str, Any] | None,
+        strict: bool,
+        timeout: int,
+        report_errors: bool,
+        result: dict[str, Any],
+    ) -> NoReturn:
+        reported = result.get("error")
+        error = reported if isinstance(reported, str) else "Template evaluation failed"
+        context: dict[str, Any] = {"template": template}
+        if result.get("error_code"):
+            context["ha_error_code"] = result["error_code"]
+        if result.get("warnings"):
+            context["warnings"] = result["warnings"]
+
+        if result.get("client_error"):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    error,
+                    context=context,
+                    suggestions=["Check Home Assistant WebSocket connection"],
+                )
+            )
+        if result.get("error_code") == "template_error" and render_timed_out(
+            error, timeout
+        ):
+            # A second render would only time out again.
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.TIMEOUT_OPERATION,
+                    error,
+                    context=context,
+                    suggestions=TEMPLATE_TIMEOUT_SUGGESTIONS,
+                )
+            )
+
+        diagnosis, unavailable = await self._diagnose_template(
+            template, variables, strict, timeout
+        )
+        error, timed_out = _render_outcome(error, report_errors, result, diagnosis)
+        if diagnosis is not None and isinstance(diagnosis.get("line"), int):
+            context["line"] = diagnosis["line"]
+            if diagnosis.get("source_line"):
+                context["source_line"] = diagnosis["source_line"]
+        elif unavailable:
+            context["line_unavailable"] = unavailable
+
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.TIMEOUT_OPERATION
+                if timed_out
+                else ErrorCode.VALIDATION_FAILED,
+                error,
+                context=context,
+                suggestions=(
+                    TEMPLATE_TIMEOUT_SUGGESTIONS
+                    if timed_out
+                    else TEMPLATE_ERROR_SUGGESTIONS
+                ),
+            )
+        )
+
+    async def _diagnose_template(
+        self,
+        template: str,
+        variables: dict[str, Any] | None,
+        strict: bool,
+        timeout: int,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Ask the ha_mcp_tools component where in the template the render fails.
+
+        Home Assistant reports a template error without its line. The component
+        renders the same template in-process, where the Jinja exception still
+        carries it. Returns ``(diagnosis, None)``, or ``(None, reason)`` when a
+        component that advertises the capability could not answer; without
+        the capability both are ``None`` and the error stands as Home
+        Assistant reported it.
+        """
+        caps = await get_component_caps(self._client)
+        if not component_supports(caps, "template_diagnose"):
+            return None, None
+        params: dict[str, Any] = {
+            "template": template,
+            "strict": strict,
+            "timeout": timeout,
+            # The component may spend up to ``timeout`` in its guarded render.
+            "_wait_timeout": timeout + 10,
+        }
+        if variables is not None:
+            params["variables"] = variables
+        try:
+            ws = await get_websocket_client(
+                url=self._client.base_url,
+                token=self._client.token,
+                verify_ssl=getattr(self._client, "verify_ssl", None),
+            )
+            raw = await ws.send_command("ha_mcp_tools/template_diagnose", **params)
+        except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
+            if is_unknown_command(exc):
+                invalidate_caps(self._client)
+                return None, None
+            logger.warning("ha_mcp_tools/template_diagnose failed: %r", exc)
+            return None, f"line lookup failed: {exc}"
+        except Exception as exc:
+            logger.warning("ha_mcp_tools/template_diagnose unavailable", exc_info=True)
+            return None, f"line lookup failed: {exc}"
+        diagnosis = raw.get("result")
+        if not isinstance(diagnosis, dict):
+            return None, "line lookup returned no diagnosis"
+        return diagnosis, None
+
+    async def _test_condition(
+        self,
+        condition: dict[str, Any],
+        variables: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"condition": condition}
+        if variables is not None:
+            params["variables"] = variables
+        ws = await get_websocket_client(
+            url=self._client.base_url,
+            token=self._client.token,
+            verify_ssl=getattr(self._client, "verify_ssl", None),
+        )
+        try:
+            response = await ws.send_command("test_condition", **params)
+        except HomeAssistantCommandError as exc:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_FAILED,
+                    core_error_message(exc),
+                    context={"condition": condition, "ha_error_code": exc.code},
+                    suggestions=CONDITION_ERROR_SUGGESTIONS,
+                )
+            )
+            raise AssertionError("unreachable: raise_tool_error always raises") from exc
+        result = response.get("result") or {}
+        data: dict[str, Any] = {
+            "success": True,
+            "condition": condition,
+            "result": result.get("result"),
+        }
+        # Home Assistant 2026.7+ returns template errors hit while checking a
+        # template condition that still evaluated (e.g. an undefined variable).
+        if result.get("template_errors"):
+            data["warnings"] = list(result["template_errors"])
+        return data
 
 
 def register_utility_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
@@ -1164,242 +323,99 @@ def register_utility_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
     tools = UtilityTools(client)
 
     @mcp.tool(
-        tags={"History & Statistics"},
-        annotations={
-            "openWorldHint": False,
-            "idempotentHint": True,
-            "readOnlyHint": True,
-            "title": "Get Logs",
-        },
-    )
-    @log_tool_usage
-    async def ha_get_logs(
-        source: Literal[
-            "logbook",
-            "system",
-            "error_log",
-            "supervisor",
-            "system_service",
-            "logger",
-        ] = "logbook",
-        # Shared parameters
-        limit: int | None = None,
-        search: str | None = None,
-        order: Annotated[
-            Literal["newest", "oldest"],
-            Field(
-                description=(
-                    "Sort order for time-ordered sources (logbook, system, "
-                    "error_log, supervisor, system_service): 'newest' (default) "
-                    "returns most-recent first; 'oldest' returns chronological-"
-                    "first. Ignored for source='logger'."
-                )
-            ),
-        ] = "newest",
-        # Logbook-specific (ignored for other sources)
-        hours_back: Annotated[int, Field(ge=1)] = 1,
-        entity_id: str | None = None,
-        end_time: str | None = None,
-        offset: Annotated[int, Field(ge=0)] = 0,
-        compact: bool = True,
-        # System/error_log-specific
-        level: str | None = None,
-        # Supervisor + system_service-specific (different namespaces)
-        slug: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Get Home Assistant logs from various sources.
-
-        **Sources:**
-        - "logbook" (default): Entity state change history with pagination
-        - "system": Structured system log entries (errors, warnings) via system_log/list
-        - "error_log": Raw home-assistant.log text
-        - "supervisor": Add-on container logs (requires slug = add-on slug)
-        - "system_service": HA-Supervisor-managed system service logs (requires
-          slug ∈ {supervisor, host, core, dns, audio, cli, multicast, observer})
-        - "logger": Effective log level per integration via logger/log_info (confirms logger.set_level changes took effect)
-
-        **Shared params:** limit, search (keyword filter on entries/lines; matches integration domain for source='logger')
-        **Order:** order='newest' (default) returns most-recent first; order='oldest' returns chronological-first. Applies to all time-ordered sources (logbook, system, error_log, supervisor, system_service); ignored for source='logger'. For raw-text sources (error_log, supervisor, system_service) it sets the read direction of the most-recent window.
-        **Logbook params:** hours_back, entity_id, end_time, offset, compact (default True — strips attribute dicts to save context)
-        **System/error_log params:** level (ERROR, WARNING, INFO, DEBUG)
-        **Supervisor params:** slug = add-on slug, e.g. "core_mosquitto" (use
-            ha_get_addon() to list installed slugs)
-        **System-service params:** slug = service name. The slug "supervisor"
-            here means the Supervisor service's own logs, NOT an add-on with
-            that name — the source param disambiguates.
-        """
-        return await tools.get_logs(
-            source=source,
-            limit=limit,
-            search=search,
-            hours_back=hours_back,
-            entity_id=entity_id,
-            end_time=end_time,
-            offset=offset,
-            compact=compact,
-            level=level,
-            slug=slug,
-            order=order,
-        )
-
-    @mcp.tool(
         tags={"Utilities"},
-        annotations={
-            "openWorldHint": False,
-            "idempotentHint": True,
-            "readOnlyHint": True,
-            "title": "Evaluate Template",
-        },
+        annotations=read_only_hints("Evaluate Template", open_world=False),
     )
     @log_tool_usage
     async def ha_eval_template(
-        template: str, timeout: int = 3, report_errors: bool = True
+        template: Annotated[
+            str | None,
+            Field(
+                description="Jinja2 template to render. Omit when using 'condition'."
+            ),
+        ] = None,
+        condition: Annotated[
+            dict[str, Any] | None,
+            JSON_STRING_COERCION,
+            Field(
+                description=(
+                    "Automation condition to test instead of a template, e.g. "
+                    "{'condition': 'numeric_state', 'entity_id': 'sensor.temp', "
+                    "'above': 20}. Test several at once with {'condition': 'and', "
+                    "'conditions': [...]}."
+                )
+            ),
+        ] = None,
+        variables: Annotated[
+            dict[str, Any] | None,
+            JSON_STRING_COERCION,
+            Field(
+                description=(
+                    "Variables available to the template or condition, e.g. "
+                    "sample trigger data: {'trigger': {'to_state': {'state': 'on'}}}"
+                )
+            ),
+        ] = None,
+        strict: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Template only: fail on undefined variables instead of "
+                    "rendering them as empty (reported in warnings when "
+                    "report_errors is on)"
+                )
+            ),
+        ] = False,
+        timeout: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=60,
+                description="Template only: maximum render time in seconds",
+            ),
+        ] = 3,
+        report_errors: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Template only: have Home Assistant report render errors and "
+                    "warnings. With false, a failed render is only written to "
+                    "Home Assistant's log."
+                )
+            ),
+        ] = True,
     ) -> dict[str, Any]:
+        """Execute a Jinja2 template render, or an automation condition check, in Home Assistant.
+
+        Renders templates with Home Assistant's template engine (all states,
+        functions and filters available), or checks a condition block the way
+        an automation would and returns true/false.
+
+        When to use: any one-shot answer DERIVED from current HA state (an
+        average across sensors, a count of entities matching a condition, a
+        rendered message with live values), and testing a template or condition
+        before embedding it in an automation. One render beats fetching N states
+        and doing the math yourself.
+
+        When NOT to use: a plain single-entity value is ha_get_state /
+        ha_search. Templates in automation `condition:` / `trigger:` positions
+        or templated action names: prefer native constructs, which are validated
+        at config load, where a template only errors at runtime and a non-truthy
+        render is silently false — see ha_get_skill_guide for the anti-pattern
+        list. Test the native condition here with `condition`.
+
+        Results: a render that works but hits something suspect (an undefined
+        variable, a missing attribute) still returns its result with the
+        messages in `warnings`; strict=true makes those hard errors. A failed
+        render returns Home Assistant's error text and, with the ha_mcp_tools
+        component installed, the template `line` and `source_line` it failed on
+        when the error names one.
+
+        EXAMPLES:
+        - ha_eval_template(template="{{ states.light | selectattr('state', 'eq', 'on') | list | count }}")
+        - ha_eval_template(template="Hello {{ name }}", variables={"name": "Alice"})
+        - ha_eval_template(condition={"condition": "numeric_state", "entity_id": "sensor.temperature", "above": 20})
         """
-        Evaluate Jinja2 templates using Home Assistant's template engine.
-
-        This tool allows testing and debugging of Jinja2 template expressions that are commonly used in
-        Home Assistant automations, scripts, and configurations. It provides real-time evaluation with
-        access to all Home Assistant states, functions, and template variables.
-
-        **When NOT to use this for automation/script logic:**
-        Templates have legitimate uses (notification bodies, dynamic `data.*` values,
-        debugging existing templates), but `condition:` / `trigger:` positions and
-        action service names are better expressed as native HA constructs:
-        native constructs are schema-validated at config load and surface
-        structural errors loudly, whereas equivalent template logic only errors
-        at runtime — and a template that renders a non-truthy value is silently
-        treated as false.
-        Prefer:
-        - `condition: numeric_state` over `{{ states('x') | float > N }}`
-        - `condition: state` over `{{ is_state(...) }}`
-        - `condition: time` / `condition: sun` over `now().hour` / `is_state('sun.sun', ...)`
-        - Native `for:` field on state/numeric_state triggers and state conditions over
-          `{{ now() - X.last_changed > timedelta(...) }}` duration math
-        - `choose` action over templated `service:` / `action:` strings
-        See `ha_get_skill_guide` (best-practices skill) for the full anti-pattern list.
-
-        **When to use (reach for this tool, don't compute it yourself):**
-        Any one-shot question whose answer is DERIVED from current HA state — an
-        average/sum/min/max across sensors, a count of entities matching a
-        condition, a boolean comparison, or a rendered message with live values.
-        One render call beats fetching N states and doing the math yourself, and
-        it is the canonical way to *test* a template before embedding it. This is
-        for one-shot answers and template testing only — NOT for putting templates
-        into automation logic; for `condition:` / `trigger:` positions native
-        constructs win.
-        - "average temperature across the bedroom sensors"
-          -> `{{ ([states('sensor.a'), states('sensor.b')] | map('float', 0) | sum) / 2 }}`
-        - "how many lights are on"
-          -> `{{ states.light | selectattr('state', 'eq', 'on') | list | count }}`
-        NOT for a plain single-entity value ("what's the state of X") — that is
-        `ha_get_state` / `ha_search`; rendering `{{ states('X') }}` there is over-use.
-
-        **Parameters:**
-        - template: The Jinja2 template string to evaluate
-        - timeout: Maximum evaluation time in seconds (default: 3)
-        - report_errors: Whether to return detailed error information (default: True)
-
-        **Common Template Functions:**
-
-        **State Access:**
-        ```jinja2
-        {{ states('sensor.temperature') }}              # Get entity state value
-        {{ states.sensor.temperature.state }}           # Alternative syntax
-        {{ state_attr('light.bedroom', 'brightness') }} # Get entity attribute
-        {{ is_state('light.living_room', 'on') }}       # Check if entity has specific state
-        ```
-
-        **Numeric Operations:**
-        ```jinja2
-        {{ states('sensor.temperature') | float(0) }}   # Convert to float with default
-        {{ states('sensor.humidity') | int(0) }}        # Convert to integer with default
-        {{ (states('sensor.temp') | float(0) + 5) | round(1) }} # Math operations
-        ```
-
-        **Time and Date:**
-        ```jinja2
-        {{ now() }}                                     # Current datetime
-        {{ now().strftime('%H:%M:%S') }}               # Format current time
-        {{ as_timestamp(now()) }}                      # Convert to Unix timestamp
-        {{ now().hour }}                               # Current hour (0-23)
-        {{ now().weekday() }}                          # Day of week (0=Monday)
-        ```
-
-        **Conditional Logic (for display strings — not for `condition:` positions):**
-        ```jinja2
-        {{ 'Day' if now().hour < 18 else 'Night' }}    # Ternary operator
-        {% if is_state('alarm_control_panel.home', 'armed_away') %}
-          Alarm is armed
-        {% else %}
-          Alarm is disarmed
-        {% endif %}
-        ```
-
-        **Lists and Loops:**
-        ```jinja2
-        {% for entity in states.light %}
-          {{ entity.entity_id }}: {{ entity.state }}
-        {% endfor %}
-
-        {{ states.light | selectattr('state', 'eq', 'on') | list | count }} # Count on lights
-        ```
-
-        **String Operations:**
-        ```jinja2
-        {{ states('sensor.weather') | title }}         # Title case
-        {{ 'Hello ' + states('input_text.name') }}     # String concatenation
-        {{ states('sensor.data') | regex_replace('pattern', 'replacement') }}
-        ```
-
-        **Device and Area Functions:**
-        ```jinja2
-        {{ device_entities('device_id_here') }}        # Get entities for device
-        {{ area_entities('living_room') }}             # Get entities in area
-        {{ device_id('light.bedroom') }}               # Get device ID for entity
-        ```
-
-        **Common Use Cases (legitimate template positions):**
-
-        **Dynamic Service Data:**
-        ```jinja2
-        # Dynamic brightness based on time
-        {{ 255 if now().hour < 22 else 50 }}
-
-        # Message with current values
-        "Temperature is {{ states('sensor.temp') }}°C, humidity {{ states('sensor.humidity') }}%"
-        ```
-
-        **Examples:**
-
-        **Test basic state access:**
-        ```python
-        ha_eval_template("{{ states('light.living_room') }}")
-        ```
-
-        **Test a string expression (e.g. for a notification body):**
-        ```python
-        ha_eval_template("{{ 'Day' if now().hour < 18 else 'Night' }}")
-        ```
-
-        **Test mathematical operations:**
-        ```python
-        ha_eval_template("{{ (states('sensor.temperature') | float(0) + 5) | round(1) }}")
-        ```
-
-        **Test entity counting:**
-        ```python
-        ha_eval_template("{{ states.light | selectattr('state', 'eq', 'on') | list | count }}")
-        ```
-
-        **IMPORTANT NOTES:**
-        - Templates have access to all current Home Assistant states and attributes
-        - Use this tool to test templates before using them in automations or scripts
-        - Template evaluation respects Home Assistant's security model and timeouts
-        - Complex templates may affect Home Assistant performance - keep them efficient
-        - Use default values (e.g., `| float(0)`) to handle missing or invalid states
-
-        **For template documentation:** https://www.home-assistant.io/docs/configuration/templating/
-        """
-        return await tools.eval_template(template, timeout, report_errors)
+        return await tools.eval_template(
+            template, condition, variables, strict, timeout, report_errors
+        )

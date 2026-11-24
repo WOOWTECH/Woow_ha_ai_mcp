@@ -15,7 +15,7 @@ echo '{"test_prompt":"Search for light entities. Report how many you found."}' \
   | uv run python tests/uat/run_uat.py --agents gemini
 ```
 
-Commands must be prefixed with `uv run python` — the repo targets Python 3.13 via uv.
+Commands must be prefixed with `uv run python` — the repo targets Python 3.14 via uv.
 
 For OpenAI-compatible endpoints (LM Studio, Ollama, vLLM), the `--base-url` must include the `/v1` suffix, e.g. `http://172.19.0.1:1234/v1`. LM Studio requires the model to be loaded in its UI first; Ollama auto-loads on demand.
 
@@ -97,6 +97,8 @@ echo '{"test_prompt":"..."}' | uv run python tests/uat/run_uat.py --agents opena
 | `--ha-url` | (start container) | Use existing HA instance |
 | `--ha-token` | test token | HA long-lived access token |
 | `--branch` | (local code) | Git branch/tag for ha-mcp |
+| `--mcp-url` | (start server) | Use this running ha-mcp server (streamable HTTP); needs `--ha-url` |
+| `--dev-env` | — | Decrypted dev environment URLs file; sets `--ha-url` and `--mcp-url` |
 | `--timeout` | 300 | Timeout per phase in seconds |
 | `--base-url` | — | OpenAI-compatible API base URL (required for `openai` agent) |
 | `--api-key` | `no-key` | API key for OpenAI-compatible endpoint |
@@ -106,7 +108,7 @@ echo '{"test_prompt":"..."}' | uv run python tests/uat/run_uat.py --agents opena
 
 ### Stdout: Concise Summary
 
-The calling agent receives a compact summary. On success, phase outputs are omitted to save context:
+The calling agent receives a compact summary. It leaves out the raw JSON to save context:
 
 ```json
 {
@@ -121,6 +123,7 @@ The calling agent receives a compact summary. On success, phase outputs are omit
         "completed": true,
         "duration_ms": 5200,
         "exit_code": 0,
+        "output": "...",
         "num_turns": 3,
         "tool_stats": { "totalCalls": 2, "totalSuccess": 2, "totalFail": 0 }
       },
@@ -128,6 +131,7 @@ The calling agent receives a compact summary. On success, phase outputs are omit
         "completed": true,
         "duration_ms": 8100,
         "exit_code": 0,
+        "output": "...",
         "num_turns": 5,
         "tool_stats": { "totalCalls": 4, "totalSuccess": 4, "totalFail": 0 }
       },
@@ -135,6 +139,7 @@ The calling agent receives a compact summary. On success, phase outputs are omit
         "completed": true,
         "duration_ms": 2100,
         "exit_code": 0,
+        "output": "...",
         "num_turns": 2,
         "tool_stats": { "totalCalls": 1, "totalSuccess": 1, "totalFail": 0 }
       },
@@ -156,7 +161,7 @@ The calling agent receives a compact summary. On success, phase outputs are omit
 - `total_tool_calls` - Total MCP tool invocations
 - `total_tool_success` / `total_tool_fail` - Success/failure counts
 
-On failure, `output` and `stderr` are included in the summary for the failed phase:
+Every phase summary includes `output`, plus `tool_trace` when tool calls were logged. With the OpenAI agent, each `ha_search_tools` call is followed by a `[tool] ha_search_tools returned: [...]` line listing the tool names the search returned, in rank order. A failed phase also includes `stderr` when it is not empty:
 
 ```json
 {
@@ -198,6 +203,17 @@ echo '{"test_prompt":"..."}' | uv run python tests/uat/run_uat.py --branch feat/
 # Compare against master
 echo '{"test_prompt":"..."}' | uv run python tests/uat/run_uat.py --branch master --agents gemini
 ```
+
+## Dev Environment
+
+To run on Home Assistant OS, on the embedded server or the app, or on a machine without Docker, run against a [dev environment](../../docs/dev-ha-env.md) instead of a local container. Start one, decrypt its `dev-ha-env-urls` file, and pass it to either runner:
+
+```bash
+echo '{"test_prompt":"..."}' | uv run python tests/uat/run_uat.py --dev-env dev-ha-env-urls.txt --agents claude
+uv run python tests/uat/stories/run_story.py --all --agents claude --dev-env dev-ha-env-urls.txt
+```
+
+The agents use the environment's ha-mcp server, so `--branch` and `--mcp-env` do not apply: the server is the one the environment runs, set by its `track_ref`. Story setup and verification still run in-process against the environment's Home Assistant. The environment keeps its state between runs. Story results record the revision as `unknown` (`version: running server`), since the code under test is the environment's, not the local checkout. To compare a branch with master, start one environment on each and run the same scenarios against both, with a separate `--results-file` for each.
 
 ## Dependencies
 

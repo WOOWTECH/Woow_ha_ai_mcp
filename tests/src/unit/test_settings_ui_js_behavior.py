@@ -16,163 +16,29 @@ from __future__ import annotations
 
 import json
 import re
-from typing import ClassVar
+from typing import ClassVar, get_args
 
 import pytest
 
-from ._js_harness import HarnessResult, extract_script_body, run_script
+from ._js_harness import (
+    HarnessResult,
+    _assert_clean_init,
+    extract_script_body,
+    run_script,
+)
+from ._locale_catalogs import catalog_messages
+from ._settings_ui_dom import (
+    _TOP_LEVEL_ELEMENT_IDS,
+    DEFAULT_FETCHES,
+    MIN_DOM,
+)
+from ._settings_ui_js_helpers import localized_policy_dom as _localized_policy_dom
+from ._settings_ui_js_helpers import policy_panel_dom as _policy_panel_dom
+from ._settings_ui_js_helpers import probe as _probe
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def settings_script() -> str:
-    """The rendered ``<script>`` body from ``_SETTINGS_HTML``.
-
-    Module-scoped because the body is pure and large; re-extracting on
-    every test would be wasted work.
-    """
-    from ha_mcp.settings_ui import _SETTINGS_HTML
-
-    return extract_script_body(_SETTINGS_HTML)
-
-
-# Element ids the script binds top-level handlers on. Drift between
-# this set and what the production script reaches via
-# ``document.getElementById(...).addEventListener(...)`` is checked at
-# import time by ``_assert_min_dom_covers_handlers`` below, so a future
-# handler that lands without a matching DOM stub fails the suite
-# immediately with a clear message instead of letting tests silently
-# fail at init.
-_TOP_LEVEL_ELEMENT_IDS = [
-    "status",
-    "restartBtn",
-    "restartNotice",
-    "restartNoticeText",
-    "sidecarStopRow",
-    "stopSidecarBtn",
-    "search",
-    "groups",
-    "summary",
-    "featuresBody",
-    "backupConfigForm",
-    "backupConfigActions",
-    "backupConfigSave",
-    "backupConfigStatus",
-    "backupRefresh",
-    "backupBulkDelete",
-    "backupDomain",
-    "backupEntity",
-    "backupState",
-    "backupList",
-    "modalBackdrop",
-    "modalBody",
-    "modalTitle",
-    "modalClose",
-    "panel-tools",
-    "panel-server",
-    "panel-backups",
-    # Tool Security Policies tab (#966): the master-toggle checkbox
-    # mirrors the Server-Settings flag and posts to /api/settings/features;
-    # the global-settings save button writes wait_seconds / TTL.
-    "policy-master-toggle",
-    "policy-save-global-btn",
-    # Read Only Mode toggle (#1569) — Tools tab, above the search box.
-    # Same save-then-verify flow as the policy master toggle.
-    "read-only-mode-toggle",
-    # Advanced settings panel — the 5 section containers that
-    # loadAdvancedSettings() writes to via innerHTML. Without container
-    # divs in MIN_DOM, renderSection silently no-ops (getElementById
-    # returns null) and the behavioural tests find an empty body.
-    # (The advanced fields auto-save on change, so there is no Save
-    # button/status row here anymore.)
-    # Connection section was removed from the panel;
-    # advSearch is now the first rendered advanced section.
-    "advSearch",
-    "advOperations",
-    "advToolsSurface",
-    "advDiagnostics",
-    # Developer section (issue #1775) — bottom of panel-server; hosts the
-    # dev-mode toggle whose enable path is confirm()-gated.
-    "advDeveloper",
-    # Beta features dedicated container — beta
-    # master + sub-flags render here, NOT into featuresBody, so the
-    # dangerous block sits at the bottom of panel-server.
-    "betaBody",
-    # Version footer span — populated from /api/settings/info on
-    # init; without the container element the JS would no-op.
-    "versionFooterText",
-]
-
-
-def _min_dom_row(el_id: str) -> str | None:
-    """DOM stub markup for ``el_id`` (first half of the dispatch); None emits nothing."""
-    if el_id.startswith("backup") and el_id.endswith(("Domain", "Entity", "State")):
-        return f'<select id="{el_id}"></select>'
-    if el_id in ("backupList", "featuresBody"):
-        return f'<table><tbody id="{el_id}"></tbody></table>'
-    if el_id == "modalBackdrop":
-        # Full modal scaffold (mirrors settings.html) so the focus-trap
-        # code in showModal/closeModal — which queries `.modal` and
-        # #modalClose — has the structure it depends on.
-        return (
-            '<div id="modalBackdrop">'
-            '<div class="modal" role="dialog" tabindex="-1">'
-            '<div class="modal-header">'
-            '<span class="modal-title" id="modalTitle"></span>'
-            '<button class="modal-close" id="modalClose">×</button>'
-            "</div>"
-            '<div class="modal-body" id="modalBody"></div>'
-            "</div>"
-            "</div>"
-        )
-    if el_id in ("modalBody", "modalTitle", "modalClose"):
-        return None  # rendered as children of modalBackdrop above
-    if el_id.startswith("panel-"):
-        return f'<div id="{el_id}" class="panel"></div>'
-    return _min_dom_row_tail(el_id)
-
-
-def _min_dom_row_tail(el_id: str) -> str | None:
-    """DOM stub markup for ``el_id`` (second half of the dispatch); None emits nothing."""
-    if el_id in (
-        "restartBtn",
-        "stopSidecarBtn",
-        "backupConfigSave",
-        "backupRefresh",
-        "backupBulkDelete",
-    ):
-        return f'<button id="{el_id}"></button>'
-    if el_id == "restartNotice":
-        return '<div id="restartNotice"><span id="restartNoticeText"></span></div>'
-    if el_id == "restartNoticeText":
-        return None  # rendered as a child of restartNotice above
-    if el_id == "search":
-        return '<input id="search" />'
-    if el_id in ("policy-master-toggle", "read-only-mode-toggle"):
-        return f'<input id="{el_id}" type="checkbox" />'
-    if el_id == "policy-save-global-btn":
-        return '<button id="policy-save-global-btn"></button>'
-    return f'<div id="{el_id}"></div>'
-
-
-def _build_min_dom() -> str:
-    """Render an HTML document that supplies every element the script
-    binds a top-level handler on, so the init pass doesn't throw on a
-    missing-element addEventListener call.
-    """
-    rows = []
-    for el_id in _TOP_LEVEL_ELEMENT_IDS:
-        row = _min_dom_row(el_id)
-        if row is not None:
-            rows.append(row)
-    body = "\n  ".join(rows)
-    return f"<!DOCTYPE html>\n<html><body>\n  {body}\n</body></html>"
-
-
-MIN_DOM = _build_min_dom()
 
 
 def _assert_min_dom_covers_handlers() -> None:
@@ -185,9 +51,9 @@ def _assert_min_dom_covers_handlers() -> None:
     maintainer would have to dig through ``result.errors`` to find the
     actual root cause.
     """
-    from ha_mcp.settings_ui import _SETTINGS_HTML
+    from ha_mcp.settings_ui import render_settings_html
 
-    script = extract_script_body(_SETTINGS_HTML)
+    script = extract_script_body(render_settings_html())
     # Top-level (not indented) getElementById(...) calls — handlers
     # bound at script load time. Indented calls are inside functions
     # and only run when those functions execute, which our tests
@@ -207,26 +73,13 @@ def _assert_min_dom_covers_handlers() -> None:
 _assert_min_dom_covers_handlers()
 
 
-# Default routes for the init-time fetches. Individual tests merge in
-# their own entries via ``{**DEFAULT_FETCHES, "/restart": ...}``.
-DEFAULT_FETCHES: dict[str, dict] = {
-    "/api/settings/features": {
-        "status": 200,
-        "json": {"features": [], "values": {}},
-    },
-    "/api/settings/tools": {
-        "status": 200,
-        "json": {"tools": [], "states": {}, "addon_mode": True},
-    },
-    "/api/settings/info": {
-        "status": 200,
-        "json": {"instance_id": "baseline-id"},
-    },
-    "/api/settings/backup-config": {
-        "status": 200,
-        "json": {},
-    },
-}
+# The add-on tool as the settings API renders it, plus a Russian translation
+# supplied by the tests themselves (see _app_tool_dom).
+APP_TOOL_NAME = "ha_get_app"
+APP_TOOL_TITLE = "Get Apps (add-ons)"
+APP_TOOL_GROUP = "Apps (add-ons)"
+APP_TOOL_TITLE_RU = "Получить приложения"
+APP_TOOL_GROUP_RU = "Приложения"
 
 
 class TestLocalizationBehavior:
@@ -237,12 +90,15 @@ class TestLocalizationBehavior:
         locale: str = "ru",
         *,
         tools: dict[str, dict[str, str]] | None = None,
+        tool_groups: dict[str, str] | None = None,
     ) -> str:
-        from ha_mcp.settings_ui._i18n import build_payload, serialize_payload
+        from ha_mcp.settings_ui import build_payload, serialize_payload
 
         catalog = build_payload(locale)
         if tools:
             catalog["tools"].update(tools)
+        if tool_groups:
+            catalog["tool_groups"].update(tool_groups)
         payload = serialize_payload(catalog)
         additions = (
             f'<script id="ha-mcp-i18n" type="application/json">{payload}</script>'
@@ -251,18 +107,20 @@ class TestLocalizationBehavior:
         )
         return MIN_DOM.replace("</body>", additions + "</body>")
 
-    def test_russian_static_group_and_tool_copy(self, settings_script: str) -> None:
-        fetches = {
+    @staticmethod
+    def _app_tool_fetches() -> dict:
+        """The tools endpoint as the server renders it for the add-on tool."""
+        return {
             **DEFAULT_FETCHES,
             "/api/settings/tools": {
                 "status": 200,
                 "json": {
                     "tools": [
                         {
-                            "name": "ha_get_addon",
-                            "title": "Get Add-ons",
-                            "description": "Get Home Assistant add-ons.",
-                            "primary_tag": "Add-ons",
+                            "name": APP_TOOL_NAME,
+                            "title": APP_TOOL_TITLE,
+                            "description": "Get Home Assistant apps.",
+                            "primary_tag": APP_TOOL_GROUP,
                             "category": "read",
                         }
                     ],
@@ -270,54 +128,64 @@ class TestLocalizationBehavior:
                 },
             },
         }
+
+    def _app_tool_dom(self) -> str:
+        """A catalog carrying a translation for that tool and its group.
+
+        Both entries are supplied here instead of read out of the shipped
+        Russian catalog. What the catalogs hold for this tool is not this
+        test's subject and does not stand still: the English behind the
+        heading and the title moves through the post-merge sync, which re-keys
+        the group and retranslates the title under the tool's current name.
+        Pinning the shipped Russian made this test green in a PR and red on
+        master one sync later, and reading it back would make the localized
+        search term collapse onto the English one for as long as the key is
+        missing — the test would keep passing while testing nothing.
+        """
+        return self._localized_dom(
+            tools={
+                APP_TOOL_NAME: {
+                    "title": APP_TOOL_TITLE_RU,
+                    "description": "Список приложений",
+                }
+            },
+            tool_groups={APP_TOOL_GROUP: APP_TOOL_GROUP_RU},
+        )
+
+    def test_russian_static_group_and_tool_copy(self, settings_script: str) -> None:
         result = run_script(
             settings_script,
-            initial_html=self._localized_dom(),
-            fetch_map=fetches,
+            initial_html=self._app_tool_dom(),
+            fetch_map=self._app_tool_fetches(),
         )
         assert not result.errors
         assert "Инструменты" in result.dom
-        assert "Дополнения" in result.dom
-        assert "Получить дополнения" in result.dom
+        assert APP_TOOL_GROUP_RU in result.dom
+        assert APP_TOOL_TITLE_RU in result.dom
 
     def test_tool_search_matches_localized_title(self, settings_script: str) -> None:
-        fetches = {
-            **DEFAULT_FETCHES,
-            "/api/settings/tools": {
-                "status": 200,
-                "json": {
-                    "tools": [
-                        {
-                            "name": "ha_get_addon",
-                            "title": "Get Add-ons",
-                            "description": "Get Home Assistant add-ons.",
-                            "primary_tag": "Add-ons",
-                            "category": "read",
-                        }
-                    ],
-                    "states": {},
-                },
-            },
-        }
-        result = run_script(
-            settings_script,
-            initial_html=self._localized_dom(),
-            fetch_map=fetches,
-            invoke="""
+        invoke = """
               await new Promise(r => setTimeout(r, 200));
               const search = document.getElementById('search');
-              search.value = 'получить дополнения';
+              search.value = '__LOCALIZED__';
               search.dispatchEvent(new Event('input', {bubbles: true}));
-              const row = document.querySelector('[data-name="ha_get_addon"]');
+              const row = document.querySelector('[data-name="__NAME__"]');
               document.body.dataset.localizedSearchMatch = String(
                 row && !row.classList.contains('hidden')
               );
-              search.value = 'get add-ons';
+              search.value = '__SOURCE__';
               search.dispatchEvent(new Event('input', {bubbles: true}));
               document.body.dataset.sourceSearchMatch = String(
                 row && !row.classList.contains('hidden')
               );
-            """,
+            """
+        result = run_script(
+            settings_script,
+            initial_html=self._app_tool_dom(),
+            fetch_map=self._app_tool_fetches(),
+            invoke=invoke.replace("__LOCALIZED__", APP_TOOL_TITLE_RU.lower())
+            .replace("__SOURCE__", APP_TOOL_TITLE.lower())
+            .replace("__NAME__", APP_TOOL_NAME),
         )
         assert not result.errors
         assert 'data-localized-search-match="true"' in result.dom
@@ -490,7 +358,7 @@ class TestTranslationHtmlSanitization:
 
     @staticmethod
     def _dom_with_catalog(messages: dict[str, str], extra_html: str = "") -> str:
-        from ha_mcp.settings_ui._i18n import build_payload, serialize_payload
+        from ha_mcp.settings_ui import build_payload, serialize_payload
 
         catalog = build_payload("en")
         catalog["messages"].update(messages)
@@ -595,34 +463,24 @@ class TestTranslationHtmlSanitization:
         assert "<em onmouseover" not in result.dom
 
 
-def _assert_clean_init(result: HarnessResult) -> None:
-    """Fail loud on any script-init or transpile error.
-
-    Each test in this file asserts on side effects (fetches, broadcasts,
-    reloads, alerts). When the script throws at init time the side
-    effects come back empty, the side-effect assertion fires with a
-    misleading message ("expected 1 POST, got 0"), and the actual root
-    cause sits in ``result.errors``. Calling this at the top of every
-    test surfaces the real error first.
-    """
-    init_errors = [
-        e
-        for e in result.errors
-        if e.startswith(("script init:", "transpile failure", "invoke:", "jsdom error"))
-    ]
-    assert not init_errors, f"script failed to initialise: {init_errors}"
-
-
 # ---------------------------------------------------------------------------
 # restartAddon() flow
 # ---------------------------------------------------------------------------
 
 
 class TestVersionFooter:
-    """The version footer at the bottom of the settings page reads from
-    /api/settings/info on init and renders ``ha-mcp <version>`` so an
-    operator can see the running build without leaving the UI.
+    """The footer at the bottom of the settings page reads from
+    /api/settings/info on init and renders the running version and installation
+    method so an operator can identify the active build without leaving the UI.
     """
+
+    @staticmethod
+    def _footer_text(result: HarnessResult) -> str:
+        match = re.search(r'id="versionFooterText">([^<]*)</div>', result.dom)
+        assert match is not None, (
+            f"version footer missing; dom tail: {result.dom[-1500:]}"
+        )
+        return match.group(1)
 
     def test_version_rendered_from_settings_info(self, settings_script: str) -> None:
         fetches = {
@@ -645,8 +503,102 @@ class TestVersionFooter:
             invoke="await new Promise(r => setTimeout(r, 200));",
         )
         _assert_clean_init(result)
-        assert "ha-mcp 7.5.0.dev400" in result.dom, (
-            f"version footer missing or wrong; dom tail: {result.dom[-1500:]}"
+        assert self._footer_text(result) == "ha-mcp 7.5.0.dev400"
+
+    @pytest.mark.parametrize(
+        ("deployment_mode", "expected_label"),
+        [
+            ("embedded", "embedded"),
+            ("sidecar", "sidecar"),
+            ("addon", "app/add-on"),
+            ("docker", "container/docker"),
+            ("git", "source checkout"),
+            ("pypi", "python package"),
+            ("unknown", "unknown"),
+            ("future-mode", "future-mode"),
+            ("constructor", "constructor"),
+        ],
+    )
+    def test_installation_method_rendered_from_settings_info(
+        self,
+        settings_script: str,
+        deployment_mode: str,
+        expected_label: str,
+    ) -> None:
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/settings/info": {
+                "status": 200,
+                "json": {
+                    "is_addon": deployment_mode == "addon",
+                    "is_sidecar": deployment_mode == "sidecar",
+                    "deployment_mode": deployment_mode,
+                    "instance_id": "test-id",
+                    "started_at": 0,
+                    "version": "8.2.0",
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=fetches,
+            invoke="await new Promise(r => setTimeout(r, 200));",
+        )
+        _assert_clean_init(result)
+        assert (
+            self._footer_text(result)
+            == f"ha-mcp 8.2.0 · installation: {expected_label}"
+        )
+
+    @pytest.mark.parametrize(
+        ("deployment_mode", "translated_label"),
+        [("embedded", "intégré"), ("sidecar", "accompagnement")],
+    )
+    def test_server_mode_labels_stay_raw_when_footer_phrase_is_localized(
+        self,
+        settings_script: str,
+        deployment_mode: str,
+        translated_label: str,
+    ) -> None:
+        from ha_mcp.settings_ui import build_payload, serialize_payload
+
+        catalog = build_payload("fr")
+        catalog["messages"].update(
+            {
+                "footer.installation": "mode d’installation : {method}",
+                f"footer.deployment.{deployment_mode}": translated_label,
+            }
+        )
+        payload = serialize_payload(catalog)
+        localized_dom = MIN_DOM.replace(
+            "</body>",
+            f'<script id="ha-mcp-i18n" type="application/json">{payload}</script>'
+            "</body>",
+        )
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/settings/info": {
+                "status": 200,
+                "json": {
+                    "is_addon": False,
+                    "is_sidecar": deployment_mode == "sidecar",
+                    "deployment_mode": deployment_mode,
+                    "instance_id": "test-id",
+                    "started_at": 0,
+                    "version": "8.2.0",
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=localized_dom,
+            fetch_map=fetches,
+            invoke="await new Promise(r => setTimeout(r, 200));",
+        )
+        _assert_clean_init(result)
+        assert self._footer_text(result) == (
+            f"ha-mcp 8.2.0 · mode d’installation : {deployment_mode}"
         )
 
     def test_version_omitted_when_info_response_lacks_version(
@@ -675,7 +627,7 @@ class TestVersionFooter:
             invoke="await new Promise(r => setTimeout(r, 200));",
         )
         _assert_clean_init(result)
-        assert "ha-mcp undefined" not in result.dom
+        assert self._footer_text(result) == ""
 
 
 class TestXssGuard:
@@ -923,9 +875,9 @@ class TestRestartAddonFlow:
             "probe must not reload when instance_id never flips — "
             "that would land the user back on the same broken instance"
         )
-        assert "did not come back online" in result.dom.lower(), (
-            f"expected manual-reload fallback message, dom={result.dom[:600]}"
-        )
+        assert (
+            "did not come back online. reload the page manually." in result.dom.lower()
+        ), f"expected manual-reload fallback message, dom={result.dom[:600]}"
 
 
 # ---------------------------------------------------------------------------
@@ -1105,25 +1057,44 @@ class TestSaveFeatureFlagJsonParseFallback:
 # ---------------------------------------------------------------------------
 
 
-def _policy_panel_dom() -> str:
-    """MIN_DOM stub plus the elements the policy tab queries.
+def _server_503_body() -> str:
+    """The exact 503 body the server sends, not a copy of it.
 
-    The script binds top-level handlers on policy-master-toggle /
-    policy-save-global-btn (covered by MIN_DOM), but the bodies of
-    policyLoadConfig / policyLoadPending fetch and write into
-    policy-* sub-elements that don't appear in MIN_DOM. Add the
-    minimum set so the policy-tab invocations don't throw on missing
-    elements when we exercise them directly.
+    A hand-written fixture drifts, and drifts in the direction that keeps its
+    own assertion passing: the first two copies of this paragraph in this file
+    both dropped the sentence naming the three causes and wrote ``addon log``
+    where the server writes ``app (add-on) log``, so an assertion on
+    ``addon log`` passed only because the fixture was wrong.
     """
-    extras = """
-      <div id="policy-pending-list"></div>
-      <div id="policy-load-error" style="display:none"></div>
-      <div id="policy-rules-empty" style="display:none"></div>
-      <div id="policy-rules-list"></div>
-      <input id="policy-wait-seconds" />
-      <input id="policy-ttl-minutes" />
-    """
-    return MIN_DOM.replace("</body>", extras + "</body>")
+    from ha_mcp.settings_ui import POLICY_UNAVAILABLE_MESSAGE
+
+    return POLICY_UNAVAILABLE_MESSAGE
+
+
+# One /api/settings/features reply carrying the policy-tool flag as off.
+# Reused across the save-flow tests below, whose `responses` arrays must
+# account for EVERY call to that URL, GET and POST alike — the queue is
+# keyed by URL, not method. Init alone makes TWO reads (loadTools ->
+# loadPolicyState, and loadFeatureFlags), so each sequence below opens with
+# three of these: the two init reads plus the explicit sync in `invoke`.
+_OFF_FLAG_RESPONSE: dict = {
+    "status": 200,
+    "json": {"flags": {"enable_security_policy_tool": {"value": False}}},
+}
+
+# Both Policies-tab flags reported and off: the state a real operator starts
+# from. The POST-body tests need it because an ABSENT flag entry now renders
+# its switch indeterminate and disabled — dispatching a synthetic change on
+# that switch would exercise a click no user could make.
+_BOTH_POLICY_FLAGS_OFF_RESPONSE: dict = {
+    "status": 200,
+    "json": {
+        "flags": {
+            "enable_tool_security_policies": {"value": False},
+            "enable_security_policy_tool": {"value": False},
+        }
+    },
+}
 
 
 class TestPolicyTabFlow:
@@ -1144,8 +1115,20 @@ class TestPolicyTabFlow:
         fetches = {
             **DEFAULT_FETCHES,
             "/api/settings/features": {
-                "status": 200,
-                "json": {"restart_required": True},
+                "responses": [
+                    _BOTH_POLICY_FLAGS_OFF_RESPONSE,  # 1-2: the two init reads
+                    _BOTH_POLICY_FLAGS_OFF_RESPONSE,
+                    _BOTH_POLICY_FLAGS_OFF_RESPONSE,  # 3: the explicit sync below
+                    # 4: the save POST (sticks for the follow-up re-read;
+                    # the applied echo then paints the confirmed state).
+                    {
+                        "status": 200,
+                        "json": {
+                            "applied": {"enable_tool_security_policies": True},
+                            "restart_required": True,
+                        },
+                    },
+                ]
             },
         }
         result = run_script(
@@ -1153,13 +1136,26 @@ class TestPolicyTabFlow:
             initial_html=_policy_panel_dom(),
             fetch_map=fetches,
             invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.syncPolicyGlobalToggles();
               const cb = document.getElementById('policy-master-toggle');
+              const pre = document.createElement('div');
+              pre.id = '__master_pre_dispatch_probe';
+              pre.dataset.disabled = String(cb.disabled);
+              pre.dataset.indeterminate = String(cb.indeterminate);
+              document.body.appendChild(pre);
               cb.checked = true;
               cb.dispatchEvent(new Event('change'));
-              await new Promise(r => setTimeout(r, 50));
+              await new Promise(r => setTimeout(r, 100));
             """,
         )
         _assert_clean_init(result)
+        pre = re.search(r'<div[^>]*id="__master_pre_dispatch_probe"[^>]*>', result.dom)
+        assert pre is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        assert 'data-disabled="false"' in pre.group(0), (
+            f"switch must be editable before the synthetic click: {pre.group(0)}"
+        )
+        assert 'data-indeterminate="false"' in pre.group(0), pre.group(0)
         flag_posts = [
             f
             for f in result.fetches
@@ -1179,7 +1175,7 @@ class TestPolicyTabFlow:
                 continue
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError, TypeError:
                 continue
             flags = body.get("flags") if isinstance(body, dict) else None
             if (
@@ -1194,33 +1190,749 @@ class TestPolicyTabFlow:
             f"got {[f.get('body') for f in flag_posts]}"
         )
 
-    def test_pending_list_shows_off_message_when_feature_disabled(
+    def test_manage_tool_toggle_change_posts_to_features_endpoint(
         self, settings_script: str
     ) -> None:
-        """When the addon flag is off, /api/policy/pending 503s. The
-        UI should tell the user the feature is just turned off — NOT
-        the misleading "sidecar / unavailable" text the earlier code
-        showed. This catches regressions where the new copy gets
-        clobbered back to the generic message."""
+        """The policy-editing-tool toggle must POST
+        ``{flags: {enable_security_policy_tool: true}}`` to the same
+        feature-flag endpoint the master toggle uses (#2148) — it is an
+        ordinary feature flag, not a policy-document field."""
         fetches = {
             **DEFAULT_FETCHES,
-            # Feature flag explicitly disabled
             "/api/settings/features": {
-                "status": 200,
-                "json": {
-                    "flags": {
-                        "enable_tool_security_policies": {"value": False},
+                "responses": [
+                    _BOTH_POLICY_FLAGS_OFF_RESPONSE,  # 1-2: the two init reads
+                    _BOTH_POLICY_FLAGS_OFF_RESPONSE,
+                    _BOTH_POLICY_FLAGS_OFF_RESPONSE,  # 3: the explicit sync below
+                    # 4: the save POST (sticks for the follow-up re-read;
+                    # the applied echo then paints the confirmed state).
+                    {
+                        "status": 200,
+                        "json": {
+                            "applied": {"enable_security_policy_tool": True},
+                            "restart_required": True,
+                        },
+                    },
+                ]
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.syncPolicyGlobalToggles();
+              const cb = document.getElementById('policy-manage-tool-toggle');
+              const pre = document.createElement('div');
+              pre.id = '__manage_pre_dispatch_probe';
+              pre.dataset.disabled = String(cb.disabled);
+              pre.dataset.indeterminate = String(cb.indeterminate);
+              document.body.appendChild(pre);
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 100));
+            """,
+        )
+        _assert_clean_init(result)
+        pre = re.search(r'<div[^>]*id="__manage_pre_dispatch_probe"[^>]*>', result.dom)
+        assert pre is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        assert 'data-disabled="false"' in pre.group(0), (
+            f"switch must be editable before the synthetic click: {pre.group(0)}"
+        )
+        assert 'data-indeterminate="false"' in pre.group(0), pre.group(0)
+        matched = False
+        for f in result.fetches:
+            if f["method"] != "POST" or "/api/settings/features" not in f["url"]:
+                continue
+            try:
+                body = json.loads(f.get("body", ""))
+            except json.JSONDecodeError, TypeError:
+                continue
+            flags = body.get("flags") if isinstance(body, dict) else None
+            if (
+                isinstance(flags, dict)
+                and flags.get("enable_security_policy_tool") is True
+            ):
+                matched = True
+                break
+        assert matched, (
+            "expected POST body containing "
+            "{'flags': {'enable_security_policy_tool': True}}; got "
+            f"{[f.get('body') for f in result.fetches if f['method'] == 'POST']}"
+        )
+
+    def test_manage_tool_toggle_reverts_when_save_fails(
+        self, settings_script: str
+    ) -> None:
+        """A failed save must snap the switch back to its previous value.
+        Leaving it visually on would tell the operator that agents can edit
+        the policies when the server still says they cannot (or vice versa)."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/settings/features": {
+                "responses": [
+                    _OFF_FLAG_RESPONSE,  # 1-2: the two init reads
+                    _OFF_FLAG_RESPONSE,
+                    _OFF_FLAG_RESPONSE,  # 3: the explicit sync below
+                    # 4: the save itself fails — the server still holds the
+                    # previous value, so reverting IS correct here.
+                    {"status": 500, "json": {"error": {"message": "nope"}}},
+                ]
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.syncPolicyGlobalToggles();
+              const cb = document.getElementById('policy-manage-tool-toggle');
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 100));
+              const probe = document.createElement('div');
+              probe.id = '__manage_tool_probe';
+              probe.dataset.checked = String(cb.checked);
+              probe.dataset.indeterminate = String(cb.indeterminate);
+              probe.dataset.disabled = String(cb.disabled);
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        m = re.search(r'<div[^>]*id="__manage_tool_probe"[^>]*>', result.dom)
+        assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        assert 'data-checked="false"' in m.group(0), (
+            f"failed save must revert the switch to its previous value: {m.group(0)}"
+        )
+        # Reverted must also mean retryable: a rejected save leaves the
+        # server's value known, so the switch stays editable, not unknown.
+        assert 'data-indeterminate="false"' in m.group(0), m.group(0)
+        assert 'data-disabled="false"' in m.group(0), m.group(0)
+
+    def test_unconfirmed_save_keeps_the_applied_value(
+        self, settings_script: str
+    ) -> None:
+        """Save succeeded, follow-up read failed: the POST echoes `applied`
+        — the server stating what it persisted — so the switch shows that
+        instead of reverting to a pre-flip state the server no longer has."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "responses": [
+                        _OFF_FLAG_RESPONSE,  # 1-2: the two init reads
+                        _OFF_FLAG_RESPONSE,
+                        _OFF_FLAG_RESPONSE,  # 3: the explicit sync below
+                        # 4: the save POST, echoing what it wrote
+                        {
+                            "status": 200,
+                            "json": {
+                                "applied": {"enable_security_policy_tool": True},
+                                "restart_required": True,
+                            },
+                        },
+                        # 5: the confirming re-read fails
+                        {"status": 503, "json": {}},
+                    ]
+                },
+            },
+            invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.syncPolicyGlobalToggles();
+              const cb = document.getElementById('policy-manage-tool-toggle');
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 100));
+              const probe = document.createElement('div');
+              probe.id = '__applied_probe';
+              probe.dataset.checked = String(cb.checked);
+              probe.dataset.indeterminate = String(cb.indeterminate);
+              probe.dataset.disabled = String(cb.disabled);
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        m = re.search(r'<div[^>]*id="__applied_probe"[^>]*>', result.dom)
+        assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        tag = m.group(0)
+        assert 'data-checked="true"' in tag, (
+            f"the echoed applied value must survive a failed re-read: {tag}"
+        )
+        assert 'data-indeterminate="false"' in tag, tag
+        assert 'data-disabled="false"' in tag, tag
+
+    def test_unconfirmed_save_without_echo_goes_unknown(
+        self, settings_script: str
+    ) -> None:
+        """Save succeeded but neither the response nor the re-read says
+        what the server now holds: the switch goes to the unknown
+        treatment. Reverting to the pre-flip value would assert a state
+        nobody verified."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "responses": [
+                        _OFF_FLAG_RESPONSE,  # 1-2: the two init reads
+                        _OFF_FLAG_RESPONSE,
+                        _OFF_FLAG_RESPONSE,  # 3: the explicit sync below
+                        # 4: the save — 200 with no `applied` echo
+                        # (truncated body).
+                        {"status": 200, "json": {"restart_required": True}},
+                        {"status": 503, "json": {}},  # 5: re-read fails
+                    ]
+                },
+            },
+            invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.syncPolicyGlobalToggles();
+              const cb = document.getElementById('policy-manage-tool-toggle');
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 100));
+              const notice = document.getElementById('policyUnknownNotice');
+              const probe = document.createElement('div');
+              probe.id = '__unconfirmed_probe';
+              probe.dataset.blocked = String(cb.indeterminate && cb.disabled);
+              probe.dataset.shown = String(
+                !!notice && notice.classList.contains('show'));
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        m = re.search(r'<div[^>]*id="__unconfirmed_probe"[^>]*>', result.dom)
+        assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        tag = m.group(0)
+        assert 'data-blocked="true"' in tag, (
+            f"an unconfirmed save must leave the switch unknown, not reverted "
+            f"and editable: {tag}"
+        )
+        assert 'data-shown="true"' in tag, f"unknown notice must show: {tag}"
+
+    def test_missing_flag_entry_is_unknown_not_off(self, settings_script: str) -> None:
+        """Known is per FLAG, not per response. A 200 that omits one flag
+        entry says nothing about that flag; rendering it as an editable
+        "off" invites a save that overwrites an enabled server value (a
+        server build older than this UI, or an overlay dropping the key).
+        The flag that IS present must still render normally."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "status": 200,
+                    "json": {
+                        "flags": {
+                            # Master present and on; the policy-tool flag is
+                            # absent from the payload entirely.
+                            "enable_tool_security_policies": {
+                                "value": True,
+                                "origin": "file",
+                                "editable": True,
+                            }
+                        }
                     },
                 },
             },
-            # Stub policy config endpoints so policyLoadConfig doesn't 500
+            invoke="""
+              await window.syncPolicyGlobalToggles();
+              const master = document.getElementById('policy-master-toggle');
+              const tool = document.getElementById('policy-manage-tool-toggle');
+              const notice = document.getElementById('policyUnknownNotice');
+              const probe = document.createElement('div');
+              probe.id = '__missing_flag_probe';
+              probe.dataset.masterChecked = String(master.checked);
+              probe.dataset.masterBlocked = String(
+                master.indeterminate || master.disabled);
+              probe.dataset.toolBlocked = String(
+                tool.indeterminate && tool.disabled);
+              probe.dataset.shown = String(
+                !!notice && notice.classList.contains('show'));
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        m = re.search(r'<div[^>]*id="__missing_flag_probe"[^>]*>', result.dom)
+        assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        tag = m.group(0)
+        assert 'data-master-checked="true"' in tag, (
+            f"the flag the payload DID carry must render from its value: {tag}"
+        )
+        assert 'data-master-blocked="false"' in tag, (
+            f"a present flag must stay editable: {tag}"
+        )
+        assert 'data-tool-blocked="true"' in tag, (
+            f"an omitted flag entry must render unknown, not off-and-editable: {tag}"
+        )
+        assert 'data-shown="true"' in tag, (
+            f"the notice must show when EITHER policy flag is unknown: {tag}"
+        )
+
+    def test_env_pinned_flag_locks_the_switch(self, settings_script: str) -> None:
+        """editable:false means every save is rejected server-side, so the
+        switch must lock and name the env var instead of looking usable
+        (the treatment the generated Server Settings rows already get)."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "status": 200,
+                    "json": {
+                        "is_addon": False,
+                        "flags": {
+                            "enable_security_policy_tool": {
+                                "value": True,
+                                "origin": "env",
+                                "editable": False,
+                                "env_var": "ENABLE_SECURITY_POLICY_TOOL",
+                            }
+                        },
+                    },
+                },
+            },
+            invoke="""
+              await window.syncPolicyGlobalToggles();
+              const cb = document.getElementById('policy-manage-tool-toggle');
+              const probe = document.createElement('div');
+              probe.id = '__pinned_probe';
+              probe.dataset.checked = String(cb.checked);
+              probe.dataset.disabled = String(cb.disabled);
+              probe.dataset.indeterminate = String(cb.indeterminate);
+              // Booleans, not the note's HTML: markup inside a data-
+              // attribute closes the probe tag early for the reader below.
+              const note = document.getElementById('policy-manage-tool-locked');
+              probe.dataset.noteNamesVar = String(
+                note.innerHTML.includes('ENABLE_SECURITY_POLICY_TOOL'));
+              probe.dataset.noteShown = String(note.style.display !== 'none');
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        m = re.search(r'<div[^>]*id="__pinned_probe"[^>]*>', result.dom)
+        assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        tag = m.group(0)
+        assert 'data-disabled="true"' in tag, (
+            f"an env-pinned flag's switch must be disabled: {tag}"
+        )
+        # Known-but-locked is not the same as unknown: the value IS known.
+        assert 'data-indeterminate="false"' in tag, tag
+        assert 'data-checked="true"' in tag, tag
+        assert 'data-note-shown="true"' in tag, (
+            f"the locked note must be visible: {tag}"
+        )
+        assert 'data-note-names-var="true"' in tag, (
+            f"the locked note must name the env var that pins it: {tag}"
+        )
+
+    def test_policy_toggles_unknown_when_features_fetch_fails(
+        self, settings_script: str
+    ) -> None:
+        """When /api/settings/features fails, both Policies-tab switches are
+        unknown: the notice shows and each switch goes indeterminate +
+        disabled rather than rendering a confident "off" (#2148). Mirrors the
+        Tools-tab read-only unknown-state treatment."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {"status": 503, "json": {}},
+            },
+            invoke="""
+              await window.syncPolicyGlobalToggles();
+              const notice = document.getElementById('policyUnknownNotice');
+              const master = document.getElementById('policy-master-toggle');
+              const tool = document.getElementById('policy-manage-tool-toggle');
+              const probe = document.createElement('div');
+              probe.id = '__policy_unknown_probe';
+              probe.dataset.shown = String(
+                !!notice && notice.classList.contains('show'));
+              probe.dataset.masterBlocked = String(
+                master.indeterminate && master.disabled);
+              probe.dataset.toolBlocked = String(
+                tool.indeterminate && tool.disabled);
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        m = re.search(r'<div[^>]*id="__policy_unknown_probe"[^>]*>', result.dom)
+        assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        tag = m.group(0)
+        assert 'data-shown="true"' in tag, f"unknown notice must show: {tag}"
+        assert 'data-master-blocked="true"' in tag, (
+            f"master switch must be indeterminate + disabled while unknown: {tag}"
+        )
+        assert 'data-tool-blocked="true"' in tag, (
+            f"policy-tool switch must be indeterminate + disabled while unknown: {tag}"
+        )
+
+    def test_gate_toggle_preserves_conditional_rules(
+        self, settings_script: str
+    ) -> None:
+        """Un-gating a tool must remove only the bare unconditional rule, not
+        a predicate-bearing rule the user authored in the policy editor. The
+        gate toggle keys on the ``when == []`` rule; conditional rules survive."""
+        fetches = {
+            **DEFAULT_FETCHES,
             "/api/policy/config": {
                 "status": 200,
-                "json": {"wait_seconds": 60, "approval_ttl_minutes": 5, "rules": []},
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 3,
+                    "rules": [
+                        {
+                            "tool_name": "ha_call_service",
+                            "when": [
+                                {"path": "args.domain", "op": "eq", "value": "lock"}
+                            ],
+                            "remember_minutes": 0,
+                        }
+                    ],
+                },
             },
-            "/api/policy/pending": {
-                "status": 503,
-                "json": {"error": "irrelevant when flag is off"},
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="await loadPolicyState(); await window.syncPolicyRule('ha_call_service', false);",
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1, (
+            f"expected one PUT to policy config; got {result.fetches}"
+        )
+        body = json.loads(puts[0]["body"])
+        rules = body.get("rules", [])
+        # The conditional rule survives un-gating; nothing was wiped.
+        assert len(rules) == 1, f"conditional rule was wrongly removed: {rules}"
+        assert rules[0]["when"], "expected the predicate-bearing rule to remain"
+
+    def test_gate_toggle_on_adds_bare_rule_beside_conditional(
+        self, settings_script: str
+    ) -> None:
+        """Enable direction: turning the Tools-tab gate ON when a conditional
+        rule already exists must ADD the bare unconditional rule (not silently
+        no-op), so the tool is gated for every call."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 2,
+                    "rules": [
+                        {
+                            "tool_name": "ha_call_service",
+                            "when": [
+                                {"path": "args.domain", "op": "eq", "value": "lock"}
+                            ],
+                            "remember_minutes": 0,
+                        }
+                    ],
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="await loadPolicyState(); await window.syncPolicyRule('ha_call_service', true);",
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1
+        rules = json.loads(puts[0]["body"])["rules"]
+        assert len(rules) == 2
+        assert any(r["tool_name"] == "ha_call_service" and not r["when"] for r in rules)
+        assert any(r["when"] for r in rules)  # conditional rule preserved
+
+    def test_save_rule_expands_conditions_into_separate_rules(
+        self, settings_script: str
+    ) -> None:
+        """Each condition on a card persists as its OWN rule so they OR at
+        evaluation (gate if ANY matches), not one AND-ed rule."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 0,
+                    "rules": [],
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await policyLoadConfig();
+              await window.savePolicyRule('ha_call_service', {
+                tool_name: 'ha_call_service',
+                conditions: [
+                  [{path: 'args.domain', op: 'eq', value: 'lock'}],
+                  [{path: 'args.domain', op: 'eq', value: 'alarm_control_panel'}]
+                ],
+                remember_minutes: 0
+              });
+            """,
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1
+        rules = json.loads(puts[0]["body"])["rules"]
+        assert len(rules) == 2, f"expected one rule per condition; got {rules}"
+        assert all(
+            r["tool_name"] == "ha_call_service" and len(r["when"]) == 1 for r in rules
+        )
+
+    def test_save_rule_preserves_multi_predicate_condition(
+        self, settings_script: str
+    ) -> None:
+        """A condition with AND-ed sub-parameters (multi-predicate rule) must
+        round-trip as ONE rule — not be flattened into separate OR rules."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 0,
+                    "rules": [],
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await policyLoadConfig();
+              await window.savePolicyRule('ha_call_service', {
+                tool_name: 'ha_call_service',
+                conditions: [
+                  [
+                    {path: 'args.domain', op: 'eq', value: 'lock'},
+                    {path: 'args.service', op: 'eq', value: 'unlock'}
+                  ]
+                ],
+                remember_minutes: 0
+              });
+            """,
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1
+        rules = json.loads(puts[0]["body"])["rules"]
+        assert len(rules) == 1, f"multi-predicate condition was split: {rules}"
+        assert len(rules[0]["when"]) == 2
+
+    def test_save_rule_preserves_rule_order(self, settings_script: str) -> None:
+        """Saving a card must replace the tool's rules IN PLACE — rule order
+        is behaviorally significant (find_matching_rule takes the FIRST
+        match's remember_minutes), so a tool rule must not slide behind a
+        wildcard rule on edit (Codex #1993 round 3)."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 1,
+                    "rules": [
+                        {
+                            "tool_name": "ha_call_service",
+                            "when": [
+                                {"path": "args.domain", "op": "eq", "value": "lock"}
+                            ],
+                            "remember_minutes": 5,
+                        },
+                        {"tool_name": "*", "when": [], "remember_minutes": 60},
+                    ],
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await policyLoadConfig();
+              await window.savePolicyRule('ha_call_service', {
+                tool_name: 'ha_call_service',
+                conditions: [[{path: 'args.domain', op: 'eq', value: 'lock'}]],
+                remember_minutes: 5
+              });
+            """,
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1
+        rules = json.loads(puts[0]["body"])["rules"]
+        assert [r["tool_name"] for r in rules] == ["ha_call_service", "*"], (
+            f"tool rule moved behind the wildcard: {rules}"
+        )
+
+    def test_new_tool_rule_inserts_before_wildcard(self, settings_script: str) -> None:
+        """A tool with NO existing rule must insert BEFORE a wildcard rule,
+        not append after it — first-match would otherwise resolve the tool's
+        calls to the wildcard's remember_minutes (Patch76 review: the branch
+        the in-place reorder fix doesn't cover)."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 1,
+                    "rules": [
+                        {"tool_name": "ha_restart", "when": [], "remember_minutes": 0},
+                        {"tool_name": "*", "when": [], "remember_minutes": 60},
+                    ],
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await policyLoadConfig();
+              await window.savePolicyRule('ha_call_service', {
+                tool_name: 'ha_call_service',
+                conditions: [[{path: 'args.domain', op: 'eq', value: 'lock'}]],
+                remember_minutes: 5
+              });
+            """,
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1
+        rules = json.loads(puts[0]["body"])["rules"]
+        assert [r["tool_name"] for r in rules] == [
+            "ha_restart",
+            "ha_call_service",
+            "*",
+        ], f"new tool rule appended after the wildcard: {rules}"
+
+    def test_gate_toggle_on_inserts_before_wildcard(self, settings_script: str) -> None:
+        """The Tools-tab gate toggle has the same new-rule case: a fresh bare
+        gate must land before an existing wildcard rule."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 1,
+                    "rules": [
+                        {"tool_name": "*", "when": [], "remember_minutes": 60},
+                    ],
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="await loadPolicyState(); await window.syncPolicyRule('ha_call_service', true);",
+        )
+        _assert_clean_init(result)
+        puts = [
+            f
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+        assert len(puts) == 1
+        rules = json.loads(puts[0]["body"])["rules"]
+        assert [r["tool_name"] for r in rules] == ["ha_call_service", "*"], (
+            f"bare gate appended after the wildcard: {rules}"
+        )
+
+    def test_load_collapses_tool_rules_into_one_card(
+        self, settings_script: str
+    ) -> None:
+        """Read side of renderPolicyCards: a tool's on-disk rules collapse into
+        ONE card, one condition row per rule in order. The multi-predicate row
+        joins its predicates with ' AND ' and offers one edit per predicate
+        (editing them: test_settings_ui_policy_and_conditions.py). The remember
+        input shows the MAX across the rules (60), so a save that never touches
+        it can't silently shorten a longer window."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 4,
+                    "rules": [
+                        {
+                            "tool_name": "ha_call_service",
+                            "when": [
+                                {"path": "args.domain", "op": "eq", "value": "lock"}
+                            ],
+                            "remember_minutes": 1,
+                        },
+                        {
+                            "tool_name": "ha_call_service",
+                            "when": [
+                                {"path": "args.service", "op": "eq", "value": "unlock"}
+                            ],
+                            "remember_minutes": 60,
+                        },
+                        {
+                            "tool_name": "ha_call_service",
+                            "when": [
+                                {"path": "args.domain", "op": "eq", "value": "lock"},
+                                {"path": "args.service", "op": "eq", "value": "unlock"},
+                            ],
+                            "remember_minutes": 0,
+                        },
+                    ],
+                },
             },
         }
         result = run_script(
@@ -1229,15 +1941,40 @@ class TestPolicyTabFlow:
             fetch_map=fetches,
             invoke="""
               await window.policyLoadConfig();
-              await window.policyLoadPending();
+              const cards = document.querySelectorAll('.policy-rule-card');
+              document.body.setAttribute('data-card-count', String(cards.length));
+              const card = cards[0];
+              const rows = card
+                ? Array.from(card.querySelectorAll('.policy-predicate-row'))
+                : [];
+              document.body.setAttribute('data-row-count', String(rows.length));
+              const rowText = (r) => (r ? r.textContent : '');
+              const hasEdit = (r) =>
+                String(r ? r.querySelectorAll('.policy-edit-predicate').length : 0);
+              document.body.setAttribute(
+                'data-multi-has-and', String(rowText(rows[2]).includes(' AND ')));
+              document.body.setAttribute('data-multi-has-edit', hasEdit(rows[2]));
+              document.body.setAttribute('data-single0-has-edit', hasEdit(rows[0]));
+              document.body.setAttribute('data-single1-has-edit', hasEdit(rows[1]));
+              const rem = card ? card.querySelector('.policy-remember-minutes') : null;
+              document.body.setAttribute('data-remember', rem ? String(rem.value) : '');
             """,
         )
         _assert_clean_init(result)
-        # `dom` is the full final-state document snapshot; grep the
-        # pending-list region for the new off-state copy.
-        assert "turned off" in result.dom.lower(), (
-            f"expected 'turned off' in pending-list snapshot; "
-            f"dom contains: {result.dom[-2000:]}"
+        assert _probe(result, "card-count") == "1", (
+            "tool rules did not collapse to one card"
+        )
+        assert _probe(result, "row-count") == "3", "expected one condition row per rule"
+        assert _probe(result, "multi-has-and") == "true", (
+            "multi-predicate row missing ' AND ' join"
+        )
+        assert _probe(result, "multi-has-edit") == "2", (
+            "each predicate of the multi-predicate row should be editable"
+        )
+        assert _probe(result, "single0-has-edit") == "1"
+        assert _probe(result, "single1-has-edit") == "1"
+        assert _probe(result, "remember") == "60", (
+            "remember input should show the max across rules"
         )
 
     def test_pending_list_shows_server_message_when_feature_on_but_503(
@@ -1245,8 +1982,8 @@ class TestPolicyTabFlow:
     ) -> None:
         """Feature is on but the queue is unreachable (sidecar mode or
         ImportError at startup). The server's 503 message should
-        propagate verbatim so the user knows to check the addon log,
-        instead of the generic "feature off" text."""
+        propagate verbatim — it names which cause applied — instead of
+        the generic "feature off" text."""
         fetches = {
             **DEFAULT_FETCHES,
             "/api/settings/features": {
@@ -1263,10 +2000,7 @@ class TestPolicyTabFlow:
             },
             "/api/policy/pending": {
                 "status": 503,
-                "json": {
-                    "error": "Tool security policies live approvals are not active. "
-                    "Check the addon log for ImportError / RuntimeError details."
-                },
+                "json": {"error": _server_503_body()},
             },
         }
         result = run_script(
@@ -1279,9 +2013,484 @@ class TestPolicyTabFlow:
             """,
         )
         _assert_clean_init(result)
-        assert "addon log" in result.dom.lower(), (
-            f"expected addon-log message in pending-list snapshot; "
-            f"dom contains: {result.dom[-2000:]}"
+        assert _server_503_body() in result.dom, (
+            f"expected the server's 503 paragraph in the pending-list "
+            f"snapshot; dom contains: {result.dom[-2000:]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# "Already decided" copy on the 409 path
+# ---------------------------------------------------------------------------
+
+
+def _already_decided_cases() -> list[tuple[str, str]]:
+    """Every (non-English locale, decided outcome) pair the 409 can produce.
+
+    Derived from ``Decision`` rather than listed, so a new outcome arrives
+    here as new cases instead of as untested copy.
+    """
+    from ha_mcp.policy.approval_queue import Decision
+    from ha_mcp.settings_ui import build_payload, select_locale
+    from ha_mcp.settings_ui.locale_policy import BEST_EFFORT_LOCALES
+
+    default = select_locale()
+    served = {language["code"] for language in build_payload(default)["languages"]}
+    locales = sorted(served - {default} - BEST_EFFORT_LOCALES)
+    outcomes = sorted(set(get_args(Decision)) - {"pending"})
+    # Both sides are discovered, so either emptying out collects zero cases
+    # and the class below passes without driving the handler once.
+    assert locales, (
+        "no non-English catalog is registered — every case here derives from "
+        "one, so this file would pin the 409 copy in no language at all"
+    )
+    assert outcomes, (
+        "Decision no longer names any decided outcome — the 409 branch these "
+        "cases drive cannot be reached, so either the branch or this is dead"
+    )
+    return [(locale, outcome) for locale in locales for outcome in outcomes]
+
+
+# ---------------------------------------------------------------------------
+# Ambiguous-save handling, across all three feature-flag toggles
+#
+# saveFeatureFlag is three-valued: a parsed body means the server confirmed,
+# `false` means it refused (previous value confirmed, revert), and `null`
+# means no usable answer came back so the write MAY have landed. The last
+# case is the one this table exists for: reverting there puts the switch back
+# to a value the server no longer holds, under a message asserting exactly
+# that.
+#
+# `null` arises three ways, all covered below: a rejected fetch, a
+# CONNECTION_FAILED 502 (app/add-on mode - _supervisor.py folds every
+# httpx.HTTPError, read timeouts included, into a hardcoded 502), and a
+# bodyless 502/504 from ingress.
+#
+# Routes use `byMethod` so the failing response is keyed to the POST rather
+# than to a hand-counted init-GET slot: previously an entry sat in "slot 4"
+# and any change to how often init reads /api/settings/features would have
+# slid it onto a different call, leaving the test green while exercising a
+# different path.
+# ---------------------------------------------------------------------------
+
+_TOGGLES = [
+    ("policy-master-toggle", "enable_tool_security_policies", "Tool Security Policies"),
+    ("policy-manage-tool-toggle", "enable_security_policy_tool", "Policy-editing tool"),
+    ("read-only-mode-toggle", "read_only_mode", "Read Only Mode"),
+]
+
+# The three ways a save can come back with no usable answer.
+_AMBIGUOUS_POST = [
+    ("rejected_fetch", {"throw": "NetworkError when attempting to fetch"}),
+    (
+        "connection_failed_502",
+        {
+            "status": 502,
+            "json": {"error": {"code": "CONNECTION_FAILED", "message": "supervisor"}},
+        },
+    ),
+    ("bodyless_504", {"status": 504, "body": ""}),
+]
+
+
+def _flags_response(**values: bool) -> dict:
+    """A /api/settings/features GET reporting every flag explicitly.
+
+    All three are named on every response so a test never lands on the
+    missing-entry path (which renders a switch indeterminate) by accident.
+    """
+    base = {
+        "enable_tool_security_policies": False,
+        "enable_security_policy_tool": False,
+        "read_only_mode": False,
+    }
+    base.update(values)
+    return {
+        "status": 200,
+        "json": {"flags": {k: {"value": v} for k, v in base.items()}},
+    }
+
+
+def _toggle_probe(toggle_id: str, probe_id: str) -> str:
+    """Flip ``toggle_id`` on, then record switch state, toast and banner."""
+    return f"""
+      await new Promise(r => setTimeout(r, 250));
+      await window.syncPolicyGlobalToggles();
+      const cb = document.getElementById('{toggle_id}');
+      cb.checked = true;
+      cb.dispatchEvent(new Event('change'));
+      await new Promise(r => setTimeout(r, 200));
+      const toast = document.querySelector('#ha-toast-region .ha-toast');
+      const probe = document.createElement('div');
+      probe.id = '{probe_id}';
+      probe.dataset.checked = String(cb.checked);
+      probe.dataset.indeterminate = String(cb.indeterminate);
+      probe.dataset.msg = toast
+        ? (toast.querySelector('.ha-toast-msg')?.textContent || '') : '';
+      probe.dataset.restart = String(
+        document.getElementById('restartNotice').classList.contains('show'));
+      // One digit per switch, declaration order of _TOGGLES. The failure
+      // path re-reads via loadPolicyState(), which refreshes or clears the
+      // state of ALL THREE switches — so the repaint has to cover all three,
+      // not just the toggle under test (the repaint-one-of-three bug).
+      probe.dataset.allIndet = ['policy-master-toggle',
+        'policy-manage-tool-toggle', 'read-only-mode-toggle']
+        .map(i => document.getElementById(i).indeterminate ? '1' : '0')
+        .join('');
+      document.body.appendChild(probe);
+    """
+
+
+def _probe_tag(result: HarnessResult, probe_id: str) -> str:
+    _assert_clean_init(result)
+    m = re.search(rf'<div[^>]*id="{probe_id}"[^>]*>', result.dom)
+    assert m is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+    return m.group(0)
+
+
+class TestAmbiguousSaveAcrossToggles:
+    """Every toggle, every way the answer can go missing."""
+
+    @pytest.mark.parametrize("toggle_id,flag,label", _TOGGLES)
+    @pytest.mark.parametrize("case,post_response", _AMBIGUOUS_POST)
+    def test_write_that_landed_is_not_reverted(
+        self, settings_script: str, toggle_id, flag, label, case, post_response
+    ) -> None:
+        """The re-read shows the new value, so the switch stays where it is.
+
+        Reverting here would contradict the server, and the message that
+        goes with a revert ("still has the previous value") would be false.
+        The restart banner must also be armed: these flags gate tool
+        registration at startup, and the success toast auto-dismisses.
+        """
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "byMethod": {
+                        "GET": {
+                            "responses": [
+                                _flags_response(),
+                                _flags_response(),
+                                _flags_response(),
+                                _flags_response(**{flag: True}),
+                            ]
+                        },
+                        "POST": {"responses": [post_response]},
+                    }
+                },
+            },
+            invoke=_toggle_probe(toggle_id, "__landed"),
+        )
+        tag = _probe_tag(result, "__landed")
+        assert 'data-checked="true"' in tag, (
+            f"[{case}/{flag}] the write landed and the re-read confirms it — "
+            f"reverting would contradict the server: {tag}"
+        )
+        assert "did not save" not in tag, (
+            f"[{case}/{flag}] must not claim the server kept the previous "
+            f"value when it did not: {tag}"
+        )
+        assert 'data-restart="true"' in tag, (
+            f"[{case}/{flag}] a landed write needs the restart banner — the "
+            f"toast alone auto-dismisses in 4s: {tag}"
+        )
+        # Positive, not just the absence of the wrong message: this branch
+        # exists to say the save landed, and nothing else pins that it does.
+        assert "Saved. Restart required." in tag, (
+            f"[{case}/{flag}] a landed write must say so: {tag}"
+        )
+
+    @pytest.mark.parametrize("toggle_id,flag,label", _TOGGLES)
+    def test_write_that_did_not_land_reverts_with_the_reason(
+        self, settings_script: str, toggle_id, flag, label
+    ) -> None:
+        """The re-read shows the old value — the one case where reverting is
+        justified, and the only case where the message is true."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "byMethod": {
+                        "GET": {"responses": [_flags_response()]},
+                        "POST": {
+                            "responses": [
+                                {"throw": "NetworkError when attempting to fetch"}
+                            ]
+                        },
+                    }
+                },
+            },
+            invoke=_toggle_probe(toggle_id, "__notlanded"),
+        )
+        tag = _probe_tag(result, "__notlanded")
+        assert 'data-checked="false"' in tag, f"[{flag}] must revert: {tag}"
+        assert "did not save" in tag, (
+            f"[{flag}] a revert must say why — the wrong switch position "
+            f"*under* that message is the defect: {tag}"
+        )
+
+    @pytest.mark.parametrize("toggle_id,flag,label", _TOGGLES)
+    def test_unconfirmable_readback_goes_unknown(
+        self, settings_script: str, toggle_id, flag, label
+    ) -> None:
+        """Neither value confirmed: show unknown rather than assert either.
+
+        This is the likeliest path in practice — a rejected fetch usually
+        means the network is down, so the follow-up read fails too and
+        `_clearFlagSwitchState()` clears every flag.
+        """
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "byMethod": {
+                        "GET": {
+                            "responses": [
+                                _flags_response(),
+                                _flags_response(),
+                                _flags_response(),
+                                {"status": 503, "json": {}},
+                            ]
+                        },
+                        "POST": {
+                            "responses": [
+                                {"throw": "NetworkError when attempting to fetch"}
+                            ]
+                        },
+                    }
+                },
+            },
+            invoke=_toggle_probe(toggle_id, "__unknown"),
+        )
+        tag = _probe_tag(result, "__unknown")
+        assert 'data-indeterminate="true"' in tag, (
+            f"[{flag}] an unconfirmable readback must read as unknown: {tag}"
+        )
+        assert "did not save" not in tag, (
+            f"[{flag}] must not claim the previous value survived when that "
+            f"is unknown: {tag}"
+        )
+        # The dedicated copy, positively. Swapping errors.save_outcome_unknown
+        # for the saved toast would otherwise leave the suite green.
+        assert "Could not confirm the change" in tag, (
+            f"[{flag}] the unknown outcome has its own message and this is "
+            f"the only case that shows it: {tag}"
+        )
+        # The failed re-read cleared ALL THREE switch slices
+        # (_clearFlagSwitchState), so all three must repaint as unknown —
+        # repainting only the toggle under test leaves the other two painted
+        # editable at a value that no longer exists, with their unknown
+        # notices hidden.
+        assert 'data-all-indet="111"' in tag, (
+            f"[{flag}] every flag switch must repaint as unknown after the "
+            f"re-read cleared all three state slices: {tag}"
+        )
+
+    @pytest.mark.parametrize("toggle_id,flag,label", _TOGGLES)
+    def test_server_refusal_reverts_immediately(
+        self, settings_script: str, toggle_id, flag, label
+    ) -> None:
+        """A refusal is NOT ambiguous, and must not be re-read.
+
+        The server answered, so the previous value is confirmed. Re-reading
+        here would turn a known state into an unknown one — the regression
+        the blanket-readback attempt introduced.
+        """
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map={
+                **DEFAULT_FETCHES,
+                "/api/settings/features": {
+                    "byMethod": {
+                        "GET": {"responses": [_flags_response()]},
+                        "POST": {
+                            "responses": [
+                                {"status": 500, "json": {"error": {"message": "nope"}}}
+                            ]
+                        },
+                    }
+                },
+            },
+            invoke=_toggle_probe(toggle_id, "__refused"),
+        )
+        tag = _probe_tag(result, "__refused")
+        assert 'data-checked="false"' in tag, f"[{flag}] refusal must revert: {tag}"
+        assert 'data-indeterminate="false"' in tag, (
+            f"[{flag}] a refusal leaves the server's value KNOWN, so the "
+            f"switch stays editable rather than going unknown: {tag}"
+        )
+        assert "did not save" in tag, (
+            f"[{flag}] the revert must say the server kept the previous value: {tag}"
+        )
+
+
+class TestAlreadyDecidedCopy:
+    """The 409 alert must read as one translated sentence.
+
+    ``current_decision`` is a backend enum. Interpolating it raw put an
+    English word inside otherwise translated copy — Italian read ``Questa
+    approvazione è già stata approved``. It is resolved through the catalog
+    now, and this drives the real handler and compares the whole sentence
+    the user is shown against the locale's own copy. Asserting on the
+    rendered alert covers the ways source-text matching cannot — a catalog
+    whose value is still the English placeholder, a key the concatenation
+    builds but no catalog holds, a resolved word no message consumes.
+    """
+
+    @pytest.mark.parametrize(("locale", "outcome"), _already_decided_cases())
+    def test_alert_shows_the_catalog_word_and_never_the_enum(
+        self, settings_script: str, locale: str, outcome: str
+    ) -> None:
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/approve": {
+                "status": 409,
+                "json": {"error": "already decided", "current_decision": outcome},
+            },
+            "/api/policy/pending": {"status": 200, "json": {"pending": []}},
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_localized_policy_dom(locale),
+            fetch_map=fetches,
+            invoke="await window.policyDecide('tok-1', 'approve');",
+        )
+        _assert_clean_init(result)
+
+        assert len(result.alerts) == 1, (
+            f"expected the single 409 alert; got {result.alerts}"
+        )
+        alert = result.alerts[0]
+        messages = catalog_messages(locale)
+        word = messages[f"policies.pending.decision.{outcome}"]
+        # Whole sentence, not containment: the host a containment check
+        # searches is that same catalog value with the word already
+        # substituted, so it cannot fail on catalog content. Lose the host to
+        # the English fallback and "This approval was already approvata"
+        # satisfies both a containment and a not-the-enum check.
+        expected = messages["policies.pending.already_decided"].replace(
+            "{decision}", word
+        )
+        assert alert == expected, (
+            f"{locale}: the alert reads {alert!r}, not the {locale} sentence "
+            f"{expected!r}. Either the host sentence fell back to English or "
+            f"the {outcome!r} slot is not the catalog word — both put English "
+            "inside translated copy, which is the bug this path prevents."
+        )
+
+
+class TestDecideUnavailableCopy:
+    """A 503 on the decide path must not splice English into translated copy.
+
+    ``/api/policy/{approve,deny}`` answers 503 with a fixed English paragraph
+    when live approvals are not active. Folding that body into
+    ``policies.pending.action_failed`` put that whole paragraph inside an
+    Italian clause. The path now answers the way ``policyLoadPending``
+    already does: the translated off-message when the flag is known off, and
+    otherwise the server's diagnostic on its own, because it names which of the
+    remaining causes applied and the generic line cannot.
+    """
+
+    def _decide_under_503(
+        self,
+        settings_script: str,
+        *,
+        enabled: bool,
+        approve_response: dict[str, object] | None = None,
+    ) -> HarnessResult:
+        """Drive an Italian UI through a 503 decide with the flag at ``enabled``.
+
+        ``loadPolicyState`` is invoked explicitly rather than left to page
+        init, so the branch reads a settled ``policyState`` instead of racing
+        the init fetch. ``approve_response`` overrides the 503 the decide
+        call receives, for the case where it carries no JSON at all.
+        """
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/settings/features": {
+                "status": 200,
+                "json": {
+                    "flags": {"enable_tool_security_policies": {"value": enabled}}
+                },
+            },
+            "/api/policy/config": {
+                "status": 200,
+                "json": {"wait_seconds": 60, "approval_ttl_minutes": 5, "rules": []},
+            },
+            "/api/policy/approve": approve_response
+            or {"status": 503, "json": {"error": _server_503_body()}},
+            "/api/policy/pending": {"status": 200, "json": {"pending": []}},
+        }
+        return run_script(
+            settings_script,
+            initial_html=_localized_policy_dom("it"),
+            fetch_map=fetches,
+            invoke=(
+                "await window.loadPolicyState();"
+                "await window.policyDecide('tok-1', 'approve');"
+            ),
+        )
+
+    def test_flag_known_off_shows_the_translated_off_message(
+        self, settings_script: str
+    ) -> None:
+        result = self._decide_under_503(settings_script, enabled=False)
+        _assert_clean_init(result)
+
+        expected = catalog_messages("it")["policies.pending.disabled"]
+        assert result.alerts == [expected], (
+            f"expected the Italian off-message {expected!r}; got {result.alerts}. "
+            "A user who simply turned the feature off is being told to read the "
+            "add-on log instead."
+        )
+
+    def test_flag_on_shows_the_server_diagnostic_on_its_own(
+        self, settings_script: str
+    ) -> None:
+        result = self._decide_under_503(settings_script, enabled=True)
+        _assert_clean_init(result)
+
+        assert result.alerts == [_server_503_body()], (
+            f"expected the server paragraph alone; got {result.alerts}. Equality "
+            "is the point: anything longer means it was spliced into a "
+            "translated sentence, which is the mixed-language render this fixes."
+        )
+
+    def test_503_without_a_json_body_shows_the_translated_line(
+        self, settings_script: str
+    ) -> None:
+        """No JSON body means no server message, so the catalog line is all
+        there is — and it has to be the translated one.
+
+        Our own routes always send JSON, but an ingress or reverse proxy in
+        front of them does not, and that is the deployment this branch exists
+        for. A stand-in error synthesised from the status line looks like a
+        server message to the branch, so it would shadow the catalog line and
+        alert a bare ``HTTP 503`` in every language.
+        """
+        result = self._decide_under_503(
+            settings_script,
+            enabled=True,
+            approve_response={
+                "status": 503,
+                "body": "<html><body>503 Service Unavailable</body></html>",
+            },
+        )
+        _assert_clean_init(result)
+
+        expected = catalog_messages("it")["policies.pending.unavailable"]
+        assert result.alerts == [expected], (
+            f"expected the Italian unavailable line {expected!r}; got "
+            f"{result.alerts}. Anything else here is untranslated text — or the "
+            "proxy's HTML — put in front of an Italian user."
         )
 
 
@@ -1814,45 +3023,6 @@ class TestAdvancedSectionRender:
         assert "DEBUG" in select_match.group(1)
         assert "CRITICAL" in select_match.group(1)
 
-    def test_int_field_emits_min_max_attrs(self, settings_script: str) -> None:
-        # Same connection-removed migration as test_locked_field above.
-        fetches = {
-            **DEFAULT_FETCHES,
-            "/api/settings/advanced": {
-                "status": 200,
-                "json": {
-                    "fields": [
-                        {
-                            "field": "fuzzy_threshold",
-                            "env_var": "FUZZY_THRESHOLD",
-                            "value": 70,
-                            "type": "int",
-                            "section": "search",
-                            "origin": "default",
-                            "editable": True,
-                            "min": 1,
-                            "max": 100,
-                        }
-                    ]
-                },
-            },
-        }
-        result = run_script(
-            settings_script,
-            initial_html=MIN_DOM,
-            fetch_map=fetches,
-            invoke="await new Promise(r => setTimeout(r, 200));",
-        )
-        _assert_clean_init(result)
-
-        m = re.search(
-            r'<input[^>]*data-adv-field="fuzzy_threshold"[^>]*>',
-            result.dom,
-        )
-        assert m is not None, "expected number input for fuzzy_threshold"
-        assert 'min="1"' in m.group(0)
-        assert 'max="100"' in m.group(0)
-
 
 class TestFormControlAccessibility:
     """Every generated form control must carry a ``name`` (or ``id``) so it
@@ -2066,7 +3236,7 @@ class TestFormControlAccessibility:
         # Sanity: the expanded fixture really did exercise the extra
         # surfaces, not silently render nothing. `adv:code_mode_max_duration`
         # is emitted by both the Advanced-panel field generator (the fixture
-        # lists it as an advanced field) and renderCodeModeSubRows, so this
+        # lists it as an advanced field) and renderAdvancedSubRows, so this
         # assert only proves *a* control with that name rendered — not the
         # code-mode sub-row specifically.
         assert 'name="adv:code_mode_max_duration"' in result.dom, (
@@ -2397,7 +3567,7 @@ class TestAddonModeLockedBannerCopy:
         )
         # Addon-aware copy must appear.
         assert "App (add-on) Configuration" in result.dom, (
-            f"expected 'App (add-on) Configuration' hint; dom tail: {result.dom[-2000:]}"
+            f"expected 'app (add-on) Configuration' hint; dom tail: {result.dom[-2000:]}"
         )
 
     def test_advanced_locked_banner_in_addon_mode_avoids_unset_copy(
@@ -2442,7 +3612,7 @@ class TestAddonModeLockedBannerCopy:
             "addon-mode advanced banner still shows standalone 'unset env var' copy"
         )
         assert "App (add-on) runtime environment" in result.dom, (
-            f"expected 'App (add-on) runtime environment' wording; "
+            f"expected 'app (add-on) runtime environment' wording; "
             f"dom tail: {result.dom[-2000:]}"
         )
 
@@ -2492,7 +3662,7 @@ class TestAddonModeLockedBannerCopy:
         ``config.yaml`` schema, so the Saved-tools-path row renders
         env-pinned and read-only and the add-on user cannot unset it —
         the standalone "unset it to edit here" copy is unactionable.
-        ``renderCodeModeSubRows`` was
+        ``renderAdvancedSubRows`` was
         overlooked when the addon-aware locked-note copy was added to
         the other render paths (see the master/advanced banner tests
         above); this pins the same rule for the code-mode sub-rows.
@@ -2559,7 +3729,7 @@ class TestAddonModeLockedBannerCopy:
         # Supervisor" helper text (Supervisor never sees this start.py
         # setdefault value).
         assert "Hardcoded to" in result.dom and "cannot be changed" in result.dom, (
-            f"expected field-specific 'hardcoded in App (add-on) mode' copy; "
+            f"expected field-specific 'hardcoded in app (add-on) mode' copy; "
             f"dom tail: {result.dom[-2000:]}"
         )
         assert "managed by Home Assistant Supervisor" not in result.dom, (
@@ -2835,12 +4005,13 @@ class TestBetaBlockRendersAtBottom:
         Asserted against the production HTML (the header lives in the
         static panel-server markup, not in any JS-rendered container).
         """
-        from ha_mcp.settings_ui import _SETTINGS_HTML
+        from ha_mcp.settings_ui import render_settings_html
 
-        assert "Beta features (dangerous)" in _SETTINGS_HTML, (
+        page = render_settings_html()
+        assert "Beta features (dangerous)" in page, (
             "beta section heading copy missing or changed in production HTML"
         )
-        assert "beta-section-title" in _SETTINGS_HTML, (
+        assert "beta-section-title" in page, (
             "beta section title class missing in production HTML"
         )
 
@@ -2857,6 +4028,7 @@ class TestBetaBlockRendersAtBottom:
             "section": "diagnostics",
             "origin": "default",
             "editable": True,
+            "restart_required": True,
             "choices": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         }
         fetches = {
@@ -2905,8 +4077,7 @@ class TestBetaBlockRendersAtBottom:
         assert body.get("log_level") == "DEBUG", (
             f"auto-save POST body missing the edited value: {body}"
         )
-        # log_level IS in ADVANCED_RESTART_REQUIRED, so this pins the
-        # restart branch: exact toast text + banner shown + cross-tab broadcast.
+        # log_level needs a restart: pins the toast, banner and broadcast.
         m = re.search(r'data-toast="([^"]*)"', result.dom)
         assert m and "Saved. Restart required." in m.group(1), (
             f"expected restart-required success toast; got {m.group(1) if m else None}"
@@ -2985,6 +4156,144 @@ class TestBetaBlockRendersAtBottom:
         )
         assert json.loads(posts[0]["body"]).get("enable_dev_mode") is True
 
+    def test_security_policy_access_toggle_enable_is_confirm_gated(
+        self, settings_script: str
+    ) -> None:
+        """Enabling dev-tools security-policy access (issue #2141) must
+        pass its own confirm() gate — it is stored independently of the
+        dev-mode toggle (though effective only while dev mode is on):
+        declining reverts the checkbox and saves nothing; accepting
+        fires exactly one auto-save POST."""
+        adv_field = {
+            "field": "dev_tools_security_policy_access",
+            "env_var": "HAMCP_DEV_SECURITY_POLICY_ACCESS",
+            "value": False,
+            "type": "bool",
+            "section": "developer",
+            "origin": "default",
+            "editable": True,
+        }
+        applied = {"dev_tools_security_policy_access": True}
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/settings/advanced": {
+                "status": 200,
+                "json": {"fields": [adv_field], "is_addon": False},
+                "responses": [
+                    {"status": 200, "json": {"fields": [adv_field], "is_addon": False}},
+                    {"status": 200, "json": {"applied": applied}},
+                    {"status": 200, "json": {"fields": [adv_field], "is_addon": False}},
+                ],
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 200));
+              const cb = document.querySelector(
+                '#advDeveloper input[data-adv-field="dev_tools_security_policy_access"]');
+              document.body.setAttribute('data-rendered', String(!!cb));
+              // Decline the warning: the toggle must revert and no save fires.
+              window.confirm = () => false;
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 1200));
+              document.body.setAttribute('data-declined-state', String(cb.checked));
+              // Accept the warning: the save proceeds.
+              window.confirm = () => true;
+              cb.checked = true;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 1500));
+            """,
+        )
+        _assert_clean_init(result)
+        assert 'data-rendered="true"' in result.dom, (
+            "dev_tools_security_policy_access row did not render into #advDeveloper"
+        )
+        assert 'data-declined-state="false"' in result.dom, (
+            "declining the confirm() must revert the policy-access checkbox"
+        )
+        posts = [
+            f
+            for f in result.fetches
+            if "/api/settings/advanced" in f["url"] and f["method"] == "POST"
+        ]
+        assert len(posts) == 1, (
+            f"expected exactly one save POST (declined change must not "
+            f"save), got {len(posts)}: {result.fetches}"
+        )
+        assert (
+            json.loads(posts[0]["body"]).get("dev_tools_security_policy_access") is True
+        )
+
+    def test_security_policy_access_toggle_disable_skips_confirm(
+        self, settings_script: str
+    ) -> None:
+        """Unchecking the policy-access toggle must save immediately with
+        NO confirm() prompt — the gate protects only the arming
+        direction. A confirm on disable whose Cancel path force-unchecks
+        would leave the UI showing OFF while the server keeps access ON."""
+        adv_field = {
+            "field": "dev_tools_security_policy_access",
+            "env_var": "HAMCP_DEV_SECURITY_POLICY_ACCESS",
+            "value": True,
+            "type": "bool",
+            "section": "developer",
+            "origin": "file",
+            "editable": True,
+        }
+        applied = {"dev_tools_security_policy_access": False}
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/settings/advanced": {
+                "status": 200,
+                "json": {"fields": [adv_field], "is_addon": False},
+                "responses": [
+                    {"status": 200, "json": {"fields": [adv_field], "is_addon": False}},
+                    {"status": 200, "json": {"applied": applied}},
+                    {"status": 200, "json": {"fields": [adv_field], "is_addon": False}},
+                ],
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 200));
+              const cb = document.querySelector(
+                '#advDeveloper input[data-adv-field="dev_tools_security_policy_access"]');
+              document.body.setAttribute('data-rendered', String(!!cb && cb.checked));
+              let confirms = 0;
+              window.confirm = () => { confirms += 1; return false; };
+              cb.checked = false;
+              cb.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 1500));
+              document.body.setAttribute('data-confirms', String(confirms));
+            """,
+        )
+        _assert_clean_init(result)
+        assert 'data-rendered="true"' in result.dom, (
+            "policy-access row did not render checked into #advDeveloper"
+        )
+        assert 'data-confirms="0"' in result.dom, (
+            "disabling policy access must not prompt confirm()"
+        )
+        posts = [
+            f
+            for f in result.fetches
+            if "/api/settings/advanced" in f["url"] and f["method"] == "POST"
+        ]
+        assert len(posts) == 1, (
+            f"disable must auto-save exactly once, got {len(posts)}: {result.fetches}"
+        )
+        assert (
+            json.loads(posts[0]["body"]).get("dev_tools_security_policy_access")
+            is False
+        )
+
     def test_advanced_field_autosave_error_shows_error_toast(
         self, settings_script: str
     ) -> None:
@@ -3038,7 +4347,7 @@ class TestBetaBlockRendersAtBottom:
     def test_advanced_autosave_no_restart_field_plain_saved(
         self, settings_script: str
     ) -> None:
-        """A field NOT in ADVANCED_RESTART_REQUIRED saves with a plain
+        """A field without restart_required saves with a plain
         "Saved." toast and does NOT raise the restart banner — pins the
         no-restart branch (dashboard_screenshot_engine_url is resolved live)."""
         adv_field = {
@@ -4045,7 +5354,7 @@ class TestReadOnlyModeToggle:
                 continue
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError, TypeError:
                 continue
             flags = body.get("flags") if isinstance(body, dict) else None
             if isinstance(flags, dict) and flags.get("read_only_mode") is True:
@@ -4336,7 +5645,7 @@ class TestTablistAndStatusBehavior:
     """Behavioural coverage for the #1596 a11y JS — the ARIA tablist
     (aria-selected + roving tabindex sync, keyboard navigation) and the
     failure-path role=alert toggling. The static-markup tests in
-    test_settings_ui.py only assert the affordances exist; these drive the
+    test_settings_ui_page.py only assert the affordances exist; these drive the
     handlers and assert they actually behave.
     """
 
@@ -4581,17 +5890,6 @@ class TestToastFeedback:
         assert ">second<" in result.dom, result.dom[-600:]
 
 
-def _probe(result: HarnessResult, attr: str) -> str | None:
-    """Read a ``data-<attr>`` value stamped onto an element in result.dom.
-
-    The JS behaviour tests stash assertion data into data-* attributes
-    (live, before the fake clock advances past toast auto-dismiss). This
-    pulls the value back out without depending on attribute order.
-    """
-    m = re.search(rf'data-{attr}="([^"]*)"', result.dom)
-    return m.group(1) if m else None
-
-
 class TestModalFocusTrap:
     """The snapshot modal follows the WAI-ARIA APG dialog pattern:
     focus moves into the dialog on open, Tab is trapped inside it, Escape
@@ -4807,7 +6105,7 @@ class TestAdvancedAutoSaveReloadGuard:
 
 
 class TestLoadPolicyStateKeepsPriorGated:
-    """loadPolicyState() keeps the previously-loaded gatedTools when the
+    """loadPolicyState() keeps the previously-loaded gate state when the
     /api/policy/config reload fails, instead of clobbering it to empty —
     so a transient blip can't make the Tools tab falsely claim nothing is
     gated.
@@ -4860,7 +6158,7 @@ class TestLoadPolicyStateKeepsPriorGated:
             initial_html=MIN_DOM,
             fetch_map=fetches,
             invoke="""
-              await new Promise(r => setTimeout(r, 200));  // first load seeds gatedTools
+              await new Promise(r => setTimeout(r, 200));  // first load seeds the gate state
               const before = document.querySelector('input[name="tool:ha_get_state:gated"]');
               const checkedBefore = !!(before && before.checked);
               await loadPolicyState();   // second load: policy/config 500 -> keep prior
@@ -4869,7 +6167,7 @@ class TestLoadPolicyStateKeepsPriorGated:
               document.body.setAttribute('data-before', String(checkedBefore));
               document.body.setAttribute('data-after', String(!!(after && after.checked)));
               document.body.setAttribute(
-                'data-has', String(policyState.gatedTools.has('ha_get_state')));
+                'data-has', String(isToolGated('ha_get_state')));
             """,
         )
         _assert_clean_init(result)
@@ -4877,7 +6175,7 @@ class TestLoadPolicyStateKeepsPriorGated:
             "precondition: the tool should render gated after the first load"
         )
         assert _probe(result, "has") == "true", (
-            "gatedTools was cleared after the failed policy reload"
+            "the gate state was cleared after the failed policy reload"
         )
         assert _probe(result, "after") == "true", (
             "the gated checkbox lost its checked state after the failed reload"
@@ -4938,57 +6236,6 @@ class TestCapabilityBadgeUnknownFallback:
         texts = _probe(result, "texts") or ""
         assert set(texts.split("|")) == {"?", "weird"}, (
             f"unknown badges should show '?' (blank) and the raw value; got {texts}"
-        )
-
-
-class TestBackupActionErrorToast:
-    """A network drop on a destructive backup action surfaces a visible
-    error toast instead of silently no-opping (the bare rejection would
-    only reach the visually-hidden #status region).
-    """
-
-    @pytest.mark.parametrize(
-        "act,verb,name,throw_pattern",
-        [
-            ("restore", "Restore", "snap_a", "/restore"),
-            ("delete", "Delete", "snap_b", "/backups/snap_b"),
-        ],
-    )
-    def test_network_error_shows_error_toast(
-        self,
-        settings_script: str,
-        act: str,
-        verb: str,
-        name: str,
-        throw_pattern: str,
-    ) -> None:
-        fetches = {**DEFAULT_FETCHES, throw_pattern: {"throw": "network down"}}
-        invoke = (
-            (
-                "await new Promise(r => setTimeout(r, 100));\n"
-                "await window.backupAction('__ACT__', '__NAME__');\n"
-                "const t = document.querySelector('#ha-toast-region .ha-toast');\n"
-                "document.body.setAttribute('data-toast',\n"
-                "  t ? (t.className + '::' + "
-                "(t.querySelector('.ha-toast-msg')?.textContent || '')) : 'NONE');\n"
-            )
-            .replace("__ACT__", act)
-            .replace("__NAME__", name)
-        )
-        result = run_script(
-            settings_script,
-            initial_html=MIN_DOM,
-            fetch_map=fetches,
-            settle_ms=300,
-            invoke=invoke,
-        )
-        _assert_clean_init(result)
-        toast = _probe(result, "toast") or ""
-        assert "ha-toast-error" in toast, (
-            f"expected an error toast for a failed {act}; got {toast!r}"
-        )
-        assert verb in toast and name in toast and "failed" in toast, (
-            f"error toast missing action/name context; got {toast!r}"
         )
 
 
@@ -5233,11 +6480,12 @@ class TestGoogleFontsRemoved:
     """
 
     def test_settings_html_has_no_google_fonts_or_preconnect(self) -> None:
-        from ha_mcp.settings_ui import _SETTINGS_HTML
+        from ha_mcp.settings_ui import render_settings_html
 
-        assert "fonts.googleapis.com" not in _SETTINGS_HTML
-        assert "fonts.gstatic.com" not in _SETTINGS_HTML
-        assert "preconnect" not in _SETTINGS_HTML
+        page = render_settings_html()
+        assert "fonts.googleapis.com" not in page
+        assert "fonts.gstatic.com" not in page
+        assert "preconnect" not in page
 
 
 class TestAriaLabelledbyOnRenderedInputs:
@@ -5337,6 +6585,8 @@ _VISIBILITY_DOM = MIN_DOM.replace(
   <div id="visibility-load-error" role="alert" aria-live="assertive" style="display:none"></div>
   <span id="visibility-save-status" class="status" role="status" aria-live="polite"></span>
   <input id="visibility-enabled" type="checkbox" />
+  <input id="visibility-enforce" type="checkbox" />
+  <input id="visibility-restrict-report-issue" type="checkbox" />
   <input id="visibility-cat-diagnostic" type="checkbox" />
   <input id="visibility-cat-config" type="checkbox" />
   <input id="visibility-exclude-hidden" type="checkbox" />
@@ -5375,6 +6625,39 @@ class TestVisibilitySettingsTab:
         assert "Failed to load visibility config" in result.dom
         # The error region is an assertive alert so a screen reader announces it.
         assert 'role="alert"' in result.dom
+
+    def test_report_issue_restriction_loads_and_saves(
+        self, settings_script: str
+    ) -> None:
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/visibility/config": {
+                "status": 200,
+                "json": {"version": 4, "restrict_report_issue": True},
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_VISIBILITY_DOM,
+            fetch_map=fetches,
+            invoke="""
+              await window.visibilityLoadConfig();
+              const toggle = document.getElementById('visibility-restrict-report-issue');
+              document.body.dataset.loaded = String(toggle.checked);
+              toggle.checked = false;
+              await window.visibilitySaveConfig();
+            """,
+        )
+        _assert_clean_init(result)
+        assert 'data-loaded="true"' in result.dom
+        puts = [
+            f
+            for f in result.fetches
+            if "/api/visibility/config" in f["url"] and f["method"] == "PUT"
+        ]
+        assert len(puts) == 1
+        body = json.loads(puts[0]["body"])
+        assert body["restrict_report_issue"] is False
 
     def test_save_success_reports_saved_as_polite_status(
         self, settings_script: str
@@ -5506,3 +6789,993 @@ class TestEmbeddedRestartButton:
         assert m and "Restart HA-MCP Server" in m.group(1), (
             f"embedded restart-notice copy missing; got {m.group(1) if m else None}"
         )
+
+
+class TestExtraYamlWriteKeysNesting:
+    """JSDOM coverage for the extra-YAML-write-keys text row nested under
+    enable_yaml_config_editing (#1887).
+
+    It comes from the advanced cache (section ``beta_yamlkeys``) but renders
+    among the YAML per-key toggles, so it shares their indent class and both
+    of their gates (beta master AND the parent toggle).
+    """
+
+    def _payloads(self, master_on: bool, yaml_on: bool) -> dict[str, dict]:
+        return {
+            **DEFAULT_FETCHES,
+            "/api/settings/features": {
+                "status": 200,
+                "json": {
+                    "flags": {
+                        "enable_beta_features": {
+                            "value": master_on,
+                            "origin": "default",
+                            "editable": True,
+                            "type": "bool",
+                            "env_var": "ENABLE_BETA_FEATURES",
+                        },
+                        "enable_yaml_config_editing": {
+                            "value": yaml_on,
+                            "origin": "default",
+                            "editable": True,
+                            "type": "bool",
+                            "env_var": "ENABLE_YAML_CONFIG_EDITING",
+                        },
+                    },
+                    "beta_sub_flags": ["enable_yaml_config_editing"],
+                },
+            },
+            "/api/settings/advanced": {
+                "status": 200,
+                "json": {
+                    "fields": [
+                        {
+                            "field": "extra_yaml_write_keys",
+                            "env_var": "HA_MCP_EXTRA_YAML_KEYS",
+                            "value": "alert2",
+                            "type": "str",
+                            "section": "beta_yamlkeys",
+                            "origin": "default",
+                            "editable": True,
+                        }
+                    ]
+                },
+            },
+        }
+
+    def _rows(self, dom: str) -> list[str]:
+        return re.findall(
+            r'<div[^>]*class="[^"]*yaml-packages-sub[^"]*"[^>]*>',
+            dom,
+        )
+
+    @pytest.mark.parametrize("editable", [True, False])
+    def test_row_renders_existing_keys_one_per_line(
+        self, settings_script: str, editable: bool
+    ) -> None:
+        payloads = self._payloads(master_on=True, yaml_on=True)
+        payloads["/api/settings/advanced"]["json"]["fields"][0]["value"] = (
+            "alert2, whole_house_fan, energy_status"
+        )
+        field = payloads["/api/settings/advanced"]["json"]["fields"][0]
+        field["editable"] = editable
+        field["origin"] = "default" if editable else "env"
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=payloads,
+            invoke="""
+              await new Promise(r => setTimeout(r, 300));
+              const input = document.querySelector('[name="adv:extra_yaml_write_keys"]');
+              console.log('yaml-editor', input.tagName, input.rows, input.value, input.disabled);
+            """,
+        )
+        _assert_clean_init(result)
+
+        assert self._rows(result.dom), (
+            f"expected yaml-packages-sub row in DOM; tail: {result.dom[-2000:]}"
+        )
+        assert 'name="adv:extra_yaml_write_keys"' in result.dom
+        assert any(
+            entry["args"]
+            == [
+                "yaml-editor",
+                "TEXTAREA",
+                "4",
+                "alert2\nwhole_house_fan\nenergy_status",
+                "false" if editable else "true",
+            ]
+            for entry in result.console
+        )
+        for row in self._rows(result.dom):
+            assert "dimmed" not in row, f"unexpected dimmed with both gates on: {row}"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            (
+                "alert2\nwhole_house_fan\nenergy_status",
+                "alert2,whole_house_fan,energy_status",
+            ),
+            (
+                " alert2, whole_house_fan\r\n\nenergy_status, ",
+                "alert2,whole_house_fan,energy_status",
+            ),
+            (" \n,\n ", ""),
+        ],
+    )
+    def test_multiline_edit_saves_compatible_csv(
+        self, settings_script: str, text: str, expected: str
+    ) -> None:
+        payloads = self._payloads(master_on=True, yaml_on=True)
+        advanced = payloads["/api/settings/advanced"]
+        payloads["/api/settings/advanced"] = {
+            "byMethod": {
+                "GET": advanced,
+                "POST": {"status": 200, "json": {"restart_required": False}},
+            }
+        }
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=payloads,
+            invoke=f"""
+              await new Promise(r => setTimeout(r, 300));
+              const input = document.querySelector('[name="adv:extra_yaml_write_keys"]');
+              input.value = {json.dumps(text)};
+              input.dispatchEvent(new Event('change', {{bubbles: true}}));
+            """,
+        )
+        _assert_clean_init(result)
+        posts = [
+            call
+            for call in result.fetches_to("/api/settings/advanced")
+            if call["method"] == "POST"
+        ]
+        assert len(posts) == 1
+        assert json.loads(posts[0]["body"]) == {"extra_yaml_write_keys": expected}
+
+    @pytest.mark.parametrize(
+        "master_on,yaml_on", [(False, True), (True, False), (False, False)]
+    )
+    def test_row_dimmed_when_either_gate_off(
+        self, settings_script: str, master_on: bool, yaml_on: bool
+    ) -> None:
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=self._payloads(master_on=master_on, yaml_on=yaml_on),
+            invoke="await new Promise(r => setTimeout(r, 300));",
+        )
+        _assert_clean_init(result)
+
+        rows = self._rows(result.dom)
+        assert rows, "expected yaml-packages-sub row"
+        for row in rows:
+            assert "dimmed" in row, f"expected dimmed row: {row}"
+        assert re.search(
+            r'<textarea[^>]*disabled[^>]*name="adv:extra_yaml_write_keys"', result.dom
+        )
+
+
+class TestFeatureGatedStubRow:
+    """Feature-gated stub rows (#2148): the "how to enable this" hint is
+    worded per ``disabled_by_beta``, and the security-gate switch stays
+    operable so a rule can be authored BEFORE the tool is registered."""
+
+    @staticmethod
+    def _fetches(*, policies_enabled: bool) -> dict:
+        return {
+            **DEFAULT_FETCHES,
+            "/api/settings/tools": {
+                "status": 200,
+                "json": {
+                    "tools": [
+                        {
+                            "name": "ha_manage_security_policy",
+                            "title": "Manage Security Policy",
+                            "primary_tag": "System",
+                            "annotations": {"destructiveHint": True},
+                            "disabled_by": "enable_security_policy_tool",
+                            "disabled_by_beta": False,
+                        },
+                        {
+                            "name": "ha_write_file",
+                            "title": "Write File",
+                            "primary_tag": "Files",
+                            "annotations": {"destructiveHint": True},
+                            "disabled_by": "enable_filesystem_tools",
+                            "disabled_by_beta": True,
+                        },
+                    ],
+                    "states": {},
+                    "env_pinned": {},
+                    "read_only_exempt": [],
+                },
+            },
+            "/api/settings/features": {
+                "status": 200,
+                "json": {
+                    "flags": {
+                        "enable_tool_security_policies": {"value": policies_enabled}
+                    }
+                },
+            },
+            "/api/policy/config": {
+                "status": 200,
+                "json": {
+                    "wait_seconds": 60,
+                    "approval_ttl_minutes": 5,
+                    "version": 1,
+                    "rules": [],
+                },
+            },
+        }
+
+    @staticmethod
+    def _gate_input(dom: str, tool: str) -> str:
+        m = re.search(rf'<input[^>]*name="tool:{tool}:gated"[^>]*>', dom)
+        assert m is not None, f"gated input for {tool} missing; dom tail: {dom[-2000:]}"
+        return m.group(0)
+
+    def test_non_beta_stub_renders_non_beta_hint(self, settings_script: str) -> None:
+        """A non-beta gated row must NOT claim to be beta or point at the dev
+        add-on config — its toggle is on the Tool Security Policies tab."""
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=self._fetches(policies_enabled=True),
+            invoke="await new Promise(r => setTimeout(r, 250));",
+        )
+        _assert_clean_init(result)
+        row = re.search(
+            r'<div class="tool"[^>]*data-name="ha_manage_security_policy".*?'
+            r'name="tool:ha_manage_security_policy:gated"',
+            result.dom,
+            re.S,
+        )
+        assert row is not None, f"stub row missing; dom tail: {result.dom[-2000:]}"
+        assert "Tool Security Policies tab" in row.group(0), (
+            f"non-beta gated row must name where its toggle lives: {row.group(0)}"
+        )
+        assert "docs/beta.md" not in row.group(0), (
+            f"non-beta gated row must not render the beta hint: {row.group(0)}"
+        )
+
+    def test_beta_stub_still_renders_beta_hint(self, settings_script: str) -> None:
+        """Regression guard on the other branch: beta-gated rows keep the
+        beta wording (dev add-on config / docs/beta.md)."""
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=self._fetches(policies_enabled=True),
+            invoke="await new Promise(r => setTimeout(r, 250));",
+        )
+        _assert_clean_init(result)
+        row = re.search(
+            r'<div class="tool"[^>]*data-name="ha_write_file".*?'
+            r'name="tool:ha_write_file:gated"',
+            result.dom,
+            re.S,
+        )
+        assert row is not None, f"beta stub row missing; dom tail: {result.dom[-2000:]}"
+        assert "docs/beta.md" in row.group(0), (
+            f"beta gated row must keep the beta hint: {row.group(0)}"
+        )
+
+    def test_gate_switch_operable_on_stub_when_policies_enabled(
+        self, settings_script: str
+    ) -> None:
+        """The chicken-and-egg fix: with policies on, a gated-off tool's
+        security-gate switch must be live so the rule can be authored before
+        the tool is enabled. Its enable/pin switches stay locked."""
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=self._fetches(policies_enabled=True),
+            invoke="await new Promise(r => setTimeout(r, 250));",
+        )
+        _assert_clean_init(result)
+        gate = self._gate_input(result.dom, "ha_manage_security_policy")
+        assert "disabled" not in gate, (
+            f"gate switch must be operable on a stub row while policies are on: {gate}"
+        )
+        enabled_input = re.search(
+            r'<input[^>]*name="tool:ha_manage_security_policy:enabled"[^>]*>',
+            result.dom,
+        )
+        assert enabled_input is not None and "disabled" in enabled_input.group(0), (
+            "the enable switch on a gated stub row must stay locked: "
+            f"{enabled_input and enabled_input.group(0)}"
+        )
+
+    def test_gate_switch_locked_on_stub_when_policies_disabled(
+        self, settings_script: str
+    ) -> None:
+        """Without the master switch there is nothing to gate with, so the
+        stub's gate switch stays disabled (same as every other row)."""
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=self._fetches(policies_enabled=False),
+            invoke="await new Promise(r => setTimeout(r, 250));",
+        )
+        _assert_clean_init(result)
+        gate = self._gate_input(result.dom, "ha_manage_security_policy")
+        assert "disabled" in gate, (
+            f"gate switch must stay locked while policies are off: {gate}"
+        )
+
+
+class TestApprovalPinRemoval:
+    """The local checkbox after a successful PIN removal (#2502 review).
+
+    The DELETE answer's ``event_decisions_disabled`` reports whether the
+    PERSISTED toggle was on. A box the user ticked but has not saved yet is
+    invisible to that flag, so keying the local reset on it left the
+    checkbox ticked, the status refresh then disabled it (no PIN), and the
+    next Save submitted the one combination the server refuses.
+    """
+
+    @staticmethod
+    def _fetches(*, event_decisions_disabled: bool) -> dict:
+        return {
+            **DEFAULT_FETCHES,
+            "/api/policy/decision-pin": {
+                "byMethod": {
+                    "DELETE": {
+                        "status": 200,
+                        "json": {
+                            "set": False,
+                            "event_decisions_disabled": event_decisions_disabled,
+                        },
+                    },
+                    "GET": {"status": 200, "json": {"set": False}},
+                }
+            },
+        }
+
+    @staticmethod
+    def _invoke() -> str:
+        return """
+              await new Promise(r => setTimeout(r, 250));
+              window.confirm = () => true;
+              const cb = document.getElementById('policy-event-decisions-toggle');
+              cb.checked = true;
+              const pre = document.createElement('div');
+              pre.id = '__pin_pre_probe';
+              pre.dataset.checked = String(cb.checked);
+              document.body.appendChild(pre);
+              document.getElementById('policy-clear-pin-btn').click();
+              await new Promise(r => setTimeout(r, 150));
+              const probe = document.createElement('div');
+              probe.id = '__pin_removal_probe';
+              probe.dataset.checked = String(cb.checked);
+              document.body.appendChild(probe);
+            """
+
+    def _probe(self, dom: str) -> str:
+        # The box really was ticked before the click: without this, a page
+        # that never got it ticked would satisfy every "cleared" assertion
+        # below for the wrong reason.
+        pre = re.search(r'<div[^>]*id="__pin_pre_probe"[^>]*>', dom)
+        assert pre is not None and 'data-checked="true"' in pre.group(0), (
+            f"the toggle was not ticked before the removal: {pre and pre.group(0)}"
+        )
+        probe = re.search(r'<div[^>]*id="__pin_removal_probe"[^>]*>', dom)
+        assert probe is not None, f"probe missing; dom tail: {dom[-1500:]}"
+        return probe.group(0)
+
+    def test_an_unsaved_tick_is_cleared_when_the_server_says_nothing_changed(
+        self, settings_script: str
+    ) -> None:
+        """The persisted toggle was already off — the box must still clear.
+
+        This is the sequence that used to break: tick the box without
+        saving, then remove the PIN. The server reports
+        ``event_decisions_disabled: false`` because nothing was persisted,
+        and the box used to stay ticked.
+        """
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=self._fetches(event_decisions_disabled=False),
+            invoke=self._invoke(),
+        )
+        _assert_clean_init(result)
+        assert 'data-checked="false"' in self._probe(result.dom)
+
+    def test_the_box_is_cleared_when_the_server_switched_it_off(
+        self, settings_script: str
+    ) -> None:
+        """The case that already worked, kept working."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=self._fetches(event_decisions_disabled=True),
+            invoke=self._invoke(),
+        )
+        _assert_clean_init(result)
+        assert 'data-checked="false"' in self._probe(result.dom)
+
+    def test_a_failed_removal_leaves_the_box_alone(self, settings_script: str) -> None:
+        """Nothing was removed, so nothing about the toggle may be implied."""
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/decision-pin": {
+                "byMethod": {
+                    "DELETE": {"status": 500, "json": {"error": "no"}},
+                    "GET": {"status": 200, "json": {"set": True}},
+                }
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke=self._invoke(),
+        )
+        _assert_clean_init(result)
+        assert 'data-checked="true"' in self._probe(result.dom)
+
+
+class TestApprovalPinInvalidStatus:
+    """A stored record that matches nothing is its own state in the tab.
+
+    Reported as "no PIN set", the user is told to do the thing they
+    already did; the repair for a record the server cannot decode is to
+    set a new PIN, and the status line is where that is said.
+    """
+
+    def test_an_unusable_record_says_so_and_keeps_the_toggle_locked(
+        self, settings_script: str
+    ) -> None:
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/decision-pin": {
+                "status": 200,
+                "json": {"set": False, "invalid": True},
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.policyRefreshPinStatus();
+              const probe = document.createElement('div');
+              probe.id = '__pin_invalid_probe';
+              probe.dataset.status = document.getElementById('policy-pin-status').textContent;
+              probe.dataset.disabled = String(
+                document.getElementById('policy-event-decisions-toggle').disabled
+              );
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        probe = re.search(r'<div[^>]*id="__pin_invalid_probe"[^>]*>', result.dom)
+        assert probe is not None, f"probe missing; dom tail: {result.dom[-1500:]}"
+        assert "cannot be read" in probe.group(0), probe.group(0)
+        assert 'data-disabled="true"' in probe.group(0), probe.group(0)
+
+    def test_a_plain_missing_pin_still_says_no_pin_set(
+        self, settings_script: str
+    ) -> None:
+        """The control: absent and invalid must not render the same line."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=DEFAULT_FETCHES,
+            invoke="""
+              await new Promise(r => setTimeout(r, 250));
+              await window.policyRefreshPinStatus();
+              const probe = document.createElement('div');
+              probe.id = '__pin_absent_probe';
+              probe.dataset.status = document.getElementById('policy-pin-status').textContent;
+              document.body.appendChild(probe);
+            """,
+        )
+        _assert_clean_init(result)
+        probe = re.search(r'<div[^>]*id="__pin_absent_probe"[^>]*>', result.dom)
+        assert probe is not None
+        assert "No PIN set" in probe.group(0), probe.group(0)
+
+
+class TestAllowListPolicyUi:
+    """rule_effect='allow' (issue #2540): the bare rule approves its tool, so
+    the Tools-tab gate toggle and the rule cards read the other way round."""
+
+    ALLOW_POLICY: ClassVar[dict] = {
+        "rule_effect": "allow",
+        "wait_seconds": 60,
+        "approval_ttl_minutes": 5,
+        "version": 4,
+        "rules": [{"tool_name": "ha_get_state", "when": [], "remember_minutes": 0}],
+    }
+
+    def _fetches(self, policy: dict | None = None) -> dict:
+        return {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {"status": 200, "json": policy or self.ALLOW_POLICY},
+        }
+
+    def _puts(self, result: HarnessResult) -> list[dict]:
+        return [
+            json.loads(f["body"])
+            for f in result.fetches
+            if f["method"] == "PUT" and "/api/policy/config" in f["url"]
+        ]
+
+    def test_gating_an_approved_tool_removes_its_approval(
+        self, settings_script: str
+    ) -> None:
+        fetches = self._fetches()
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="await loadPolicyState(); await window.syncPolicyRule('ha_get_state', true);",
+        )
+        _assert_clean_init(result)
+        (body,) = self._puts(result)
+        assert body["rules"] == []
+        assert body["rule_effect"] == "allow"
+
+    def test_ungating_a_tool_approves_it(self, settings_script: str) -> None:
+        fetches = self._fetches()
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="await loadPolicyState(); await window.syncPolicyRule('ha_call_service', false);",
+        )
+        _assert_clean_init(result)
+        (body,) = self._puts(result)
+        assert sorted(r["tool_name"] for r in body["rules"]) == [
+            "ha_call_service",
+            "ha_get_state",
+        ]
+
+    def test_toggle_shows_unapproved_tools_as_gated(self, settings_script: str) -> None:
+        fetches = self._fetches()
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=fetches,
+            invoke="""
+              await loadPolicyState();
+              document.body.setAttribute(
+                'data-approved', String(isToolGated('ha_get_state')));
+              document.body.setAttribute(
+                'data-other', String(isToolGated('ha_call_service')));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "approved") == "false"
+        assert _probe(result, "other") == "true"
+
+    def test_rule_cards_use_allow_list_wording(self, settings_script: str) -> None:
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=DEFAULT_FETCHES,
+            invoke=("renderPolicyCards(" + json.dumps(self.ALLOW_POLICY) + ");"),
+        )
+        _assert_clean_init(result)
+        assert 'data-i18n="policies.rules.title_allow"' in result.dom
+        assert "Approved tools" in result.dom
+        assert "approves every call to this tool" in result.dom
+        assert 'class="policy-rule-lifetime" style="display:none"' in result.dom
+
+    def test_empty_allow_list_explains_that_everything_is_gated(
+        self, settings_script: str
+    ) -> None:
+        empty = {**self.ALLOW_POLICY, "rules": []}
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=DEFAULT_FETCHES,
+            invoke="renderPolicyCards(" + json.dumps(empty) + ");",
+        )
+        _assert_clean_init(result)
+        assert 'data-i18n-html="policies.rules.empty_allow"' in result.dom
+        assert "every tool call needs your approval" in result.dom
+
+    def test_switching_effect_asks_first_and_sends_it(
+        self, settings_script: str
+    ) -> None:
+        require = {**self.ALLOW_POLICY, "rule_effect": "require_approval"}
+        fetches = self._fetches(require)
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await policyLoadConfig();
+              let confirms = 0;
+              window.confirm = () => { confirms += 1; return false; };
+              document.getElementById('policy-rule-effect').value = 'allow';
+              await saveGlobalSettings();
+              window.confirm = () => { confirms += 1; return true; };
+              document.getElementById('policy-rule-effect').value = 'allow';
+              await saveGlobalSettings();
+              document.body.setAttribute('data-confirms', String(confirms));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "confirms") == "2"
+        puts = self._puts(result)
+        assert len(puts) == 1, "a declined switch must not be saved"
+        assert puts[0]["rule_effect"] == "allow"
+
+    def test_unchanged_allow_list_saves_without_asking(
+        self, settings_script: str
+    ) -> None:
+        fetches = self._fetches()
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              let confirms = 0;
+              window.confirm = () => { confirms += 1; return true; };
+              await policyLoadConfig();
+              await saveGlobalSettings();
+              document.body.setAttribute('data-confirms', String(confirms));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "confirms") == "0"
+        (body,) = self._puts(result)
+        assert body["rule_effect"] == "allow"
+
+    def test_mode_switched_elsewhere_is_not_written_back(
+        self, settings_script: str
+    ) -> None:
+        """The page loaded a require-approval list; the server now holds an
+        allow list. Saving the page's stale selector must not invert it."""
+        fetches = self._fetches()
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              let confirms = 0;
+              window.confirm = () => { confirms += 1; return true; };
+              policyState.cardsEffect = 'require_approval';
+              document.getElementById('policy-rule-effect').value = 'require_approval';
+              await saveGlobalSettings();
+              document.body.setAttribute('data-confirms', String(confirms));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "confirms") == "0"
+        assert self._puts(result) == []
+        assert "Reload the page" in result.dom
+
+    def test_gate_toggle_refuses_when_the_mode_changed_elsewhere(
+        self, settings_script: str
+    ) -> None:
+        fetches = self._fetches()
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              policyState.toolsEffect = 'require_approval';
+              try {
+                await window.syncPolicyRule('ha_call_service', true);
+                document.body.setAttribute('data-threw', 'false');
+              } catch (e) {
+                document.body.setAttribute('data-threw', 'true');
+              }
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "threw") == "true"
+        assert self._puts(result) == []
+
+    def test_card_save_refuses_after_a_tools_reload_saw_a_new_mode(
+        self, settings_script: str
+    ) -> None:
+        """The Tools-tab reload learns of the allow list; the cards on the
+        Policies tab were rendered for a require-approval list and still say
+        so, so a condition saved from them must not land as an approval."""
+        require = {**self.ALLOW_POLICY, "rule_effect": "require_approval"}
+        fetches = {
+            **DEFAULT_FETCHES,
+            "/api/policy/config": {
+                "responses": [
+                    {"status": 200, "json": require},
+                    {"status": 200, "json": self.ALLOW_POLICY},
+                    {"status": 200, "json": self.ALLOW_POLICY},
+                    {"status": 200, "json": self.ALLOW_POLICY},
+                ]
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 200));
+              policyState.cardsEffect = 'require_approval';
+              await loadPolicyState();
+              try {
+                await savePolicyRule('ha_call_service', {
+                  conditions: [[{path: 'args.entity_id', op: 'eq', value: 'lock.front_door'}]],
+                  remembers: [0], remember_minutes: 0, rememberDirty: false,
+                });
+                document.body.setAttribute('data-threw', 'false');
+              } catch (e) {
+                document.body.setAttribute('data-threw', 'true');
+              }
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "threw") == "true"
+        assert self._puts(result) == []
+
+    def test_approve_everything_rule_leaves_no_tool_gated(
+        self, settings_script: str
+    ) -> None:
+        star = {**self.ALLOW_POLICY, "rules": [{"tool_name": "*", "when": []}]}
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=self._fetches(star),
+            invoke="""
+              await loadPolicyState();
+              document.body.setAttribute(
+                'data-gated', String(isToolGated('ha_call_service')));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "gated") == "false"
+
+    ONE_CONDITION: ClassVar[dict] = {
+        **ALLOW_POLICY,
+        "rules": [
+            {
+                "tool_name": "ha_call_service",
+                "when": [{"path": "args.domain", "op": "eq", "value": "light"}],
+                "remember_minutes": 0,
+            }
+        ],
+    }
+
+    def test_removing_the_last_condition_asks_before_approving_everything(
+        self, settings_script: str
+    ) -> None:
+        """Without conditions an allow-list card approves every call to the
+        tool; that is never saved without the user confirming it."""
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=self._fetches(self.ONE_CONDITION),
+            invoke="""
+              await policyLoadConfig();
+              let asked = 0;
+              window.confirm = () => { asked += 1; return false; };
+              document.querySelector('.policy-remove-predicate').click();
+              await new Promise(r => setTimeout(r, 200));
+              document.body.setAttribute('data-asked', String(asked));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "asked") == "1"
+        assert self._puts(result) == []
+
+    def test_card_redrawn_after_an_edit_keeps_allow_list_wording(
+        self, settings_script: str
+    ) -> None:
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=self._fetches(self.ONE_CONDITION),
+            invoke="""
+              await policyLoadConfig();
+              window.confirm = () => true;
+              document.querySelector('.policy-remove-predicate').click();
+              await new Promise(r => setTimeout(r, 200));
+            """,
+        )
+        _assert_clean_init(result)
+        (body,) = self._puts(result)
+        assert body["rules"] == [
+            {"tool_name": "ha_call_service", "when": [], "remember_minutes": 0}
+        ]
+        assert "Approve without asking" in result.dom
+        assert "Require approval when ANY" not in result.dom
+        assert 'class="policy-rule-lifetime" style="display:none"' in result.dom
+
+    def test_rule_removal_refuses_when_the_mode_changed_elsewhere(
+        self, settings_script: str
+    ) -> None:
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=self._fetches(),
+            invoke="""
+              policyState.cardsEffect = 'require_approval';
+              try {
+                await removePolicyRule('ha_get_state');
+                document.body.setAttribute('data-threw', 'false');
+              } catch (e) {
+                document.body.setAttribute('data-threw', 'true');
+              }
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "threw") == "true"
+        assert self._puts(result) == []
+
+    def test_write_before_the_mode_was_read_says_so(self, settings_script: str) -> None:
+        result = run_script(
+            settings_script,
+            initial_html=_policy_panel_dom(),
+            fetch_map=self._fetches(),
+            invoke="""
+              policyState.toolsEffect = null;
+              try {
+                await window.syncPolicyRule('ha_call_service', true);
+              } catch (e) {
+                document.body.setAttribute('data-msg', e.message);
+              }
+            """,
+        )
+        _assert_clean_init(result)
+        assert "could not read what a matching rule does" in (
+            _probe(result, "msg") or ""
+        )
+        assert self._puts(result) == []
+
+    def test_gate_toggle_click_under_an_allow_list(self, settings_script: str) -> None:
+        """Ticking "security gated" on an approved tool removes its approval,
+        and the optimistic state follows the allow-list reading."""
+        tool = {
+            "name": "ha_get_state",
+            "title": "Get State",
+            "category": "read",
+            "description": "Read a state.",
+        }
+        fetches = {
+            **self._fetches(),
+            "/api/settings/tools": {
+                "status": 200,
+                "json": {
+                    "tools": [tool],
+                    "states": {},
+                    "env_pinned": {},
+                    "read_only_exempt": [],
+                },
+            },
+            "/api/settings/features": {
+                "status": 200,
+                "json": {
+                    "flags": {
+                        "enable_tool_security_policies": {
+                            "value": True,
+                            "origin": "default",
+                            "editable": True,
+                            "type": "bool",
+                        }
+                    },
+                    "beta_sub_flags": [],
+                    "is_addon": False,
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 200));
+              const box = document.querySelector('input[name="tool:ha_get_state:gated"]');
+              document.body.setAttribute('data-before', String(box.checked));
+              box.checked = true;
+              box.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 200));
+              document.body.setAttribute('data-gated', String(isToolGated('ha_get_state')));
+            """,
+        )
+        _assert_clean_init(result)
+        assert _probe(result, "before") == "false"
+        (body,) = self._puts(result)
+        assert body["rules"] == []
+        assert _probe(result, "gated") == "true"
+
+    def _click_gate_under_wildcard(
+        self, settings_script: str, effect: str, rules: list[dict]
+    ) -> HarnessResult:
+        policy = {**self.ALLOW_POLICY, "rule_effect": effect, "rules": rules}
+        tool = {
+            "name": "ha_get_state",
+            "title": "Get State",
+            "category": "read",
+            "description": "Read a state.",
+        }
+        fetches = {
+            **self._fetches(policy),
+            "/api/settings/tools": {
+                "status": 200,
+                "json": {
+                    "tools": [tool],
+                    "states": {},
+                    "env_pinned": {},
+                    "read_only_exempt": [],
+                },
+            },
+            "/api/settings/features": {
+                "status": 200,
+                "json": {
+                    "flags": {
+                        "enable_tool_security_policies": {
+                            "value": True,
+                            "origin": "default",
+                            "editable": True,
+                            "type": "bool",
+                        }
+                    },
+                    "beta_sub_flags": [],
+                    "is_addon": False,
+                },
+            },
+        }
+        result = run_script(
+            settings_script,
+            initial_html=MIN_DOM,
+            fetch_map=fetches,
+            invoke="""
+              await new Promise(r => setTimeout(r, 200));
+              const box = document.querySelector('input[name="tool:ha_get_state:gated"]');
+              document.body.setAttribute('data-before', String(box.checked));
+              box.checked = !box.checked;
+              box.dispatchEvent(new Event('change'));
+              await new Promise(r => setTimeout(r, 200));
+              const after = document.querySelector('input[name="tool:ha_get_state:gated"]');
+              document.body.setAttribute('data-after', String(after.checked));
+              document.body.setAttribute('data-bare', [...policyState.bareRuleTools].join(','));
+            """,
+        )
+        _assert_clean_init(result)
+        return result
+
+    def test_gate_toggle_under_an_approve_everything_rule_is_refused(
+        self, settings_script: str
+    ) -> None:
+        """An allow list's bare ``*`` rule approves every tool, so gating one
+        cannot take effect: nothing is saved, the switch returns to where it
+        was, and the alert names the rule to remove."""
+        result = self._click_gate_under_wildcard(
+            settings_script,
+            "allow",
+            [{"tool_name": "*", "when": [], "remember_minutes": 0}],
+        )
+        assert _probe(result, "before") == "false"
+        assert self._puts(result) == []
+        assert _probe(result, "after") == "false"
+        assert _probe(result, "bare") == "*"
+        assert len(result.alerts) == 1
+        assert 'unconditional "*" rule' in result.alerts[0]
+
+    def test_gate_toggle_off_under_a_gate_everything_rule_saves(
+        self, settings_script: str
+    ) -> None:
+        """In a require-approval list the tool's own bare rule is first-match
+        ahead of ``*`` (it supplies the remember window), so removing it is a
+        real change and must not be refused."""
+        result = self._click_gate_under_wildcard(
+            settings_script,
+            "require_approval",
+            [
+                {"tool_name": "ha_get_state", "when": [], "remember_minutes": 0},
+                {"tool_name": "*", "when": [], "remember_minutes": 60},
+            ],
+        )
+        assert _probe(result, "before") == "true"
+        (body,) = self._puts(result)
+        assert [r["tool_name"] for r in body["rules"]] == ["*"]
+        assert result.alerts == []

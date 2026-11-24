@@ -24,14 +24,22 @@ input_datetime, counter, timer. Skips: schedule, zone, person, tag.
 
 Also includes a cross-cutting test: a fully-configured input_number
 updated with only ``min_value=70`` must preserve initial, mode,
-unit_of_measurement, step, and icon.
+unit_of_measurement, step, and icon; and zone tests: an icon change must
+reach the zone's stored icon, and clearing a stored icon must fail; and a
+person and tag test: their icon lands in the entity registry and clears there.
 """
 
 import logging
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
+from ha_mcp._vendor.fastmcp import Client
+
 from ...utilities.assertions import (
+    MCPAssertions,
     assert_mcp_success,
     parse_mcp_result,
     safe_call_tool,
@@ -122,7 +130,7 @@ class TestInputBooleanFieldPersistence:
                 "helper_type": helper_type,
                 "name": original_name,
                 "icon": original_icon,
-                "initial": "on",
+                "config": {"initial": "on"},
             },
         )
         create_data = assert_mcp_success(create_result, "Create input_boolean")
@@ -182,9 +190,8 @@ class TestInputSelectFieldPersistence:
             {
                 "helper_type": helper_type,
                 "name": "E2E Persistence Select",
-                "options": original_options,
-                "initial": "Beta",
                 "icon": original_icon,
+                "config": {"options": original_options, "initial": "Beta"},
             },
         )
         create_data = assert_mcp_success(create_result, "Create input_select")
@@ -259,13 +266,15 @@ class TestInputNumberFieldPersistence:
             {
                 "helper_type": helper_type,
                 "name": "E2E Persistence Number",
-                "min_value": original["min"],
-                "max_value": original["max"],
-                "step": original["step"],
-                "mode": original["mode"],
-                "unit_of_measurement": original["unit_of_measurement"],
-                "initial": original["initial"],
                 "icon": original["icon"],
+                "config": {
+                    "min": original["min"],
+                    "max": original["max"],
+                    "step": original["step"],
+                    "mode": original["mode"],
+                    "unit_of_measurement": original["unit_of_measurement"],
+                    "initial": original["initial"],
+                },
             },
         )
         create_data = assert_mcp_success(create_result, "Create input_number")
@@ -329,11 +338,13 @@ class TestInputTextFieldPersistence:
             {
                 "helper_type": helper_type,
                 "name": "E2E Persistence Text",
-                "min_value": original["min"],
-                "max_value": original["max"],
-                "mode": original["mode"],
                 "icon": original["icon"],
-                "initial": "secret",
+                "config": {
+                    "min": original["min"],
+                    "max": original["max"],
+                    "mode": original["mode"],
+                    "initial": "secret",
+                },
             },
         )
         create_data = assert_mcp_success(create_result, "Create input_text")
@@ -398,9 +409,11 @@ class TestInputDatetimeFieldPersistence:
             {
                 "helper_type": helper_type,
                 "name": "E2E Persistence Datetime",
-                "has_date": original["has_date"],
-                "has_time": original["has_time"],
                 "icon": original["icon"],
+                "config": {
+                    "has_date": original["has_date"],
+                    "has_time": original["has_time"],
+                },
             },
         )
         create_data = assert_mcp_success(create_result, "Create input_datetime")
@@ -469,12 +482,14 @@ class TestCounterFieldPersistence:
             {
                 "helper_type": helper_type,
                 "name": "E2E Persistence Counter",
-                "min_value": original["minimum"],
-                "max_value": original["maximum"],
-                "step": original["step"],
-                "initial": original["initial"],
                 "icon": original["icon"],
-                "restore": True,
+                "config": {
+                    "minimum": original["minimum"],
+                    "maximum": original["maximum"],
+                    "step": original["step"],
+                    "initial": original["initial"],
+                    "restore": True,
+                },
             },
         )
         create_data = assert_mcp_success(create_result, "Create counter")
@@ -533,9 +548,8 @@ class TestTimerFieldPersistence:
             {
                 "helper_type": helper_type,
                 "name": "E2E Persistence Timer",
-                "duration": original_duration,
                 "icon": original_icon,
-                "restore": True,
+                "config": {"duration": original_duration, "restore": True},
             },
         )
         create_data = assert_mcp_success(create_result, "Create timer")
@@ -629,13 +643,15 @@ class TestInputNumberPartialUpdatePreservesFields:
             {
                 "helper_type": helper_type,
                 "name": "E2E Partial Update Number",
-                "min_value": 0,
-                "max_value": preserved["max"],
-                "step": preserved["step"],
-                "mode": preserved["mode"],
-                "unit_of_measurement": preserved["unit_of_measurement"],
-                "initial": preserved["initial"],
                 "icon": preserved["icon"],
+                "config": {
+                    "min": 0,
+                    "max": preserved["max"],
+                    "step": preserved["step"],
+                    "mode": preserved["mode"],
+                    "unit_of_measurement": preserved["unit_of_measurement"],
+                    "initial": preserved["initial"],
+                },
             },
         )
         create_data = assert_mcp_success(create_result, "Create input_number")
@@ -666,7 +682,7 @@ class TestInputNumberPartialUpdatePreservesFields:
             {
                 "helper_type": helper_type,
                 "helper_id": entity_id,
-                "min_value": new_min,
+                "config": {"min": new_min},
             },
         )
         assert_mcp_success(update_result, "Partial update (min_value only)")
@@ -688,3 +704,129 @@ class TestInputNumberPartialUpdatePreservesFields:
                 phase="post-update",
                 entity_id=entity_id,
             )
+
+
+@pytest.fixture
+async def icon_zone(
+    mcp_client: Client, ha_client: Any
+) -> AsyncIterator[tuple[str, str]]:
+    """A zone storing ``mdi:school``, removed afterwards: (entity_id, id).
+
+    Created through Core's zone/create, as the Home Assistant UI does. Each
+    zone gets its own name: Core keeps a removed zone's registry entry, icon
+    included, and gives it back to a zone created again under the same id.
+    """
+    created = await ha_client.send_websocket_message(
+        {
+            "type": "zone/create",
+            "name": f"E2E Zone Icon Test {uuid.uuid4().hex[:8]}",
+            "icon": "mdi:school",
+            "latitude": 40.7128,
+            "longitude": -74.0060,
+        }
+    )
+    zone_id = (created.get("result") or {}).get("id")
+    try:
+        assert zone_id, f"Missing zone id: {created}"
+        async with MCPAssertions(mcp_client) as mcp:
+            listed = await mcp.call_tool_success("ha_get_zone", {"zone_id": zone_id})
+        entity_id = listed["zone"]["entity_id"]
+        assert await _wait_for_entity_registration(mcp_client, entity_id)
+        yield entity_id, zone_id
+    finally:
+        if zone_id:
+            await safe_call_tool(mcp_client, "ha_remove_zone", {"zone_id": zone_id})
+
+
+async def _stored_icon(ha_client: Any, zone_id: str) -> str | None:
+    """The icon in the stored zone, read from Core's zone/list."""
+    listed = await ha_client.send_websocket_message({"type": "zone/list"})
+    zone: dict[str, Any] = next(
+        (z for z in listed.get("result") or [] if z.get("id") == zone_id), {}
+    )
+    return zone.get("icon")
+
+
+@pytest.mark.asyncio
+@pytest.mark.config
+class TestZoneIconPersistence:
+    """A zone's icon is stored in the zone, as the zone dialog stores it.
+
+    Core's zone/update merges into the stored zone, so a stored icon can be
+    changed but not removed, in the zone dialog as through the tools.
+    """
+
+    async def test_zone_icon_change_reaches_the_stored_icon(
+        self, mcp_client: Client, ha_client: Any, icon_zone: tuple[str, str]
+    ) -> None:
+        """Changing the icon of a zone must update the stored icon, the one the
+        Zones editor shows (#3001).
+        """
+        entity_id, zone_id = icon_zone
+        async with MCPAssertions(mcp_client) as mcp:
+            assert await _stored_icon(ha_client, zone_id) == "mdi:school"
+            await mcp.call_tool_success(
+                "ha_config_set_helper",
+                {"helper_type": "zone", "helper_id": entity_id,
+                 "icon": "mdi:home-city"},
+            )  # fmt: skip
+            assert await _stored_icon(ha_client, zone_id) == "mdi:home-city"
+
+    async def test_zone_stored_icon_clear_reports_the_kept_icon(
+        self, mcp_client: Client, ha_client: Any, icon_zone: tuple[str, str]
+    ) -> None:
+        """Clearing the icon of a zone that stores one must say Home Assistant
+        kept it, instead of a silent success while the icon keeps showing.
+        """
+        entity_id, zone_id = icon_zone
+        async with MCPAssertions(mcp_client) as mcp:
+            result = await mcp.call_tool_success(
+                "ha_config_set_helper",
+                {"helper_type": "zone", "helper_id": entity_id, "icon": ""},
+            )
+            assert any("mdi:school" in w for w in result.get("warnings", [])), result
+            assert await _stored_icon(ha_client, zone_id) == "mdi:school"
+
+
+async def _registry_icon(mcp: MCPAssertions, entity_id: str) -> str | None:
+    entity = await mcp.call_tool_success("ha_get_entity", {"entity_id": entity_id})
+    return entity["entity_entry"]["icon"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.config
+@pytest.mark.parametrize("helper_type", ["person", "tag"])
+async def test_person_and_tag_icons_land_in_the_registry_and_can_be_cleared(
+    mcp_client: Client, helper_type: str
+) -> None:
+    """Core's person and tag schemas have no icon field: the icon goes to the
+    entity registry on create and on update, and '' clears it there."""
+    tag_id = f"e2e-registry-icon-{uuid.uuid4().hex[:8]}"
+    create: dict[str, Any] = {
+        "helper_type": helper_type,
+        "name": f"E2E Registry Icon {helper_type}",
+        "icon": "mdi:star",
+    }
+    if helper_type == "tag":
+        create["config"] = {"tag_id": tag_id}
+    async with MCPAssertions(mcp_client) as mcp:
+        created = await mcp.call_tool_success("ha_config_set_helper", create)
+        entity_id = created.get("entity_id")
+        helper_id = tag_id if helper_type == "tag" else entity_id
+        try:
+            assert entity_id, created
+            assert await _registry_icon(mcp, entity_id) == "mdi:star"
+
+            for icon, expected in (("mdi:heart", "mdi:heart"), ("", None)):
+                await mcp.call_tool_success(
+                    "ha_config_set_helper",
+                    {"helper_type": helper_type, "helper_id": helper_id, "icon": icon},
+                )
+                assert await _registry_icon(mcp, entity_id) == expected
+        finally:
+            if helper_id:
+                await safe_call_tool(
+                    mcp_client,
+                    "ha_remove_helpers_integrations",
+                    {"helper_type": helper_type, "target": helper_id, "confirm": True},
+                )

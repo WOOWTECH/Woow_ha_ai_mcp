@@ -23,6 +23,12 @@ exactly the pre-3.4.3 behaviour without giving up the protection that matters.
 Operators who front ha-mcp differently can re-enable the guard (and pin their
 own allow-lists) via ``FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=true`` plus
 ``FASTMCP_HTTP_ALLOWED_HOSTS`` / ``FASTMCP_HTTP_ALLOWED_ORIGINS``.
+
+Turning the guard off is the documented posture, not an oversight: it has its
+own SECURITY.md section, § "Host/Origin validation (DNS-rebinding guard) is off
+by default", and the Scope section there excludes "DNS rebinding against the
+HTTP entrypoints" on the grounds that URL-path secrecy is the boundary and the
+local network is already the trusted zone.
 """
 
 from __future__ import annotations
@@ -54,10 +60,7 @@ def ensure_host_origin_guard_default_off() -> None:
     choice wins). A failed mutation is logged at WARNING and left retryable -- it
     is not recorded as done -- so a later reload re-attempts it.
     """
-    try:
-        import fastmcp
-    except Exception:  # pragma: no cover - fastmcp is a hard dependency
-        return
+    from ha_mcp._vendor import fastmcp
 
     settings = getattr(fastmcp, "settings", None)
     if settings is None or not hasattr(settings, _HOST_ORIGIN_PROTECTION_ATTR):

@@ -1,257 +1,270 @@
-"""Unit tests for device enrichment logic in tools_registry.
+"""Radio enrichment of a single ``ha_get_device`` lookup.
 
-Tests identifier parsing (ZHA ieee_address, Z-Wave node_id extraction)
-and graceful degradation when WebSocket enrichment calls fail.
+A Z-Wave JS device's node id comes from its identifier, a ZHA device's IEEE
+address likewise, and each is used to read the radio's own status. Core's
+real ``zwave_js`` and ``zha`` integrations answer those reads, set up as Core's
+own tests set them up; only the hardware below each library is replaced:
+
+- Z-Wave JS: the connection to the Z-Wave JS server
+  (``homeassistant.components.zwave_js.ZwaveClient``) is a mock whose driver,
+  controller and node are zwave-js-server-python's real models, built from the
+  node state the server would send.
+- ZHA: the radio is a zigpy ``ControllerApplication`` whose serial I/O does
+  nothing, handed to ZHA where bellows would open the EZSP stick; the device
+  and its link quality are zigpy's own device objects.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant.common import MockConfigEntry
+from zwave_js_server.const import NodeStatus
 
-from ha_mcp.tools.tools_registry import register_registry_tools
+from ha_mcp.client.rest_client import HomeAssistantClient, HomeAssistantConnectionError
+from ha_mcp.tools import tools_registry
+from ha_mcp.tools.tools_registry import RegistryTools
 
-
-def _register_and_capture(mock_client):
-    """Register registry tools with a mock MCP and return captured functions."""
-    mock_mcp = MagicMock()
-    captured: dict = {}
-
-    def capture_add_tool(method):
-        fmcp = getattr(method, "__fastmcp__", None)
-        name = (fmcp.name if fmcp else None) or method.__name__
-        captured[name] = method
-
-    mock_mcp.add_tool = capture_add_tool
-    register_registry_tools(mock_mcp, mock_client)
-    return captured
-
-
-def _make_device(
-    device_id: str = "test_device_123",
-    name: str = "Test Device",
-    identifiers: list | None = None,
-    connections: list | None = None,
-    config_entries: list | None = None,
-    **kwargs,
-):
-    """Build a mock device registry entry."""
-    return {
-        "id": device_id,
-        "name": name,
-        "name_by_user": None,
-        "manufacturer": "Test Mfg",
-        "model": "Test Model",
-        "sw_version": "1.0",
-        "hw_version": None,
-        "serial_number": None,
-        "area_id": None,
-        "via_device_id": None,
-        "disabled_by": None,
-        "labels": [],
-        "config_entries": config_entries or ["entry_1"],
-        "connections": connections or [],
-        "identifiers": identifiers or [],
-        **kwargs,
-    }
+from ._client_spies import sent_messages
+from ._zha_core import IEEE, RadioWithoutHardware, set_up_zha
+from ._zha_core import zigbee_network as build_zigbee_network
+from ._zwave_js import (
+    HOME_ID,
+    NODE_ID,
+    node_state,
+    set_up_zwave_js,
+    zwave_js_server_connection,
+)
 
 
-def _mock_client_with_device(device: dict, ws_responses: dict | None = None):
-    """Create a mock client that returns the given device from registry list."""
-    mock_client = MagicMock()
-
-    async def mock_ws(msg, **kwargs):
-        msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
-
-        # Device registry list
-        if msg_type == "config/device_registry/list":
-            return {"success": True, "result": [device]}
-
-        # Entity registry list
-        if msg_type == "config/entity_registry/list":
-            return {"success": True, "result": []}
-
-        # Custom responses for enrichment calls
-        if ws_responses and msg_type in ws_responses:
-            return ws_responses[msg_type]
-
-        return {"success": False, "error": f"Unknown type: {msg_type}"}
-
-    mock_client.send_websocket_message = AsyncMock(side_effect=mock_ws)
-    return mock_client
+@pytest.fixture(autouse=True)
+async def _registry_commands(hass: HomeAssistant) -> None:
+    """Core's ``config`` commands, which serve the device lookup's reads."""
+    assert await async_setup_component(hass, "config", {})
 
 
-class TestZWaveNodeIdParsing:
-    """Tests for Z-Wave JS node_id extraction from device identifiers."""
+@pytest.fixture
+def tools(core_client: HomeAssistantClient) -> RegistryTools:
+    return RegistryTools(core_client)
 
-    @pytest.mark.asyncio
-    async def test_zwave_node_id_extracted_from_identifier(self):
-        """Z-Wave identifier ["zwave_js", "3232323232-5"] should extract node_id="5"."""
-        device = _make_device(
-            identifiers=[["zwave_js", "3232323232-5"]],
+
+def _device(hass: HomeAssistant, domain: str, identifier: str) -> dr.DeviceEntry:
+    """A device in Core's registry, owned by a new config entry of ``domain``."""
+    entry = MockConfigEntry(domain=domain)
+    entry.add_to_hass(hass)
+    return dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(domain, identifier)}
+    )
+
+
+@pytest.fixture
+def zwave_js_server() -> Iterator[MagicMock]:
+    """The Z-Wave JS server connection, holding node 5 with no values."""
+    with zwave_js_server_connection(node_state([])) as client:
+        yield client
+
+
+@pytest.fixture
+async def zwave_js(hass: HomeAssistant, zwave_js_server: MagicMock) -> MockConfigEntry:
+    """Core's ``zwave_js`` integration, connected to ``zwave_js_server``."""
+    return await set_up_zwave_js(hass)
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [None, f"{HOME_ID}-{NODE_ID}-134:3:100"],
+    ids=["node", "node-with-product"],
+)
+async def test_zwave_node_id_and_status_come_from_the_identifier(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    tools: RegistryTools,
+    zwave_js: MockConfigEntry,
+    identifier: str | None,
+) -> None:
+    """``{home_id}-{node_id}`` and the product-suffixed form both name node 5,
+    whose status is read for this device.
+
+    ``None`` is the device Core registers for node 5; the product-suffixed
+    identifier alone is the device a replaced node leaves behind.
+    """
+    registry = dr.async_get(hass)
+    if identifier is None:
+        dev = registry.async_get_device_by_identifier(
+            ("zwave_js", f"{HOME_ID}-{NODE_ID}"), zwave_js.entry_id
         )
-        mock_client = _mock_client_with_device(
-            device,
-            {
-                "zwave_js/node_status": {
-                    "success": True,
-                    "result": {
-                        "node_id": 5,
-                        "status": "alive",
-                        "is_routing": True,
-                        "is_secure": True,
-                        "highest_security_class": "S2_Authenticated",
-                        "zwave_plus_version": 2,
-                        "is_controller_node": False,
-                    },
-                },
+        assert dev is not None
+    else:
+        dev = registry.async_get_or_create(
+            config_entry_id=zwave_js.entry_id, identifiers={("zwave_js", identifier)}
+        )
+
+    with sent_messages(core_client) as spy:
+        result = await tools.ha_get_device(device_id=dev.id)
+
+    assert result["success"] is True
+    device = result["device"]
+    assert device["integration_type"] == "zwave_js"
+    assert device["node_id"] == NODE_ID
+    # Z-Wave JS's whole reply, including fields such as ``ready``.
+    assert device["node_status"]["node_id"] == NODE_ID
+    assert device["node_status"]["status"] == NodeStatus.ALIVE
+    assert device["node_status"]["ready"] is True
+    assert {"type": "zwave_js/node_status", "device_id": dev.id} in [
+        call.args[0] for call in spy.call_args_list
+    ]
+    assert "warnings" not in result
+
+
+# A SmartStart DSK: eight dash-separated five-digit blocks, as on a QR code.
+_DSK = "34673-15546-46480-39591-32400-22155-07715-45994"
+
+
+async def test_pre_provisioned_zwave_device_gets_no_node_id(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    tools: RegistryTools,
+    zwave_js: MockConfigEntry,
+) -> None:
+    """A SmartStart device provisioned with a name but not yet included has no
+    node: Core names it ``provision_<dsk>`` and its status read refuses. A
+    block of the DSK must not be reported as its node id."""
+    provisioned = await core_client.send_websocket_message(
+        {
+            "type": "zwave_js/provision_smart_start_node",
+            "entry_id": zwave_js.entry_id,
+            "qr_provisioning_information": {
+                "version": 1,
+                "securityClasses": [0],
+                "dsk": _DSK,
+                "genericDeviceClass": 1,
+                "specificDeviceClass": 1,
+                "installerIconType": 1,
+                "manufacturerId": 1,
+                "productType": 1,
+                "productId": 1,
+                "applicationVersion": "1.0",
             },
-        )
-        captured = _register_and_capture(mock_client)
-        result = await captured["ha_get_device"](device_id="test_device_123")
+            "device_name": "Porch sensor",
+        }
+    )
+    assert provisioned["success"] is True
+    dev = dr.async_get(hass).async_get_device_by_identifier(
+        ("zwave_js", f"provision_{_DSK}"), zwave_js.entry_id
+    )
+    assert dev is not None
 
-        assert result["success"] is True
-        dev = result["device"]
-        assert dev["integration_type"] == "zwave_js"
-        assert dev["node_id"] == "5"
-        assert "node_status" in dev
-        assert dev["node_status"]["status"] == "alive"
+    result = await tools.ha_get_device(device_id=dev.id)
 
-    @pytest.mark.asyncio
-    async def test_zwave_identifier_no_dash(self):
-        """Z-Wave identifier without dash should not extract node_id."""
-        device = _make_device(
-            identifiers=[["zwave_js", "3232323232"]],
-        )
-        mock_client = _mock_client_with_device(device)
-        captured = _register_and_capture(mock_client)
-        result = await captured["ha_get_device"](device_id="test_device_123")
-
-        assert result["success"] is True
-        dev = result["device"]
-        assert dev["integration_type"] == "zwave_js"
-        assert "node_id" not in dev
-        assert "node_status" not in dev
-
-    @pytest.mark.asyncio
-    async def test_zwave_identifier_multiple_dashes(self):
-        """Z-Wave identifier with multiple dashes should extract first segment after first dash."""
-        device = _make_device(
-            identifiers=[["zwave_js", "3232323232-5-extra"]],
-        )
-        mock_client = _mock_client_with_device(
-            device,
-            {
-                "zwave_js/node_status": {
-                    "success": True,
-                    "result": {
-                        "node_id": 5,
-                        "status": "alive",
-                        "is_routing": False,
-                        "is_secure": False,
-                    },
-                },
-            },
-        )
-        captured = _register_and_capture(mock_client)
-        result = await captured["ha_get_device"](device_id="test_device_123")
-
-        dev = result["device"]
-        # split("-")[1] gives "5" even with extra dashes
-        assert dev["node_id"] == "5"
+    device = result["device"]
+    assert device["integration_type"] == "zwave_js"
+    assert "node_id" not in device
+    assert "node_status" not in device
+    assert result["warnings"] == [
+        f"Z-Wave node status unavailable: Node for device {dev.id} can't be found"
+    ]
 
 
-class TestZHAIeeeAddressParsing:
-    """Tests for ZHA IEEE address extraction."""
-
-    @pytest.mark.asyncio
-    async def test_zha_ieee_extracted(self):
-        """ZHA identifier should extract ieee_address."""
-        device = _make_device(
-            identifiers=[["zha", "00:11:22:33:44:55:66:77"]],
-        )
-        mock_client = _mock_client_with_device(
-            device,
-            {
-                "zha/devices": {
-                    "success": True,
-                    "result": [
-                        {
-                            "ieee": "00:11:22:33:44:55:66:77",
-                            "lqi": 200,
-                            "rssi": -45,
-                        }
-                    ],
-                },
-            },
-        )
-        captured = _register_and_capture(mock_client)
-        result = await captured["ha_get_device"](device_id="test_device_123")
-
-        dev = result["device"]
-        assert dev["integration_type"] == "zha"
-        assert dev["ieee_address"] == "00:11:22:33:44:55:66:77"
-        assert "radio_metrics" in dev
-        assert dev["radio_metrics"]["lqi"] == 200
-        assert dev["radio_metrics"]["rssi"] == -45
+@pytest.fixture
+def zigbee_network() -> RadioWithoutHardware:
+    return build_zigbee_network()
 
 
-class TestEnrichmentGracefulDegradation:
-    """Tests that device response still succeeds when enrichment calls fail."""
+@pytest.fixture
+async def zha(
+    hass: HomeAssistant, zigbee_network: RadioWithoutHardware
+) -> MockConfigEntry:
+    return await set_up_zha(hass, zigbee_network)
 
-    @pytest.mark.asyncio
-    async def test_zha_enrichment_timeout_still_returns_device(self):
-        """ZHA radio metrics timeout should not fail the device lookup."""
-        device = _make_device(
-            identifiers=[["zha", "00:11:22:33:44:55:66:77"]],
-        )
 
-        call_count = 0
+async def test_zha_device_gets_ieee_address_and_radio_metrics(
+    hass: HomeAssistant, tools: RegistryTools, zha: MockConfigEntry
+) -> None:
+    """ZHA lists the coordinator too; the device gets its own link quality."""
+    dev = dr.async_get(hass).async_get_device_by_identifier(("zha", IEEE), zha.entry_id)
+    assert dev is not None
 
-        async def mock_ws(msg, **kwargs):
-            nonlocal call_count
-            msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
-            if msg_type == "config/device_registry/list":
-                return {"success": True, "result": [device]}
-            if msg_type == "config/entity_registry/list":
-                return {"success": True, "result": []}
-            if msg_type == "zha/devices":
-                call_count += 1
-                raise TimeoutError("Connection timed out")
-            return {"success": False}
+    result = await tools.ha_get_device(device_id=dev.id)
 
-        mock_client = MagicMock()
-        mock_client.send_websocket_message = AsyncMock(side_effect=mock_ws)
+    device = result["device"]
+    assert device["integration_type"] == "zha"
+    assert device["ieee_address"] == IEEE
+    assert device["radio_metrics"] == {"lqi": 200, "rssi": -45}
+    # A radio read that succeeded leaves the answer without warnings.
+    assert "warnings" not in result
 
-        captured = _register_and_capture(mock_client)
-        result = await captured["ha_get_device"](device_id="test_device_123")
 
-        assert result["success"] is True
-        assert "radio_metrics" not in result["device"]
-        assert call_count == 1  # Enrichment was attempted
+@pytest.mark.parametrize(
+    ("domain", "identifier", "reader", "command", "kept", "absent", "warning"),
+    [
+        (
+            "zha",
+            IEEE,
+            "enrich_zha_metrics",
+            "zha/devices",
+            ("ieee_address", IEEE),
+            "radio_metrics",
+            "ZHA radio metrics",
+        ),
+        (
+            "zwave_js",
+            f"{HOME_ID}-{NODE_ID}",
+            "enrich_zwave_status",
+            "zwave_js/node_status",
+            ("integration_type", "zwave_js"),
+            "node_status",
+            "Z-Wave node status",
+        ),
+    ],
+    ids=["zha", "zwave_js"],
+)
+async def test_unanswered_radio_read_still_returns_the_device(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tools: RegistryTools,
+    domain: str,
+    identifier: str,
+    reader: str,
+    command: str,
+    kept: tuple[str, str],
+    absent: str,
+    warning: str,
+) -> None:
+    """A radio read that gets no answer does not fail the lookup: the device
+    comes back without the radio fields, the identifier parsing intact, and a
+    warning names the skipped read.
 
-    @pytest.mark.asyncio
-    async def test_zwave_enrichment_oserror_still_returns_device(self):
-        """Z-Wave node status OSError should not fail the device lookup."""
-        device = _make_device(
-            identifiers=[["zwave_js", "3232323232-5"]],
-        )
+    The client gets no answer only while the radio read runs; the lookup's
+    other reads are Core's.
+    """
+    unanswered: list[AsyncMock] = []
+    read = getattr(tools_registry, reader)
 
-        async def mock_ws(msg, **kwargs):
-            msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
-            if msg_type == "config/device_registry/list":
-                return {"success": True, "result": [device]}
-            if msg_type == "config/entity_registry/list":
-                return {"success": True, "result": []}
-            if msg_type == "zwave_js/node_status":
-                raise OSError("Network unreachable")
-            return {"success": False}
+    async def read_without_answer(client: HomeAssistantClient, *args: Any) -> None:
+        with patch.object(
+            client,
+            "send_websocket_message",
+            AsyncMock(side_effect=HomeAssistantConnectionError("Connection lost")),
+        ) as no_answer:
+            unanswered.append(no_answer)
+            await read(client, *args)
 
-        mock_client = MagicMock()
-        mock_client.send_websocket_message = AsyncMock(side_effect=mock_ws)
+    monkeypatch.setattr(tools_registry, reader, read_without_answer)
+    dev = _device(hass, domain, identifier)
 
-        captured = _register_and_capture(mock_client)
-        result = await captured["ha_get_device"](device_id="test_device_123")
+    result = await tools.ha_get_device(device_id=dev.id)
 
-        assert result["success"] is True
-        assert "node_status" not in result["device"]
-        assert result["device"]["node_id"] == "5"  # Parsing still works
+    assert result["success"] is True
+    device = result["device"]
+    assert absent not in device
+    assert device[kept[0]] == kept[1]
+    assert [
+        call.args[0]["type"] for mock in unanswered for call in mock.await_args_list
+    ] == [command]
+    assert result["warnings"] == [f"{warning} unavailable: Connection lost"]

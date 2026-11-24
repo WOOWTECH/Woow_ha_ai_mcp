@@ -2,23 +2,56 @@
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any
 
-from ...utils.fuzzy_search import calculate_partial_ratio
+from ...utils.device_registry_semantics import (
+    build_device_registry_snapshot,
+    effective_entity_area_id,
+)
+from ...utils.entity_membership import normalize_member_entity_ids
+from ...utils.fuzzy_search import calculate_partial_ratio, calculate_ratio
 from ...visibility.resolver import (
+    core_device_list_reply,
     device_registry_needed_for_visibility,
     load_hidden_set,
 )
+from ..component_registries import registry_list_reply
+from ..entity_registry_reads import GET_ENTRIES_CHUNK_SIZE
 from ..helpers import exception_to_structured_error
 from ..util_helpers import merge_visibility_warnings
 from ._base import _SearchBase
 
 logger = logging.getLogger(__name__)
 
-# Bounds the per-frame response size of config/entity_registry/get_entries
-# (extended entries, ~1KB typical each) so alias enrichment can't produce an
-# over-cap WebSocket frame on large instances (#1721).
-_GET_ENTRIES_CHUNK_SIZE = 500
+
+def _redact_hidden_memberships(
+    entities: list[dict[str, Any]], visibility_hidden: set[str]
+) -> list[dict[str, Any]]:
+    """Mark membership whose direct IDs intersect the visibility deny-set.
+
+    search.entities._add_membership_fields consumes this private sentinel after
+    smart-search projection, preserving is_group while withholding member IDs.
+    """
+    if not visibility_hidden:
+        return entities
+    redacted: list[dict[str, Any]] = []
+    for entity in entities:
+        attributes = entity.get("attributes")
+        members = normalize_member_entity_ids(attributes)
+        if members is not None and visibility_hidden.intersection(members):
+            redacted.append(
+                {
+                    **entity,
+                    "attributes": {
+                        **(attributes if isinstance(attributes, Mapping) else {}),
+                        "_ha_mcp_membership_redacted": True,
+                    },
+                }
+            )
+        else:
+            redacted.append(entity)
+    return redacted
 
 
 class EntitySearchMixin(_SearchBase):
@@ -33,6 +66,7 @@ class EntitySearchMixin(_SearchBase):
         domain_filter: str | None = None,
         include_hidden: bool = True,
         *,
+        include_membership: bool = False,
         prefetched_states: list[dict[str, Any]] | None = None,
         prefetched_registry: Any = None,
     ) -> dict[str, Any]:
@@ -49,6 +83,8 @@ class EntitySearchMixin(_SearchBase):
                 set in the entity registry are still returned but receive
                 a score penalty so they sort below comparable visible
                 matches. Pass False to filter them out entirely.
+            include_membership: Whether to retain membership attributes and redaction markers
+                for opt-in search result fields.
             prefetched_states: Pre-fetched ``get_states()`` list shared by the
                 ha_search orchestrator when both search branches run; ``None``
                 means fetch here.
@@ -68,6 +104,7 @@ class EntitySearchMixin(_SearchBase):
             entities, visibility_warnings = await self._fetch_search_entities(
                 domain_filter,
                 include_hidden,
+                include_membership=include_membership,
                 prefetched_states=prefetched_states,
                 prefetched_registry=prefetched_registry,
             )
@@ -168,7 +205,7 @@ class EntitySearchMixin(_SearchBase):
 
         ``config/entity_registry/list`` deliberately omits ``aliases``;
         ``get_entries`` includes them. Survivors are split into
-        ``_GET_ENTRIES_CHUNK_SIZE``-sized chunks fetched concurrently: a
+        ``GET_ENTRIES_CHUNK_SIZE``-sized chunks fetched concurrently: a
         bounded number of round-trips (one per chunk), not N+1 fan-out, and
         each response frame stays bounded regardless of instance size.
         Enrichment is best-effort per chunk — one chunk failing does not
@@ -185,8 +222,8 @@ class EntitySearchMixin(_SearchBase):
             return aliases_map, []
 
         chunks: list[list[str]] = [
-            survivor_ids[i : i + _GET_ENTRIES_CHUNK_SIZE]
-            for i in range(0, len(survivor_ids), _GET_ENTRIES_CHUNK_SIZE)
+            survivor_ids[i : i + GET_ENTRIES_CHUNK_SIZE]
+            for i in range(0, len(survivor_ids), GET_ENTRIES_CHUNK_SIZE)
         ]
         responses: list[Any] = await asyncio.gather(
             *(
@@ -203,11 +240,6 @@ class EntitySearchMixin(_SearchBase):
 
         failed_chunks = 0
         for chunk, entries_resp in zip(chunks, responses, strict=True):
-            # Same convention as _fetch_search_entities: a captured
-            # CancelledError means the surrounding task is being torn
-            # down — propagate it instead of degrading to a warning.
-            if isinstance(entries_resp, asyncio.CancelledError):
-                raise entries_resp
             if isinstance(entries_resp, BaseException):
                 failed_chunks += 1
                 logger.warning(
@@ -261,6 +293,7 @@ class EntitySearchMixin(_SearchBase):
         domain_filter: str | None,
         include_hidden: bool,
         *,
+        include_membership: bool = False,
         prefetched_states: list[dict[str, Any]] | None = None,
         prefetched_registry: Any = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -290,11 +323,7 @@ class EntitySearchMixin(_SearchBase):
             )
             fetch_slots.append("registry")
         if need_device:
-            fetch_coros.append(
-                self.client.send_websocket_message(
-                    {"type": "config/device_registry/list"}
-                )
-            )
+            fetch_coros.append(core_device_list_reply(self.client))
             fetch_slots.append("device")
         fetched = (
             await asyncio.gather(*fetch_coros, return_exceptions=True)
@@ -316,12 +345,6 @@ class EntitySearchMixin(_SearchBase):
         # with success=True.
         if isinstance(states_result, BaseException):
             raise states_result
-        # CancelledError on the registry tasks must propagate too; gather captures
-        # it like any other exception when return_exceptions=True.
-        if isinstance(registry_result, asyncio.CancelledError):
-            raise registry_result
-        if isinstance(device_result, asyncio.CancelledError):
-            raise device_result
         entities = states_result
 
         # Opt-in visibility filter. registry_result is the unprojected registry,
@@ -334,6 +357,17 @@ class EntitySearchMixin(_SearchBase):
             registry_result, states_result, self.client, device_result
         )
         registry_slim = self._build_registry_slim(registry_result)
+        if include_membership:
+            denied_member_ids = visibility_hidden | (
+                {
+                    entity_id
+                    for entity_id, entry in registry_slim.items()
+                    if entry.get("hidden_by") is not None
+                }
+                if not include_hidden
+                else set()
+            )
+            entities = _redact_hidden_memberships(entities, denied_member_ids)
         survivor_ids, survivor_states = self._filter_hidden_entities(
             entities, registry_slim, include_hidden, visibility_hidden
         )
@@ -399,40 +433,44 @@ class EntitySearchMixin(_SearchBase):
     async def get_entities_by_area(
         self,
         area_query: str,
-        group_by_domain: bool = True,
         include_hidden: bool = True,
+        *,
+        include_membership: bool = False,
     ) -> dict[str, Any]:
         """
         Get entities grouped by area/room using the HA registries for accurate area resolution.
 
-        Uses entity registry, device registry, and area registry to determine
-        which area each entity belongs to. Fuzzy matches the query against
-        area names, IDs, and area-registry aliases to find the target area(s).
+        Uses the entity, device, area, and floor registries to determine which
+        area each entity belongs to. Resolution tries an exact area first,
+        then an exact or unambiguous close-spelling floor (expanded to every
+        area on that floor), and finally falls back to fuzzy area matching.
 
         Args:
             area_query: Area/room name (or alias) to search for
-            group_by_domain: Whether to group results by domain within each area
             include_hidden: When True (default), entities with ``hidden_by``
                 set in the entity registry are still grouped under their
                 area but receive a score penalty when ranked. Pass False
                 to filter them out entirely.
+            include_membership: Whether to retain membership attributes and redaction markers
+                for opt-in search result fields.
 
         Returns:
             Dictionary with area-grouped entities
+
+        Raises:
+            ToolError: If mandatory Home Assistant state retrieval fails or an
+                unexpected search error occurs.
         """
         try:
             # Fetch all registries and states in parallel
             results = await asyncio.gather(
                 self.client.get_states(),
-                self.client.send_websocket_message(
-                    {"type": "config/area_registry/list"}
-                ),
+                registry_list_reply(self.client, "area"),
                 self.client.send_websocket_message(
                     {"type": "config/entity_registry/list"}
                 ),
-                self.client.send_websocket_message(
-                    {"type": "config/device_registry/list"}
-                ),
+                core_device_list_reply(self.client),
+                registry_list_reply(self.client, "floor"),
                 return_exceptions=True,
             )
 
@@ -442,13 +480,6 @@ class EntitySearchMixin(_SearchBase):
             if isinstance(results[0], BaseException):
                 raise results[0]
             entities = results[0]
-            # A registry sub-task that was individually cancelled must propagate,
-            # not be silently degraded to an empty registry by the parsers below
-            # (mirrors _fetch_search_entities). Non-cancellation registry errors
-            # still fail open.
-            for reg_result in results[1:]:
-                if isinstance(reg_result, asyncio.CancelledError):
-                    raise reg_result
             # Opt-in visibility filter. results[2] is the unprojected entity
             # registry, so entity_category/hidden_by/area_id/labels are present;
             # results[3] is the device registry, so the area/label dimensions
@@ -465,11 +496,24 @@ class EntitySearchMixin(_SearchBase):
             area_registry = self._parse_area_registry(results[1], registry_warnings)
             entity_reg_map = self._parse_entity_reg_map(results[2], registry_warnings)
             device_area_map = self._parse_device_area_map(results[3], registry_warnings)
+            # Availability is read back OUT of the parse rather than re-derived
+            # from the raw payload: the parser already decides what counts as
+            # usable floor data, and a second predicate here drifted from it
+            # once. An empty warnings list means the parser accepted the
+            # payload; anything else disables the fuzzy floor/area fallback.
+            floor_warnings: list[str] = []
+            floor_registry = self._parse_floor_registry(results[4], floor_warnings)
+            floor_registry_available = not floor_warnings
+            registry_warnings.extend(floor_warnings)
             degraded_warnings = registry_warnings + visibility_warnings
 
-            area_query_lower = area_query.lower().strip()
-            matched_area_ids = self._match_area_ids(area_registry, area_query_lower)
-
+            matched_area_ids, resolution_warnings = self._resolve_area_query(
+                area_registry,
+                floor_registry,
+                area_query,
+                floor_registry_available=floor_registry_available,
+            )
+            degraded_warnings.extend(resolution_warnings)
             if not matched_area_ids:
                 return merge_visibility_warnings(
                     {
@@ -488,6 +532,17 @@ class EntitySearchMixin(_SearchBase):
             entity_area_resolved, hidden_entity_ids = self._resolve_entity_areas(
                 entity_reg_map, device_area_map, include_hidden, visibility_hidden
             )
+            if include_membership:
+                denied_member_ids = visibility_hidden | (
+                    {
+                        entity_id
+                        for entity_id, entry in entity_reg_map.items()
+                        if entry.get("hidden_by") is not None
+                    }
+                    if not include_hidden
+                    else set()
+                )
+                entities = _redact_hidden_memberships(entities, denied_member_ids)
             state_map = self._build_state_map(entities)
             formatted_areas, total_entities = self._format_area_entities(
                 matched_area_ids,
@@ -495,7 +550,6 @@ class EntitySearchMixin(_SearchBase):
                 entity_area_resolved,
                 state_map,
                 hidden_entity_ids,
-                group_by_domain,
             )
 
             return merge_visibility_warnings(
@@ -514,8 +568,7 @@ class EntitySearchMixin(_SearchBase):
                 e,
                 suggestions=[
                     "Check Home Assistant connection",
-                    "Try common room names: salon, chambre, cuisine",
-                    "Use smart_entity_search to find entities first",
+                    "Use ha_search to find entities first",
                 ],
                 context={"area_query": area_query},
             )
@@ -537,6 +590,18 @@ class EntitySearchMixin(_SearchBase):
         return area_registry
 
     @classmethod
+    def _parse_floor_registry(
+        cls, result: Any, warnings: list[str] | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Parse the floor registry into ``floor_id -> floor info``."""
+        floor_registry: dict[str, dict[str, Any]] = {}
+        for floor in cls._extract_registry_list(result, "floor registry", warnings):
+            floor_id = floor.get("floor_id", "")
+            if floor_id:
+                floor_registry[floor_id] = floor
+        return floor_registry
+
+    @classmethod
     def _parse_entity_reg_map(
         cls, result: Any, warnings: list[str] | None = None
     ) -> dict[str, dict[str, str | None]]:
@@ -556,63 +621,198 @@ class EntitySearchMixin(_SearchBase):
     def _parse_device_area_map(
         cls, result: Any, warnings: list[str] | None = None
     ) -> dict[str, str | None]:
-        """Parse the device registry into ``device_id -> area_id``."""
-        device_area_map: dict[str, str | None] = {}
-        for device in cls._extract_registry_list(result, "device registry", warnings):
-            device_id = device.get("id", "")
-            if device_id:
-                device_area_map[device_id] = device.get("area_id")
-        return device_area_map
+        """Parse devices into IDs mapped to direct-or-parent effective areas."""
+        device_rows = cls._extract_registry_list(result, "device registry", warnings)
+        return build_device_registry_snapshot(list(device_rows)).effective_area_by_id
+
+    @staticmethod
+    def _match_exact_registry_ids(
+        registry: dict[str, dict[str, Any]],
+        id_key: str,
+        query_lower: str,
+    ) -> set[str]:
+        """Return exact case-insensitive id, name, or alias matches."""
+        matches: set[str] = set()
+        for registry_id, info in registry.items():
+            item_id = str(info.get(id_key) or registry_id)
+            name = str(info.get("name") or "")
+            aliases = info.get("aliases", []) or []
+            if (
+                query_lower == item_id.lower()
+                or query_lower == name.lower()
+                or any(
+                    query_lower == alias.lower()
+                    for alias in aliases
+                    if isinstance(alias, str)
+                )
+            ):
+                matches.add(registry_id)
+        return matches
+
+    @classmethod
+    def _resolve_area_query(
+        cls,
+        area_registry: dict[str, dict[str, Any]],
+        floor_registry: dict[str, dict[str, Any]],
+        area_query: str,
+        *,
+        floor_registry_available: bool,
+    ) -> tuple[set[str], list[str]]:
+        """Resolve exact area first, then exact/fuzzy floor, then fuzzy area."""
+        query_lower = area_query.lower().strip()
+        exact_area_ids = cls._match_exact_registry_ids(
+            area_registry, "area_id", query_lower
+        )
+        exact_floor_ids = cls._match_exact_registry_ids(
+            floor_registry, "floor_id", query_lower
+        )
+        if exact_area_ids:
+            warnings = []
+            if exact_floor_ids:
+                warnings.append(
+                    f"'{area_query}' matches both an area and a floor; "
+                    "the exact area match was used."
+                )
+            return exact_area_ids, warnings
+
+        if exact_floor_ids:
+            area_ids, warning = cls._expand_floor_ids(
+                area_registry,
+                floor_registry,
+                exact_floor_ids,
+                area_query,
+                fuzzy_match=False,
+            )
+            return area_ids, [warning]
+
+        if not floor_registry_available:
+            # Without the floor registry, fuzzy area matching could silently
+            # recreate the original floor->partial-area misresolution. The
+            # fetch warning names the outage; this one names what the outage
+            # cost the caller, so "no match" is not read as "no such area".
+            return set(), [
+                f"Floor data is unavailable, so '{area_query}' was matched only "
+                "against exact area IDs, names, and aliases; close-spelling "
+                "matching was skipped. Retry, or pass an exact area_id from "
+                "ha_list_floors_areas."
+            ]
+
+        fuzzy_floor_ids, floor_score = cls._match_fuzzy_registry_ids(
+            floor_registry, "floor_id", query_lower
+        )
+        _, area_score = cls._match_fuzzy_registry_ids(
+            area_registry, "area_id", query_lower
+        )
+        if len(fuzzy_floor_ids) > 1 and floor_score > area_score:
+            floor_names = sorted(
+                str(floor_registry[floor_id].get("name") or floor_id)
+                for floor_id in fuzzy_floor_ids
+            )
+            return set(), [
+                f"'{area_query}' ambiguously matches multiple floors: "
+                f"{', '.join(floor_names)}. Use an exact floor name or ID."
+            ]
+        if len(fuzzy_floor_ids) == 1 and floor_score > area_score:
+            area_ids, warning = cls._expand_floor_ids(
+                area_registry,
+                floor_registry,
+                fuzzy_floor_ids,
+                area_query,
+                fuzzy_match=True,
+            )
+            return area_ids, [warning]
+        # Exact must win outright, as above: a query like "bedroom_kids"
+        # partial-matches its parent "bedroom" at ratio 100.
+        return cls._match_area_ids(area_registry, query_lower), []
+
+    @staticmethod
+    def _match_fuzzy_registry_ids(
+        registry: dict[str, dict[str, Any]],
+        id_key: str,
+        query_lower: str,
+    ) -> tuple[set[str], int]:
+        """Return best whole-string registry matches and their score.
+
+        Whole-string similarity distinguishes a typo in a floor name from an
+        area name that merely contains the floor name as one component.
+        """
+        best_ids: set[str] = set()
+        best_score = 0
+        for registry_id, info in registry.items():
+            values = [
+                str(info.get(id_key) or registry_id),
+                str(info.get("name") or ""),
+                *(
+                    alias
+                    for alias in (info.get("aliases", []) or [])
+                    if isinstance(alias, str)
+                ),
+            ]
+            score = max(
+                (
+                    calculate_ratio(query_lower, value.lower())
+                    for value in values
+                    if value
+                ),
+                default=0,
+            )
+            if score > best_score:
+                best_ids = {registry_id}
+                best_score = score
+            elif score == best_score:
+                best_ids.add(registry_id)
+        return (best_ids, best_score) if best_score >= 80 else (set(), best_score)
+
+    @staticmethod
+    def _expand_floor_ids(
+        area_registry: dict[str, dict[str, Any]],
+        floor_registry: dict[str, dict[str, Any]],
+        floor_ids: set[str],
+        area_query: str,
+        *,
+        fuzzy_match: bool,
+    ) -> tuple[set[str], str]:
+        """Expand floor IDs to their areas and build the model-facing warning."""
+        area_ids = {
+            area_id
+            for area_id, area in area_registry.items()
+            if area.get("floor_id") in floor_ids
+        }
+        floor_label = ", ".join(
+            str(floor_registry[floor_id].get("name") or floor_id)
+            for floor_id in sorted(floor_ids)
+        )
+        floor_suffix = f" ({floor_label})" if floor_label else ""
+        match_suffix = " from a close spelling" if fuzzy_match else ""
+        warning = (
+            f"'{area_query}' is a floor, not an area — expanded to "
+            f"{len(area_ids)} area(s) on the matched floor(s){floor_suffix}"
+            f"{match_suffix}."
+        )
+        return area_ids, warning
 
     @staticmethod
     def _match_area_ids(
         area_registry: dict[str, dict[str, Any]], area_query_lower: str
     ) -> set[str]:
-        """Resolve the query to area_ids: exact id/name/alias match, else fuzzy.
-
-        Two-pass: pass 1 collects exact id / name / alias matches; if any are
-        found, fuzzy aggregation is skipped entirely. This makes ``area_filter``
-        honor a literal area_id from ``ha_list_floors_areas`` — a query like
-        ``"bedroom_kids"`` would otherwise also fuzzy-match its parent
-        ``"bedroom"`` (partial_ratio=100) and aggregate sibling areas' entities.
-        Aliases (per-area registry, used by HA voice config) mirror the
-        entity-side enrichment in smart_entity_search.
-        """
-        exact_area_ids: set[str] = set()
+        """Resolve a query that matched no area exactly to areas by close spelling."""
         fuzzy_area_ids: set[str] = set()
-
         for area_id, area_info in area_registry.items():
-            area_name = area_info.get("name", "")
+            area_name = str(area_info.get("name") or "")
             area_aliases = area_info.get("aliases", []) or []
-            # Exact match on area_id, name, or any alias (case-insensitive)
-            if (
-                area_query_lower == area_id.lower()
-                or area_query_lower == area_name.lower()
-                or any(
-                    area_query_lower == a.lower()
-                    for a in area_aliases
-                    if isinstance(a, str)
-                )
-            ):
-                exact_area_ids.add(area_id)
-                continue
-            # Fuzzy match on area name, id, or any alias
             name_score = calculate_partial_ratio(area_query_lower, area_name.lower())
             id_score = calculate_partial_ratio(area_query_lower, area_id.lower())
             alias_score = max(
                 (
-                    calculate_partial_ratio(area_query_lower, a.lower())
-                    for a in area_aliases
-                    if isinstance(a, str)
+                    calculate_partial_ratio(area_query_lower, alias.lower())
+                    for alias in area_aliases
+                    if isinstance(alias, str)
                 ),
                 default=0,
             )
             if max(name_score, id_score, alias_score) >= 80:
                 fuzzy_area_ids.add(area_id)
-
-        # Exact matches win — fuzzy aggregation only runs when no area_query is
-        # itself an area_id / name / alias.
-        return exact_area_ids or fuzzy_area_ids
+        return fuzzy_area_ids
 
     @staticmethod
     def _resolve_entity_areas(
@@ -621,7 +821,7 @@ class EntitySearchMixin(_SearchBase):
         include_hidden: bool,
         visibility_hidden: set[str],
     ) -> tuple[dict[str, str], set[str]]:
-        """Map entity_id -> resolved area_id (entity area > device area).
+        """Map entity IDs to direct area, then device direct-or-parent effective area.
 
         Hidden entities are filtered only when include_hidden is False;
         otherwise they pass through and downstream applies the score penalty so
@@ -638,10 +838,7 @@ class EntitySearchMixin(_SearchBase):
                 continue
             if is_hidden:
                 hidden_entity_ids.add(entity_id)
-            area_id = reg_info.get("area_id")
-            device_id = reg_info.get("device_id")
-            if not area_id and device_id:
-                area_id = device_area_map.get(device_id)
+            area_id = effective_entity_area_id(reg_info, device_area_map)
             if area_id:
                 entity_area_resolved[entity_id] = area_id
         return entity_area_resolved, hidden_entity_ids
@@ -663,7 +860,6 @@ class EntitySearchMixin(_SearchBase):
         entity_id: str,
         state_map: dict[str, dict[str, Any]],
         hidden_entity_ids: set[str],
-        include_domain: bool,
     ) -> dict[str, Any]:
         """Build one area entity record.
 
@@ -678,9 +874,8 @@ class EntitySearchMixin(_SearchBase):
             ),
             "state": state_info.get("state", "unknown"),
             "_hidden_by": "hidden" if entity_id in hidden_entity_ids else None,
+            "_attributes": state_info.get("attributes", {}),
         }
-        if include_domain:
-            record["domain"] = entity_id.split(".")[0]
         return record
 
     @classmethod
@@ -695,9 +890,7 @@ class EntitySearchMixin(_SearchBase):
         for entity_id in area_entities:
             domain = entity_id.split(".")[0]
             domains.setdefault(domain, []).append(
-                cls._build_area_entity_record(
-                    entity_id, state_map, hidden_entity_ids, include_domain=False
-                )
+                cls._build_area_entity_record(entity_id, state_map, hidden_entity_ids)
             )
         return domains
 
@@ -709,13 +902,12 @@ class EntitySearchMixin(_SearchBase):
         entity_area_resolved: dict[str, str],
         state_map: dict[str, dict[str, Any]],
         hidden_entity_ids: set[str],
-        group_by_domain: bool,
     ) -> tuple[dict[str, dict[str, Any]], int]:
         """Collect matched areas' entities into the response shape.
 
         Alias data is NOT enriched here — exposing private ``_aliases`` on a
         public method would leak through any caller that round-trips this
-        response. The area+query consumer in tools_search.py fetches aliases on
+        response. The area+query consumer in search/modes.py fetches aliases on
         its own when needed. Returns (formatted_areas, total_entities).
         """
         formatted_areas: dict[str, dict[str, Any]] = {}
@@ -729,23 +921,13 @@ class EntitySearchMixin(_SearchBase):
                 if resolved_area == area_id
             ]
 
-            if group_by_domain:
-                entities_payload: Any = cls._group_area_entities_by_domain(
-                    area_entities, state_map, hidden_entity_ids
-                )
-            else:
-                entities_payload = [
-                    cls._build_area_entity_record(
-                        entity_id, state_map, hidden_entity_ids, include_domain=True
-                    )
-                    for entity_id in area_entities
-                ]
-
             formatted_areas[area_id] = {
                 "area_name": area_name,
                 "area_id": area_id,
                 "entity_count": len(area_entities),
-                "entities": entities_payload,
+                "entities": cls._group_area_entities_by_domain(
+                    area_entities, state_map, hidden_entity_ids
+                ),
             }
             total_entities += len(area_entities)
         return formatted_areas, total_entities

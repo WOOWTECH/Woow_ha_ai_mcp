@@ -9,13 +9,13 @@ Each warning ends with a 2-route ' See ...' suffix naming every
 LLM-discoverable way to pull the relevant skill content:
 
 1. ``skill://`` resource URI — for clients that auto-fetch resource URIs.
-2. ``ha_get_skill_guide(skill=..., file=...)`` — explicit tool call,
+2. ``ha_get_skill_guide(file=...)``: explicit tool call,
    works on every MCP client regardless of resource-fetch support.
 
 The write tools also auto-embed the matching section into the next
 response via ``referenced_files`` and accept a ``MandatoryBPS`` opt-out
 parameter. Neither is advertised in the warning suffix by design —
-see ``util_helpers._SKILL_CONTENT_OPTOUT_HINT`` for the param contract.
+see ``config_write_helpers._SKILL_CONTENT_OPTOUT_HINT`` for the param contract.
 
 The ``skill_prefix`` kwarg lets callers pass any URL prefix (e.g., a
 GitHub mirror) when ``skill://`` isn't reachable, or ``None`` to omit
@@ -47,6 +47,10 @@ documented legitimate dynamic-data positions per
 * Top-level ``variables.*``
 * Action ``service_data.*`` (legacy alias for ``data``)
 
+The allowlist covers template *content*. Key *order* inside a ``variables``
+block is separately load-bearing — HA renders one key at a time — so those
+blocks get their own ordering-only pass (:func:`_check_variables_order`).
+
 Anti-patterns sourced from:
   https://github.com/homeassistant-ai/skills
   skill://home-assistant-best-practices
@@ -57,33 +61,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-_SKILL_URI_PREFIX = "skill://home-assistant-best-practices/references"
-_DEFAULT_SKILL_PREFIX = _SKILL_URI_PREFIX
-_SKILL_NAME = "home-assistant-best-practices"
-
-
-class BestPracticeCheckResult(list[str]):
-    """Warning list with an attached set of referenced skill files.
-
-    Behaves as a plain ``list[str]`` for all call sites — ``len()``,
-    indexing, iteration, equality with ``[...]`` all work unchanged.
-    ``referenced_files`` is added on top so the write tools can resolve
-    and embed the relevant skill bodies into responses.
-
-    Use :func:`_emit` to append warnings; direct ``append``/``extend``
-    skip the ``referenced_files`` mirror. Slicing, ``list()`` coercion,
-    and ``copy.copy``/``copy.deepcopy`` all return plain ``list[str]``
-    without the attribute — no current call site does any of these.
-    """
-
-    __slots__ = ("referenced_files",)
-
-    referenced_files: set[str]
-
-    def __init__(self, items: list[str] | None = None) -> None:
-        super().__init__(items or [])
-        self.referenced_files = set()
-
+from .best_practice_result import (
+    _DEFAULT_SKILL_PREFIX,
+    BestPracticeCheckResult,
+    _emit,
+)
+from .best_practice_variables import _check_variables_order
 
 # ---------------------------------------------------------------------------
 # Regex patterns for template anti-patterns
@@ -162,22 +145,6 @@ _TARGET_FIELDS = ("entity_id", "device_id", "area_id", "floor_id", "label_id")
 # ``service:`` (legacy) and ``action:`` (modern, 2024+) for the same field.
 _SERVICE_KEYS = ("service", "action")
 
-# Purpose-specific trigger/condition keys renamed in HA 2026.7 — the old keys
-# no longer load (home-assistant/core#174463).
-_RENAMED_TRIGGER_KEYS = {
-    "battery.low": "battery.became_low",
-    "battery.not_low": "battery.no_longer_low",
-    "lawn_mower.docked": "lawn_mower.returned_to_dock",
-    "schedule.turned_on": "schedule.block_started",
-    "schedule.turned_off": "schedule.block_ended",
-    "timer.time_remaining": "timer.remaining_time_reached",
-    "update.update_became_available": "update.became_available",
-    "vacuum.docked": "vacuum.returned_to_dock",
-}
-_RENAMED_CONDITION_KEYS = {
-    "climate.target_temperature": "climate.is_target_temperature",
-    "climate.target_humidity": "climate.is_target_humidity",
-}
 # Trigger ``options.behavior`` values renamed in HA 2026.7: any→each,
 # last→all (home-assistant/core#173259). The old values still load but raise
 # an HA repair issue and face removal. Condition ``options.behavior`` keeps
@@ -201,8 +168,8 @@ def check_automation_config(
     back-compat (so ``result == []`` and iteration work unchanged), and
     additionally exposes ``referenced_files`` — the set of skill file
     paths (relative to the skill root, e.g.
-    ``"references/automation-patterns.md"``) referenced by at least one
-    emitted warning. Callers use that set to fetch the bodies via
+    ``"references/triggers-and-conditions.md"``) that the emitted warnings
+    cite or name. Callers use that set to fetch the bodies via
     :func:`ha_mcp.utils.skill_loader.resolve_skill_files` and embed them
     in the response under ``skill_content``.
 
@@ -219,10 +186,8 @@ def check_automation_config(
 
     warnings = BestPracticeCheckResult()
 
-    # Read the canonical 2024.10+ plural root keys, falling back to the singular
-    # aliases. The internal pipeline always pre-normalizes to plural, so the
-    # fallback is defensive for direct/public callers of check_automation_config
-    # (HA accepts both forms). Mirrors _check_triggers' platform/trigger tolerance.
+    # The config is checked as the caller wrote it, so either root form may
+    # carry the lists.
     # Condition templates
     _check_condition_templates(
         config.get("conditions", config.get("condition", [])), warnings, skill_prefix
@@ -240,6 +205,11 @@ def check_automation_config(
 
     # Mode vs motion pattern
     _check_mode_motion(config, warnings, skill_prefix)
+
+    # Key order inside the top-level variables blocks. Both render one key at a
+    # time, so a forward reference between siblings is silently undefined.
+    for block_key in ("variables", "trigger_variables"):
+        _check_variables_order(config.get(block_key), warnings, skill_prefix, block_key)
 
     _dedupe_inplace(warnings)
     return warnings
@@ -260,70 +230,9 @@ def check_script_config(
 
     warnings = BestPracticeCheckResult()
     _check_action_tree(config.get("sequence", []), warnings, skill_prefix)
+    _check_variables_order(config.get("variables"), warnings, skill_prefix, "variables")
     _dedupe_inplace(warnings)
     return warnings
-
-
-# ---------------------------------------------------------------------------
-# Warning emission + skill-reference helpers
-# ---------------------------------------------------------------------------
-
-
-def _emit(
-    warnings: BestPracticeCheckResult,
-    message: str,
-    skill_prefix: str | None,
-    file_ref: str,
-) -> None:
-    """Append a warning with the 2-route ' See ...' suffix and track the file.
-
-    Args:
-        warnings: Accumulator (also holds ``referenced_files``).
-        message: Human-readable warning body — the inline alternative.
-        skill_prefix: When set, embedded as the ``skill://`` URI route.
-            When ``None``, the URI route is omitted but the other two
-            routes still appear.
-        file_ref: File path relative to the ``references/`` directory of
-            the home-assistant-best-practices skill, optionally with a
-            ``#anchor`` suffix
-            (e.g. ``"automation-patterns.md#native-conditions"``). The
-            anchor is preserved end-to-end: in the ``skill://`` URI for
-            display, and in ``referenced_files`` so the auto-embed path
-            ships only the matching markdown section instead of the
-            whole 10-20 KB reference file.
-    """
-    warnings.append(message + _skill_route_suffix(skill_prefix, file_ref))
-    warnings.referenced_files.add(f"references/{file_ref}")
-
-
-def _skill_route_suffix(skill_prefix: str | None, file_ref: str) -> str:
-    """Build the ' See ...' suffix naming the available skill access routes.
-
-    When ``skill_prefix`` is ``None`` the entire suffix is suppressed —
-    skills are off server-wide, so neither route resolves. Otherwise the
-    suffix names both so the LLM has a working path regardless of which
-    mechanism its client supports:
-
-    1. ``skill://`` URI — for clients that auto-fetch resource URIs.
-       Anchor preserved.
-    2. ``ha_get_skill_guide(skill=..., file=...)`` — explicit tool call,
-       works on every MCP client. Anchor stripped (the tool reads the
-       whole file).
-
-    Auto-embed of the matching section still happens in the next
-    write's response, driven by ``referenced_files``; the
-    ``MandatoryBPS`` opt-out param is not named here by design.
-    """
-    if not skill_prefix:
-        # Skills feature is disabled server-wide; none of the routes work.
-        # Matches the historical no-suffix behaviour.
-        return ""
-    bare_file = f"references/{file_ref.split('#', 1)[0]}"
-    routes = [
-        f"{skill_prefix}/{file_ref}",
-        f"call ha_get_skill_guide(skill={_SKILL_NAME!r}, file={bare_file!r})",
-    ]
-    return " See " + " | ".join(routes)
 
 
 # ---------------------------------------------------------------------------
@@ -340,23 +249,6 @@ def _check_condition_templates(
             # Shorthand template condition
             _check_template_string(cond, warnings, skill_prefix, "condition")
         elif isinstance(cond, dict):
-            # 2026.7 renamed purpose-specific condition keys — old keys no
-            # longer load.
-            condition_key = cond.get("condition")
-            renamed_condition = (
-                _RENAMED_CONDITION_KEYS.get(condition_key)
-                if isinstance(condition_key, str)
-                else None
-            )
-            if renamed_condition:
-                _emit(
-                    warnings,
-                    f"Condition key `{condition_key}` was renamed to "
-                    f"`{renamed_condition}` in HA 2026.7 and the old key no "
-                    f"longer loads — use `condition: {renamed_condition}`.",
-                    skill_prefix,
-                    "automation-patterns.md#native-conditions",
-                )
             if cond.get("condition") == "template":
                 vt = cond.get("value_template", "")
                 if isinstance(vt, str):
@@ -426,6 +318,12 @@ def _check_template_string(
             "instead. Templates fail silently at runtime and bypass schema validation.",
             skill_prefix,
             "template-guidelines.md#when-to-avoid-templates",
+            # The table there covers state, numeric_state, time and sun; these
+            # cover the two other native conditions the message names.
+            also_embed=(
+                "triggers-and-conditions.md#zone-condition",
+                "triggers-and-conditions.md#device-trigger-use-sparingly",
+            ),
         )
 
 
@@ -451,7 +349,7 @@ def _check_template_comparison_patterns(
             f"(e.g., `{position}: numeric_state, entity_id: sensor.temp, above: 25`). "
             "Native conditions are validated at config load and don't bypass HA's schema.",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
     if _RE_SUN.search(template):
         _emit(
@@ -460,7 +358,7 @@ def _check_template_comparison_patterns(
             f"`sun` {position} instead "
             f"(e.g., `{position}: sun, after: sunset` or `before: sunrise`).",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
     elif _RE_IS_STATE.search(template):
         # Only flag if not already flagged as sun pattern
@@ -470,7 +368,7 @@ def _check_template_comparison_patterns(
             f"`state` {position} instead "
             f"(e.g., `{position}: state, entity_id: light.bedroom, state: 'on'`).",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
 
 
@@ -492,7 +390,7 @@ def _check_template_time_patterns(
             f"`time` {position} instead "
             f"(e.g., `{position}: time, after: '09:00:00', before: '17:00:00'`).",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
     if _RE_WEEKDAY.search(template):
         _emit(
@@ -501,7 +399,7 @@ def _check_template_time_patterns(
             f"`time` {position} with `weekday:` list instead "
             f"(e.g., `{position}: time, weekday: ['mon', 'tue', 'wed']`).",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
     if _RE_NOW_DATE.search(template):
         _emit(
@@ -512,7 +410,7 @@ def _check_template_time_patterns(
             "target date on creation day). For recurring date logic, expose a `sensor.date` via "
             f"the `time_date` integration and use a `state` {position}.",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
 
 
@@ -536,7 +434,7 @@ def _check_template_state_and_duration_patterns(
             f"`state` {position} with `state:` list instead "
             f"(e.g., `{position}: state, entity_id: climate.living_room, state: ['heat', 'cool']`).",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
     if _RE_DIRECT_STATE.search(template):
         _emit(
@@ -557,7 +455,7 @@ def _check_template_state_and_duration_patterns(
             "for: {minutes: 5}`). Native `for:` is event-driven and avoids repeated "
             "template evaluation on every state change.",
             skill_prefix,
-            "automation-patterns.md#native-conditions",
+            "triggers-and-conditions.md#native-conditions",
         )
 
 
@@ -588,16 +486,27 @@ def _check_repeat_actions(
 def _check_control_flow_actions(
     action: dict[str, Any], warnings: BestPracticeCheckResult, skill_prefix: str | None
 ) -> None:
-    """Check choose/if/then/else/repeat/parallel sub-trees in a single action."""
+    """Check choose/if/then/else/repeat/parallel/sequence sub-trees in one action.
+
+    ``sequence`` is both a grouping action of its own
+    (``cv.SCRIPT_ACTION_SEQUENCE``) and the canonical shape of a ``parallel:``
+    branch — HA normalises the shorthand branch list into ``{"sequence": ...}``
+    (``_SCRIPT_PARALLEL_SCHEMA`` / ``_parallel_sequence_action``). Without this
+    arm only the shorthand branch was walked, so the canonical form of both was
+    invisible to every check below this point.
+    """
     if "choose" in action:
         _check_choose_actions(action["choose"], warnings, skill_prefix)
 
     if "if" in action:
         _check_condition_templates(action["if"], warnings, skill_prefix)
 
-    for key in ("then", "else", "default"):
+    # Every one of these is a `SCRIPT_SCHEMA` position, and that schema is
+    # `vol.All(ensure_list, [script_action])` — a lone action mapping is valid
+    # wherever a list is, so both shapes have to be walked.
+    for key in ("then", "else", "default", "sequence"):
         nested = action.get(key)
-        if isinstance(nested, list):
+        if isinstance(nested, list | dict):
             _check_action_tree(nested, warnings, skill_prefix)
 
     if "repeat" in action and isinstance(action["repeat"], dict):
@@ -606,7 +515,7 @@ def _check_control_flow_actions(
     # `parallel:` runs sub-actions concurrently — same shape as `sequence`,
     # different semantics. Recurse so templates inside parallel branches
     # are inspected the same as templates inside choose/repeat sequences.
-    if "parallel" in action and isinstance(action["parallel"], list):
+    if isinstance(action.get("parallel"), list | dict):
         _check_action_tree(action["parallel"], warnings, skill_prefix)
 
 
@@ -637,7 +546,7 @@ def _check_action_tree(
                 "`wait_for_trigger` waits for a *change*, `wait_template` "
                 "passes immediately if already true).",
                 skill_prefix,
-                "automation-patterns.md#wait-actions",
+                "automation-actions.md#wait-actions",
             )
 
         # Templated service dispatch: `service:`/`action:` containing `{{ }}`
@@ -645,6 +554,13 @@ def _check_action_tree(
         # `choose` (or `if/then/else`) action that picks between hardcoded
         # service names based on state.
         _check_service_template(action, warnings, skill_prefix)
+
+        # A `variables:` step is a legitimate template position, so it is never
+        # walked for template misuse. Its key *order* is still load-bearing —
+        # scanned separately.
+        _check_variables_order(
+            action.get("variables"), warnings, skill_prefix, "variables"
+        )
 
         # Templates in target sub-fields. Action `data`, `event_data`,
         # `service_data`, notification message/title, and `variables` are
@@ -679,7 +595,7 @@ def _check_service_template(
             "hardcoded `action:` names based on state. Native dispatch validates "
             "each service name at config load.",
             skill_prefix,
-            "automation-patterns.md#ifthen-vs-choose",
+            "automation-actions.md#ifthen-vs-choose",
         )
         return
     for key in _SERVICE_KEYS:
@@ -692,7 +608,7 @@ def _check_service_template(
                 "Templates here bypass HA's service-name validation and fail "
                 "silently if the resolved string is invalid.",
                 skill_prefix,
-                "automation-patterns.md#ifthen-vs-choose",
+                "automation-actions.md#ifthen-vs-choose",
             )
             return
 
@@ -745,10 +661,9 @@ def _check_triggers(
 ) -> None:
     """Check triggers for device_id and template anti-patterns.
 
-    Per-trigger detection is split into focused helpers (renamed-key check,
-    deprecated-behavior check, template-trigger check, numeric_state-trigger
-    check) purely to keep this function's complexity low. They run in the
-    same order as before.
+    Per-trigger detection is split into focused helpers (deprecated-behavior
+    check, template-trigger check, numeric_state-trigger check) purely to keep
+    this function's complexity low.
     """
     for trigger in _as_list(triggers):
         if not isinstance(trigger, dict):
@@ -756,7 +671,6 @@ def _check_triggers(
 
         platform = trigger.get("platform", trigger.get("trigger", ""))
 
-        _check_renamed_trigger_key(platform, warnings, skill_prefix)
         _check_deprecated_trigger_behavior(trigger, warnings, skill_prefix)
 
         # Device trigger → prefer entity_id-based triggers
@@ -782,24 +696,6 @@ def _check_triggers(
             _check_numeric_state_trigger(trigger, warnings, skill_prefix)
 
 
-def _check_renamed_trigger_key(
-    platform: Any, warnings: BestPracticeCheckResult, skill_prefix: str | None
-) -> None:
-    """Flag HA 2026.7 purpose-specific trigger key renames (old keys no longer load)."""
-    renamed_trigger = (
-        _RENAMED_TRIGGER_KEYS.get(platform) if isinstance(platform, str) else None
-    )
-    if renamed_trigger:
-        _emit(
-            warnings,
-            f"Trigger key `{platform}` was renamed to `{renamed_trigger}` "
-            "in HA 2026.7 and the old key no longer loads — use "
-            f"`trigger: {renamed_trigger}`.",
-            skill_prefix,
-            "automation-patterns.md#trigger-types",
-        )
-
-
 def _check_deprecated_trigger_behavior(
     trigger: dict[str, Any], warnings: BestPracticeCheckResult, skill_prefix: str | None
 ) -> None:
@@ -817,7 +713,7 @@ def _check_deprecated_trigger_behavior(
             "will be removed. Valid trigger values: `each`, `first`, "
             "`all` (conditions keep `any`/`all`).",
             skill_prefix,
-            "automation-patterns.md#trigger-types",
+            "triggers-and-conditions.md#purpose-specific-triggers--conditions-default-since-20267",
         )
 
 
@@ -843,7 +739,7 @@ def _check_template_trigger(
             "use native `numeric_state` trigger instead "
             "(e.g., `platform: numeric_state, entity_id: sensor.temp, above: 30`).",
             skill_prefix,
-            "automation-patterns.md#trigger-types",
+            "triggers-and-conditions.md#numeric-state-trigger",
         )
     if _RE_IS_STATE.search(vt):
         _emit(
@@ -852,7 +748,7 @@ def _check_template_trigger(
             "native `state` trigger instead "
             "(e.g., `platform: state, entity_id: light.x, to: 'on'`).",
             skill_prefix,
-            "automation-patterns.md#trigger-types",
+            "triggers-and-conditions.md#state-trigger",
         )
     if duration_match:
         _emit(
@@ -864,7 +760,7 @@ def _check_template_trigger(
             "to: 'off', for: {minutes: 5}`). Native `for:` is event-driven "
             "and doesn't re-evaluate on every state change.",
             skill_prefix,
-            "automation-patterns.md#trigger-types",
+            "triggers-and-conditions.md#state-trigger",
         )
     # Generic fallback for unmatched template triggers.
     if len(warnings) == initial and _RE_ANY_TEMPLATE.search(vt):
@@ -875,7 +771,17 @@ def _check_template_trigger(
             "`event`), use that instead. Native triggers are event-driven; "
             "template triggers re-evaluate on every state change.",
             skill_prefix,
-            "automation-patterns.md#trigger-types",
+            "triggers-and-conditions.md#template-trigger",
+            # One section per native trigger the message names; `time_pattern`
+            # is covered under Time Trigger.
+            also_embed=(
+                "triggers-and-conditions.md#state-trigger",
+                "triggers-and-conditions.md#numeric-state-trigger",
+                "triggers-and-conditions.md#time-trigger",
+                "triggers-and-conditions.md#sun-trigger",
+                "triggers-and-conditions.md#zone-trigger",
+                "triggers-and-conditions.md#event-trigger",
+            ),
         )
 
 
@@ -897,7 +803,7 @@ def _check_numeric_state_trigger(
             "to: 'off', for: {minutes: 5}`). Native `for:` is event-driven "
             "and doesn't re-evaluate on every state change.",
             skill_prefix,
-            "automation-patterns.md#trigger-types",
+            "triggers-and-conditions.md#state-trigger",
         )
 
 
@@ -933,7 +839,7 @@ def _check_mode_motion(
             "`mode: single` (default) — consider `mode: restart` so "
             "re-triggers reset the timer.",
             skill_prefix,
-            "automation-patterns.md#automation-modes",
+            "automation-actions.md#automation-modes",
         )
 
 

@@ -2,11 +2,18 @@
 Usage logging for MCP tool calls to track usage patterns and performance metrics.
 """
 
+import copy
+import errno
 import json
 import logging
+import os
+import re
+import stat
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +21,110 @@ from queue import Queue
 from typing import Any
 
 from .data_paths import get_data_dir
+
+# The usage log records tool arguments and results, so it is created owner-only.
+_PRIVATE_FILE_MODE = 0o600
+
+# O_NOFOLLOW refuses a symlink planted at the log path. O_NONBLOCK keeps a
+# planted FIFO from hanging the writer thread on open and has no effect on a
+# regular file. A FIFO with no reader then fails the open with ENXIO; one that
+# has a reader opens, and the fstat check below refuses it.
+_PRIVATE_OPEN_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+# What open(path, "a") passes to its opener. The file is opened here, not by
+# open(), so an error from the open can be told apart from one from the write.
+_APPEND_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+
+# Open errors that say nothing about who controls the path: the logs directory
+# is gone for now, or the process or system is out of descriptors. The entry is
+# dropped and the next one tries again; every retry still goes through
+# O_NOFOLLOW and the fstat checks.
+_TRANSIENT_OPEN_ERRNOS = frozenset({errno.ENOENT, errno.EMFILE, errno.ENFILE})
+
+
+class UnsafeLogPathError(PermissionError):
+    """The log path is not a private file and directory owned by this process."""
+
+
+def _check_private_fd(fd: int) -> None:
+    """Raise ``UnsafeLogPathError`` unless ``fd`` is our own owner-only regular file.
+
+    Checked on the opened descriptor, not the path, so a file swapped in
+    between the directory check and the open is still caught.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise UnsafeLogPathError("the usage log is not a regular file")
+    if not hasattr(os, "geteuid"):
+        return  # POSIX owner and mode bits do not apply on Windows.
+    if st.st_uid != os.geteuid():
+        raise UnsafeLogPathError("the usage log is owned by another user")
+    if st.st_nlink != 1:
+        raise UnsafeLogPathError("the usage log has another hard link")
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise UnsafeLogPathError("the usage log is accessible to other users")
+
+
+def _private_opener(path: str, flags: int) -> int:
+    """``open()`` opener: creates the file owner-only and opens only our own private file."""
+    try:
+        fd = os.open(path, flags | _PRIVATE_OPEN_FLAGS, _PRIVATE_FILE_MODE)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise UnsafeLogPathError("the usage log path is a symlink") from e
+        raise
+    try:
+        _check_private_fd(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _chmod_or_refuse(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except OSError as e:
+        raise UnsafeLogPathError(
+            f"could not restrict {path} to its owner ({type(e).__name__}: {e})"
+        ) from e
+
+
+def _make_private_dir(path: Path) -> None:
+    """Refuse a log directory another user controls; drop group/other write from our own.
+
+    ``mkdir(mode=0o700)`` does not touch a directory that already exists, and
+    whoever can write to it can replace the log file.
+    """
+    if not hasattr(os, "geteuid"):
+        return  # POSIX owner and mode bits do not apply on Windows.
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise UnsafeLogPathError(f"{path} is not a directory")
+    if st.st_uid != os.geteuid():
+        raise UnsafeLogPathError(f"{path} is owned by another user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        _chmod_or_refuse(
+            path, stat.S_IMODE(st.st_mode) & ~(stat.S_IWGRP | stat.S_IWOTH)
+        )
+
+
+def _make_private(path: Path) -> None:
+    """Drop group/other access from a log file an older version created 0644.
+
+    A missing file is fine: the opener creates it owner-only. Any other
+    ``OSError`` propagates, so the caller stops writing to disk rather than
+    keep appending to a file that stays readable by others.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise UnsafeLogPathError(f"{path} is not a regular file")
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        _chmod_or_refuse(path, _PRIVATE_FILE_MODE)
+
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +138,13 @@ AVG_LOG_ENTRIES_PER_TOOL = 3
 # Startup log collection duration in seconds
 STARTUP_LOG_DURATION_SECONDS = 60
 
+# Hard cap on collected startup entries. The collector sits on the root logger
+# at DEBUG with no filter, so an instance with `logger:` debug overrides on a
+# chatty integration can emit tens of thousands of records inside the window.
+# Keep the earliest ones — ha_report_issue's startup diagnostics care about the
+# boot sequence, and the tail of a debug flood is noise.
+MAX_STARTUP_LOG_ENTRIES = 5000
+
 
 class StartupLogCollector(logging.Handler):
     """Collects log messages during the first minute of server startup."""
@@ -38,10 +156,40 @@ class StartupLogCollector(logging.Handler):
         self._logs: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._active = True
+        # Per-thread, not an instance flag: emit() runs on every thread that
+        # logs, and a shared flag would drop unrelated records from other
+        # threads while one thread is mid-format.
+        self._formatting = threading.local()
+        # Nested records the guard dropped; surfaced by get_logs() so the
+        # startup diagnostics show the hole instead of hiding it.
+        self._dropped_nested = 0
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Capture log record if within startup window."""
+        """Capture log record if within startup window.
+
+        ``record.getMessage()`` is deliberately called OUTSIDE ``self._lock``
+        and under a per-thread reentrancy guard. Formatting a record runs
+        arbitrary third-party code: ``%s`` of an entity invokes
+        ``Entity.__repr__`` -> ``_stringify_state`` -> the entity's ``state``
+        property, and an integration whose property logs at debug re-enters
+        this handler on the same thread. This handler runs in-process with
+        Home Assistant in embedded mode, so that thread is the event loop.
+
+        Formatting inside the lock made that re-entry a hard self-deadlock on a
+        non-reentrant ``threading.Lock``, freezing the whole HA process — no
+        port 8123, no recorder writes, and no log line explaining it, because
+        the freeze happens inside logging itself (#2357).
+        """
         if not self._active:
+            return
+
+        # Nested emit from within our own formatting: drop the record rather
+        # than recurse. The outer record still gets collected, and the chain
+        # (repr -> log -> repr -> log) cannot run away. The lock is free on
+        # this path (formatting happens outside it), so counting is safe.
+        if getattr(self._formatting, "active", False):
+            with self._lock:
+                self._dropped_nested += 1
             return
 
         elapsed = time.time() - self._start_time
@@ -49,21 +197,69 @@ class StartupLogCollector(logging.Handler):
             self._active = False
             return
 
+        self._formatting.active = True
+        try:
+            message = record.getMessage()
+        except Exception as exc:  # noqa: BLE001
+            # Mirrors logging's own contract: a handler never propagates. Only
+            # attributes the logging machinery itself set are interpolated —
+            # ``exc``'s repr or ``record.msg`` could run the code that just
+            # failed. pathname:lineno names the broken call site, which the
+            # logger name alone does not.
+            message = (
+                f"<unformattable record from {record.pathname}:{record.lineno}: "
+                f"{type(exc).__name__}>"
+            )
+            # Honour the stdlib path too (logging.raiseExceptions / stderr);
+            # at DEBUG on root this may be the only handler that saw the record.
+            # Hand it a copy carrying the synthetic message and no args:
+            # handleError() formats ``record.args`` again and re-raises a
+            # RecursionError from that, which would escape into the caller.
+            safe = copy.copy(record)
+            safe.msg = message
+            safe.args = ()
+            self.handleError(safe)
+        finally:
+            self._formatting.active = False
+
         with self._lock:
+            if len(self._logs) >= MAX_STARTUP_LOG_ENTRIES:
+                self._active = False
+                return
             self._logs.append(
                 {
                     "timestamp": datetime.now(UTC).isoformat(),
                     "level": record.levelname,
                     "logger": record.name,
-                    "message": record.getMessage(),
+                    "message": message,
                     "elapsed_seconds": round(elapsed, 2),
                 }
             )
 
     def get_logs(self) -> list[dict[str, Any]]:
-        """Get collected startup logs."""
+        """Get collected startup logs.
+
+        If the reentrancy guard dropped any nested records, one synthetic
+        trailing entry says how many, so a reader of the diagnostics can tell
+        "the integration logged nothing" from "records were swallowed".
+        """
         with self._lock:
-            return list(self._logs)
+            logs = list(self._logs)
+            dropped = self._dropped_nested
+        if dropped:
+            logs.append(
+                {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "level": "WARNING",
+                    "logger": __name__,
+                    "message": (
+                        f"<{dropped} nested log record(s) emitted during message "
+                        "formatting were dropped by the reentrancy guard>"
+                    ),
+                    "elapsed_seconds": round(time.time() - self._start_time, 2),
+                }
+            )
+        return logs
 
     def is_active(self) -> bool:
         """Check if still collecting startup logs."""
@@ -94,6 +290,30 @@ def get_startup_logs() -> list[dict[str, Any]]:
     return _startup_collector.get_logs()
 
 
+@contextmanager
+def preserve_startup_collector() -> Iterator[None]:
+    """Keep the startup collector attached across a logging reconfiguration.
+
+    ``logging.basicConfig(force=True)`` removes *and closes* every handler on
+    the root logger. The collector is attached there at import time and is the
+    source of ``ha_report_issue``'s startup diagnostics, so it is detached for
+    the duration of the block — leaving nothing for the sweep to close — and
+    re-attached afterwards.
+    """
+    collector = _startup_collector
+    root = logging.getLogger()
+    if collector is None or collector not in root.handlers:
+        yield
+        return
+
+    root.removeHandler(collector)
+    try:
+        yield
+    finally:
+        if collector not in root.handlers:
+            root.addHandler(collector)
+
+
 # Parameter keys whose values are masked before a tool call is recorded to the
 # in-memory ring buffer or persisted to disk. Tool kwargs can carry secrets
 # (alarm/lock ``code``, tokens, passwords); these must never reach the usage
@@ -116,6 +336,13 @@ _SENSITIVE_PARAM_KEYS = frozenset(
         "apikey",
         "client_secret",
         "authorization",
+        # A settings export: the in-process server's carries its secret path and
+        # signing keys under names the key match does not cover.
+        "settings_file",
+        # Not a credential but user speech: ha_manage_pipeline(action='process')
+        # takes whatever the user said, which is as likely to name a person or
+        # an address as it is to turn on a light.
+        "sentence",
     }
 )
 # Suffix match only for families with a low false-positive rate. Deliberately
@@ -125,6 +352,11 @@ _SENSITIVE_PARAM_KEYS = frozenset(
 _SENSITIVE_KEY_SUFFIXES = ("_token", "_secret", "_password", "_passwd")
 _REDACTED_VALUE = "[REDACTED]"
 _MAX_REDACT_DEPTH = 6
+_JSON_CONTAINER_START = re.compile(r"\s*[\[{]")
+# A name written as a JSON member, as in "code": or, inside an escaped
+# string, \"code\":
+_QUOTED_MEMBER_NAME = re.compile(r"""\\*["']([A-Za-z_]\w*)\\*["']\s*:""")
+_UNPARSED_VALUE = "[text naming a sensitive key omitted]"
 
 
 def _is_sensitive_key(key: Any) -> bool:
@@ -143,9 +375,24 @@ def _redact_parameters(value: Any, _depth: int = 0) -> Any:
     dicts/lists/tuples so secrets nested under non-sensitive keys are caught
     (a tuple is returned as a list). Fails closed past ``_MAX_REDACT_DEPTH`` —
     a subtree too deep to walk is masked wholesale rather than returned verbatim.
+
+    A JSON object or array sent as a string (a stringified ``data``, an MQTT
+    payload) hides its keys from the match, so it is parsed and masked like
+    the container it encodes. Any other text that names a sensitive key as a
+    JSON member, such as a truncated or otherwise malformed object, is left
+    out whole, because its value cannot be told apart from the rest.
     """
     if _depth > _MAX_REDACT_DEPTH:
         return _REDACTED_VALUE
+    if isinstance(value, str):
+        if _JSON_CONTAINER_START.match(value):
+            try:
+                return _redact_parameters(json.loads(value), _depth + 1)
+            except ValueError, RecursionError:
+                pass
+        if any(_is_sensitive_key(name) for name in _QUOTED_MEMBER_NAME.findall(value)):
+            return _UNPARSED_VALUE
+        return value
     if isinstance(value, dict):
         return {
             key: (
@@ -157,7 +404,11 @@ def _redact_parameters(value: Any, _depth: int = 0) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_redact_parameters(item, _depth + 1) for item in value]
-    return value
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    # Entries are dumped as JSON (log file, ha_report_issue); keep odd objects
+    # from breaking that.
+    return repr(value)
 
 
 @dataclass
@@ -182,7 +433,9 @@ class UsageLogger:
         log_file_path: str | None = None,
         ring_buffer_size: int = DEFAULT_RING_BUFFER_SIZE,
     ):
-        self._enabled = True
+        # Only the file is gated: the in-memory ring buffer never touches disk
+        # and ha_report_issue reads it, so it keeps working when the file is off.
+        self._disk_enabled = True
 
         if log_file_path:
             self.log_file_path = Path(log_file_path)
@@ -195,19 +448,32 @@ class UsageLogger:
             self.log_file_path = get_data_dir() / "logs" / "mcp_usage.jsonl"
 
         try:
-            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as e:
             # Directory creation failed (e.g., read-only filesystem). Surface
             # the reason instead of silently dropping every log — operators
             # otherwise see an empty mcp_usage.jsonl with no clue why.
             logger.warning(
-                "Usage logging disabled — could not create %s (%s: %s). "
+                "Usage log file disabled — could not create %s (%s: %s). "
                 "Set HA_MCP_CONFIG_DIR to a writable path to enable persistence.",
                 self.log_file_path.parent,
                 type(e).__name__,
                 e,
             )
-            self._enabled = False
+            self._disk_enabled = False
+        else:
+            try:
+                _make_private_dir(self.log_file_path.parent)
+                _make_private(self.log_file_path)
+            except OSError as e:
+                logger.warning(
+                    "Usage log file disabled — %s is not private (%s: %s). "
+                    "Set HA_MCP_CONFIG_DIR to a directory only this user can write.",
+                    self.log_file_path,
+                    type(e).__name__,
+                    e,
+                )
+                self._disk_enabled = False
 
         # In-memory ring buffer for fast access to recent logs
         # Thread-safe: deque is thread-safe for append/pop operations
@@ -218,7 +484,7 @@ class UsageLogger:
         self._log_queue: Queue[ToolUsageLog] = Queue()
         self._logger_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        if self._enabled:
+        if self._disk_enabled:
             self._start_logger_thread()
 
     def _start_logger_thread(self) -> None:
@@ -230,28 +496,73 @@ class UsageLogger:
 
     def _log_writer_worker(self) -> None:
         """Background thread worker for writing logs to disk."""
-        while not self._stop_event.is_set():
+        while True:
             try:
-                # Wait for log entry with timeout to check stop event
+                # Read before the queue: once the stop flag is seen, every entry
+                # queued before shutdown() is in the queue.
+                stopping = self._stop_event.is_set()
                 if not self._log_queue.empty():
                     log_entry = self._log_queue.get(timeout=1.0)
-                    self._write_log_entry(log_entry)
+                    try:
+                        self._write_log_entry(log_entry)
+                    finally:
+                        # Lets a caller wait until the entry is written, not
+                        # only taken off the queue.
+                        self._log_queue.task_done()
+                elif stopping:
+                    return
                 else:
-                    # Sleep briefly to avoid busy waiting
-                    threading.Event().wait(0.1)
-            except Exception as e:
-                # Silent error handling to avoid disrupting MCP server
-                print(f"Usage logger error: {e}")
+                    # Wait briefly to avoid busy waiting; shutdown() wakes it at once.
+                    self._stop_event.wait(0.1)
+            except Exception:
+                # Never raise out of the writer; log it instead of printing, since
+                # stdout carries the JSON-RPC stream in stdio mode.
+                logger.warning("Usage log writer error", exc_info=True)
 
     def _write_log_entry(self, log_entry: ToolUsageLog) -> None:
         """Write single log entry to disk."""
+        if not self._disk_enabled:
+            return
         try:
-            with open(self.log_file_path, "a", encoding="utf-8") as f:
+            fd = _private_opener(str(self.log_file_path), _APPEND_FLAGS)
+        except OSError as e:
+            if (
+                not isinstance(e, UnsafeLogPathError)
+                and e.errno in _TRANSIENT_OPEN_ERRNOS
+            ):
+                logger.debug(
+                    "Usage log entry dropped, %s could not be opened (%s); "
+                    "the next entry retries.",
+                    self.log_file_path,
+                    e,
+                )
+                return
+            # The path was swapped after startup for something we will not or
+            # cannot open (a link, a FIFO, a file of another user). Stop writing
+            # instead of dropping every entry silently or retrying a path someone
+            # else controls on every tool call.
+            self._disk_enabled = False
+            logger.warning(
+                "Usage log file disabled — could not open %s privately (%s: %s).",
+                self.log_file_path,
+                type(e).__name__,
+                e,
+            )
+            return
+        # Until open() returns a file object, nothing owns fd; close it here.
+        try:
+            f = open(fd, "a", encoding="utf-8")  # noqa: SIM115 - the with below owns it
+        except Exception as e:  # noqa: BLE001
+            os.close(fd)
+            logger.debug("Usage log entry dropped (%s: %s).", type(e).__name__, e)
+            return
+        try:
+            with f:
                 json.dump(asdict(log_entry), f, ensure_ascii=False)
                 f.write("\n")
-        except Exception:
-            # Silent error handling
-            pass
+        except Exception as e:  # noqa: BLE001
+            # A full disk or an unserializable value drops this entry only.
+            logger.debug("Usage log entry dropped (%s: %s).", type(e).__name__, e)
 
     def log_tool_usage(
         self,
@@ -264,8 +575,6 @@ class UsageLogger:
         user_context: str | None = None,
     ) -> None:
         """Log tool usage (non-blocking)."""
-        if not self._enabled:
-            return
         try:
             # Mask secrets (alarm/lock codes, tokens, passwords) before the entry
             # reaches the ring buffer or disk. Returns a copy — never mutates the
@@ -287,9 +596,9 @@ class UsageLogger:
             with self._buffer_lock:
                 self._ring_buffer.append(entry_dict)
 
-            # Queue for disk write
-            self._log_queue.put(log_entry)
-        except Exception:
+            if self._disk_enabled:
+                self._log_queue.put(log_entry)
+        except Exception:  # noqa: BLE001
             # Silent error handling to never break MCP server
             pass
 
@@ -309,7 +618,7 @@ class UsageLogger:
             return list(reversed(buffer_list[-count:]))
 
     def shutdown(self) -> None:
-        """Gracefully shutdown logger."""
+        """Stop the writer once it has drained the queue, waiting up to 2 s."""
         self._stop_event.set()
         if self._logger_thread and self._logger_thread.is_alive():
             self._logger_thread.join(timeout=2.0)
@@ -369,8 +678,4 @@ def get_recent_logs(max_entries: int = 20) -> list[dict[str, Any]]:
     Returns:
         List of log entries as dictionaries, ordered newest to oldest
     """
-    logger = get_usage_logger()
-    if not logger._enabled:
-        return []
-
-    return logger.get_recent_entries(max_entries)
+    return get_usage_logger().get_recent_entries(max_entries)

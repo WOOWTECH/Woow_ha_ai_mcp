@@ -5,9 +5,11 @@ E2E tests for ha_set_entity device_class (Show As) and per-domain options round-
 import logging
 
 import pytest
-from fastmcp.exceptions import ToolError
 
-from ...utilities.assertions import assert_mcp_success
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+
+from ...utilities.assertions import MCPAssertions, assert_mcp_success
+from ...utilities.cleanup import CleanupSteps
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ async def _delete_template_helper(mcp_client, entity_id: str) -> None:
             "ha_remove_helpers_integrations",
             {"target": entity_id, "helper_type": "template", "confirm": True},
         )
-    except Exception as e:  # pragma: no cover - cleanup best-effort
+    except Exception as e:  # pragma: no cover - cleanup best-effort  # noqa: BLE001
         logger.warning(f"Cleanup of {entity_id} failed: {e}")
 
 
@@ -75,8 +77,8 @@ class TestShowAs:
             {
                 "helper_type": "template",
                 "name": "e2e_show_as_test",
+                "menu_choice": "binary_sensor",
                 "config": {
-                    "next_step_id": "binary_sensor",
                     "state": "{{ true }}",
                 },
             },
@@ -118,8 +120,8 @@ class TestShowAs:
             {
                 "helper_type": "template",
                 "name": "e2e_options_test",
+                "menu_choice": "sensor",
                 "config": {
-                    "next_step_id": "sensor",
                     "state": "{{ 1.234 }}",
                     "unit_of_measurement": "kWh",
                 },
@@ -164,8 +166,8 @@ class TestShowAs:
             {
                 "helper_type": "template",
                 "name": "e2e_multi_options_test",
+                "menu_choice": "sensor",
                 "config": {
-                    "next_step_id": "sensor",
                     "state": "{{ 9.87 }}",
                     "unit_of_measurement": "kWh",
                 },
@@ -272,23 +274,26 @@ class TestShowAsOnIntegrationEntity:
                 == 3
             )
         finally:
-            # Restore the override slot to its pre-test value (None or whatever
-            # it was) so we don't leak state to other tests sharing the demo
-            # entity inside this test container.
-            restore_dc = "" if original_override is None else original_override
-            await mcp_client.call_tool(
-                "ha_set_entity",
-                {"entity_id": self.TARGET, "device_class": restore_dc},
-            )
-            # Restore the sensor sub-options to their pre-test value so any
-            # demo-platform default we overwrote is put back intact. Skip the
-            # round-trip when there was nothing captured — sending an empty
-            # sub-dict would otherwise emit a no-op options={"sensor": {}} call.
-            if original_sensor_options:
-                await mcp_client.call_tool(
-                    "ha_set_entity",
-                    {
-                        "entity_id": self.TARGET,
-                        "options": {"sensor": dict(original_sensor_options)},
-                    },
-                )
+            with CleanupSteps() as cleanup:
+                with cleanup.step():
+                    # Restore the override slot to its pre-test value (None or whatever
+                    # it was) so we don't leak state to other tests sharing the demo
+                    # entity inside this test container.
+                    restore_dc = "" if original_override is None else original_override
+                    await MCPAssertions(mcp_client).call_tool_success(
+                        "ha_set_entity",
+                        {"entity_id": self.TARGET, "device_class": restore_dc},
+                    )
+                with cleanup.step():
+                    # Restore the sensor sub-options to their pre-test value so any
+                    # demo-platform default we overwrote is put back intact. Skip the
+                    # round-trip when there was nothing captured — sending an empty
+                    # sub-dict would otherwise emit a no-op options={"sensor": {}} call.
+                    if original_sensor_options:
+                        await MCPAssertions(mcp_client).call_tool_success(
+                            "ha_set_entity",
+                            {
+                                "entity_id": self.TARGET,
+                                "options": {"sensor": dict(original_sensor_options)},
+                            },
+                        )

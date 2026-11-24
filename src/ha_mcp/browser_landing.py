@@ -125,8 +125,8 @@ def register_browser_landing(mcp_instance: CustomRouteServer, path: str) -> bool
         # Any GET here is a non-MCP caller (browser, health check, proxy, or a
         # connector's SSE-style pre-flight) hitting this POST-only Streamable HTTP
         # endpoint, which answers 405 by design. Log one annotated line so the 405
-        # reads as expected.
-        logger.info("GET %s -> 405 (NORMAL for most non-SSE connections)", path)
+        # reads as expected. The path is left out: it is the secret path.
+        logger.info("GET -> 405 (NORMAL for most non-SSE connections)")
         return PlainTextResponse(
             LANDING_MESSAGE,
             status_code=405,
@@ -150,7 +150,7 @@ def register_healthz(mcp_instance: CustomRouteServer) -> bool:
     """Register a GET ``/healthz`` liveness route answering 200 with JSON.
 
     Lets uptime monitors, blackbox probes, and load balancers confirm the HTTP
-    server is alive without knowing the MCP path. Standard-mode HTTP/SSE
+    server is alive without knowing the MCP path. Standard-mode HTTP
     authenticates by URL-path secrecy (SECURITY.md -> Threat Model), so this
     route is opt-in (``MCP_HEALTHZ`` env var, checked by the caller) and the
     response body deliberately does not echo the MCP path.

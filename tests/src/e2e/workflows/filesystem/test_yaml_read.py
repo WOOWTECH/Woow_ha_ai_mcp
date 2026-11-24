@@ -21,6 +21,7 @@ enabled here only to SEED a package file to then discover.
 Tests are designed for the Docker Home Assistant test environment.
 """
 
+import json
 import logging
 import os
 from typing import Any
@@ -32,6 +33,10 @@ from ...utilities.assertions import MCPAssertions
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ha_config_get_yaml reads through the component's privileged services, which
+# register only in the "File & YAML Tools" config entry (#2292).
+pytestmark = pytest.mark.requires_tools_entry
+
 TOOL_NAME = "ha_config_get_yaml"
 SET_TOOL = "ha_config_set_yaml"
 READ_TOOL = "ha_read_file"
@@ -42,7 +47,7 @@ FEATURE_FLAG = "ENABLE_YAML_CONFIG_EDITING"
 # detects the configured folder at runtime rather than assuming "packages".
 PACKAGES_DIR = "custom_packages"
 
-# Staged pre-boot by conftest._seed_non_yaml_package_file — the file a
+# Staged pre-boot by _conftest_seed._seed_non_yaml_package_file — the file a
 # `custom_packages/*` glob must skip rather than fail on.
 NON_YAML_FILE = f"{PACKAGES_DIR}/_e2e_not_yaml.md"
 
@@ -66,9 +71,9 @@ def _require_seeded_backend(container_info: dict) -> None:
 @pytest.fixture(scope="module")
 def yaml_editing_enabled(ha_container_with_fresh_config):
     """Enable YAML editing for the module — only needed to seed a package."""
-    os.environ[FEATURE_FLAG] = "true"
-    yield
-    os.environ.pop(FEATURE_FLAG, None)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(FEATURE_FLAG, "true")
+        yield
 
 
 async def _set_yaml_confirmed(mcp: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -115,16 +120,18 @@ class TestYamlReadSingleFile:
     async def test_reads_key_from_configuration_yaml(self, mcp_client):
         async with MCPAssertions(mcp_client) as mcp:
             data = await mcp.call_tool_success(
-                TOOL_NAME, {"yaml_path": "http", "file": "configuration.yaml"}
+                TOOL_NAME, {"yaml_path": "input_number", "file": "configuration.yaml"}
             )
 
         assert data["count"] == 1
         assert data["files_searched"] == 1
         match = data["matches"][0]
         assert match["file"] == "configuration.yaml"
-        assert match["yaml_path"] == "http"
-        # The http block of initial_test_state/configuration.yaml.
-        assert "use_x_forwarded_for" in match["content"]
+        assert match["yaml_path"] == "input_number"
+        # The input_number block of initial_test_state/configuration.yaml.
+        # (Was `http:` until HA 2026.8 made an http YAML block restart Core
+        # mid-suite — see the note in that file.)
+        assert "e2e_pagination_seed" in match["content"]
 
     async def test_absent_key_is_an_empty_result_not_an_error(self, mcp_client):
         async with MCPAssertions(mcp_client) as mcp:
@@ -145,7 +152,7 @@ class TestYamlReadSingleFile:
             data = await mcp.call_tool_success(
                 TOOL_NAME,
                 {
-                    "yaml_path": "http",
+                    "yaml_path": "input_number",
                     "file": "configuration.yaml",
                     "include_content": False,
                 },
@@ -159,7 +166,7 @@ class TestYamlReadSingleFile:
             data = await mcp.call_tool_success(
                 TOOL_NAME,
                 {
-                    "yaml_path": "http",
+                    "yaml_path": "input_number",
                     "file": "configuration.yaml",
                     "include_parsed": True,
                 },
@@ -167,7 +174,7 @@ class TestYamlReadSingleFile:
 
         parsed = data["matches"][0]["parsed"]
         assert isinstance(parsed, dict)
-        assert parsed["use_x_forwarded_for"] is True
+        assert parsed["e2e_pagination_seed"]["mode"] == "box"
 
 
 @pytest.mark.filesystem
@@ -195,6 +202,46 @@ class TestYamlReadTagPreservation:
         assert "!include automations.yaml" in match["content"]
         assert match["parsed"] == "!include automations.yaml"
 
+    async def test_nested_package_key_is_discovered(self, mcp_client):
+        """Core's annotation load finds a key in a nested package folder."""
+        async with MCPAssertions(mcp_client) as mcp:
+            data = await mcp.call_tool_success(
+                TOOL_NAME,
+                {
+                    "yaml_path": "template",
+                    "file": "custom_packages/*.yaml",
+                    "include_parsed": True,
+                },
+            )
+
+        assert data["count"] >= 1
+        assert any(
+            match["file"].endswith("nested/mcp_nested_2926.yaml")
+            for match in data["matches"]
+        )
+
+    async def test_input_tag_not_resolved(self, mcp_client):
+        """Blueprint ``!input`` markers survive into the parsed view.
+
+        The staged motion-light blueprint uses ``!input motion_entity``. A
+        tag the component's loader did not register reached ``yaml_jsonify``
+        as ruamel's generic scalar and came back as a bare value, dropping
+        the tag from ``include_parsed`` results.
+        """
+        async with MCPAssertions(mcp_client) as mcp:
+            data = await mcp.call_tool_success(
+                TOOL_NAME,
+                {
+                    "yaml_path": "actions",
+                    "file": "blueprints/automation/homeassistant/motion_light.yaml",
+                    "include_parsed": True,
+                },
+            )
+
+        match = data["matches"][0]
+        assert "!input motion_entity" in match["content"]
+        assert "!input motion_entity" in json.dumps(match["parsed"])
+
 
 @pytest.mark.filesystem
 class TestReadFileYamlPath:
@@ -203,29 +250,34 @@ class TestReadFileYamlPath:
     async def test_yaml_path_returns_subtree(self, mcp_client):
         async with MCPAssertions(mcp_client) as mcp:
             data = await mcp.call_tool_success(
-                READ_TOOL, {"path": "configuration.yaml", "yaml_path": "http"}
+                READ_TOOL, {"path": "configuration.yaml", "yaml_path": "input_number"}
             )
 
-        assert "use_x_forwarded_for" in data["subtree"]
+        assert "e2e_pagination_seed" in data["subtree"]
 
     async def test_yaml_path_extracts_from_the_untailed_file(self, mcp_client):
         """tail_lines must not truncate the text the key is extracted from.
 
-        `http:` sits near the top of configuration.yaml, so a tail of a few
-        lines excludes it entirely, and the retained tail is not valid YAML on
-        its own. Extracting from the tailed text would report the key as
-        absent; the subtree must still come back, while `content` stays tailed.
+        `input_number:` sits well above the last lines of configuration.yaml,
+        so a tail of a few lines excludes it entirely, and the retained tail is
+        not valid YAML on its own. Extracting from the tailed text would report
+        the key as absent; the subtree must still come back, while `content`
+        stays tailed.
         """
         async with MCPAssertions(mcp_client) as mcp:
             data = await mcp.call_tool_success(
                 READ_TOOL,
-                {"path": "configuration.yaml", "tail_lines": 3, "yaml_path": "http"},
+                {
+                    "path": "configuration.yaml",
+                    "tail_lines": 3,
+                    "yaml_path": "input_number",
+                },
             )
 
         assert data["subtree"] is not None, (
             "yaml_path must extract from the full file, not the tailed text"
         )
-        assert "use_x_forwarded_for" in data["subtree"]
+        assert "e2e_pagination_seed" in data["subtree"]
         # content stays truncated: tailing is a display concern only.
         assert len(data["content"].split("\n")) <= 3
 
@@ -234,9 +286,10 @@ class TestReadFileYamlPath:
 class TestSecretsMasking:
     """secrets.yaml reads back masked through the yaml_path views too.
 
-    The unit half (test_custom_component_filesystem.py::
-    TestReadFileSecretsMaskingOrder) pins the ordering that makes this hold;
-    this is the behavioural half against the real component.
+    The unit half (test_custom_component_read_file.py::TestSecretsMasking)
+    checks every view of the file through the component's service; this
+    checks that the tool's yaml_path and include_parsed reads reach that
+    masked read on a real install.
     """
 
     async def test_subtree_and_parsed_are_masked(self, mcp_client):
@@ -356,6 +409,41 @@ class TestYamlReadGlobDiscovery:
         assert "e2e_read_probe" in match["content"]
         # file + yaml_path address the same fragment for ha_config_set_yaml.
         assert match["yaml_path"] == "command_line"
+
+    async def test_bracketed_filename_is_read_by_its_exact_name(
+        self, mcp_client, yaml_editing_enabled
+    ):
+        """The behavioural half of the unit coverage, on a real instance.
+
+        The unit tests resolve against a replica of the component's matcher;
+        this seeds a file whose name carries a bracket class and reads it back
+        by that exact name, so the two halves are pinned against the same
+        behaviour rather than against each other.
+        """
+        target = f"{PACKAGES_DIR}/_e2e_bracket[a].yaml"
+        async with MCPAssertions(mcp_client) as mcp:
+            await _set_yaml_confirmed(
+                mcp,
+                {
+                    "yaml_path": "shell_command",
+                    "action": "add",
+                    "file": target,
+                    "content": "e2e_bracket_probe: echo 1\n",
+                },
+            )
+
+            data = await mcp.call_tool_success(
+                TOOL_NAME, {"yaml_path": "shell_command", "file": target}
+            )
+
+        assert data["count"] == 1
+        assert data["files_searched"] == 1
+        assert data["matches"][0]["file"] == target
+        assert "e2e_bracket_probe" in data["matches"][0]["content"]
+        # The other half, on the real instance: the literal lookup found the
+        # file, so nothing degraded and no warning was manufactured.
+        assert data["files_unreadable"] == 0
+        assert "warnings" not in data
 
     async def test_glob_returns_every_defining_file(
         self, mcp_client, yaml_editing_enabled

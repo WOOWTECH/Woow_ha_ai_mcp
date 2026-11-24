@@ -16,31 +16,31 @@ import logging
 import os
 from typing import Annotated, Any
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
 
 from ..config import get_global_settings
 from ..errors import ErrorCode, create_error_response
 from ..strict_bps import BestPracticeKeyParam
 from .auto_backup import with_auto_backup
+from .config_write_helpers import (
+    attach_skill_content,
+    augment_error_dict_with_skill_content,
+    augment_tool_error_with_skill_content,
+)
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
     raise_tool_error,
     register_tool_methods,
 )
+from .tool_hints import write_hints
 from .tools_config_dashboards import fetch_dashboards_list
-from .tools_filesystem import (
-    _assert_mcp_tools_available,
-    call_mcp_tools_service,
-)
-from .util_helpers import (
-    attach_skill_content,
-    augment_error_dict_with_skill_content,
-    augment_tool_error_with_skill_content,
-    unwrap_service_response,
-)
+from .tools_filesystem import _assert_mcp_tools_available, call_mcp_tools_service
+from .util_helpers import unwrap_service_response
+from .yaml_extra_keys import effective_extra_yaml_write_keys
 
 # YAML packages frequently include template sensors, command_line entities,
 # and mqtt templates — exactly where template misuse causes the most
@@ -57,8 +57,8 @@ _LOVELACE_DASHBOARD_PREFIX = "lovelace.dashboards."
 # here, otherwise a key would silently be unreachable through the
 # wrapper. The parity invariant (keys == PACKAGES_ONLY_YAML_KEYS, and
 # every value is a real Settings field) is enforced by
-# test_yaml_config_tool.py::test_flag_map_matches_packages_only_keys.
-_YAML_PACKAGES_FLAG_BY_KEY = {
+# test_yaml_dashboards.py::test_flag_map_matches_packages_only_keys.
+YAML_PACKAGES_FLAG_BY_KEY = {
     "automation": "enable_yaml_packages_automation",
     "script": "enable_yaml_packages_script",
     "scene": "enable_yaml_packages_scene",
@@ -89,7 +89,7 @@ def _is_preview_only_call(kwargs: dict[str, Any]) -> bool:
         return False
     try:
         return bool(get_global_settings().enable_yaml_edit_confirm)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -102,12 +102,12 @@ def _disabled_packages_keys(settings: Any) -> list[str]:
     irrelevant on the wire.
 
     Uses ``getattr`` without a default so a future rename that breaks the
-    ``_YAML_PACKAGES_FLAG_BY_KEY`` → ``Settings`` mapping raises loudly
+    ``YAML_PACKAGES_FLAG_BY_KEY`` → ``Settings`` mapping raises loudly
     instead of silently treating the key as disabled (a dead toggle).
     """
     return sorted(
         key
-        for key, flag in _YAML_PACKAGES_FLAG_BY_KEY.items()
+        for key, flag in YAML_PACKAGES_FLAG_BY_KEY.items()
         if not getattr(settings, flag)
     )
 
@@ -258,7 +258,7 @@ async def _check_storage_mode_dashboard_collision(client: Any, yaml_path: str) -
     url_path = yaml_path[len(_LOVELACE_DASHBOARD_PREFIX) :]
     try:
         dashboards = await fetch_dashboards_list(client)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "lovelace/dashboards/list WS query failed (%s); skipping collision check",
             exc,
@@ -296,12 +296,9 @@ class YamlConfigTools:
     @tool(
         name="ha_config_set_yaml",
         tags={"System", "beta"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "idempotentHint": False,
-            "title": "Raw YAML Config Edit",
-        },
+        annotations=write_hints(
+            "Raw YAML Config Edit", destructive=True, idempotent=False, open_world=False
+        ),
     )
     @with_auto_backup(
         domain="yaml",
@@ -326,13 +323,7 @@ class YamlConfigTools:
                     "<url_path> is lowercase, hyphenated, and not a reserved HA "
                     "route. For themes in themes/*.yaml, use the theme name "
                     "(simple name without dots; content is the mapping of "
-                    "theme variables only, without the theme name). "
-                    "'automation', 'script', and 'scene' are accepted only when "
-                    "file is under packages/*.yaml; in configuration.yaml use "
-                    "the dedicated storage-mode tools "
-                    "(ha_config_set_automation, ha_config_set_script, "
-                    "ha_config_set_scene). Not for template sensors or "
-                    "input_* helpers — those have dedicated tools."
+                    "theme variables only, without the theme name)."
                 ),
             ),
         ],
@@ -340,9 +331,16 @@ class YamlConfigTools:
             str,
             Field(
                 description=(
-                    "Action to perform: 'add' (insert/merge content under key), "
-                    "'replace' (overwrite key with new content), or "
-                    "'remove' (delete the key entirely)."
+                    "Action to perform: 'add' (insert content if yaml_path is absent; "
+                    "otherwise merge one level deep: a list gets content's items "
+                    "appended, a mapping gets content's top-level keys set, "
+                    "overwriting same-named ones, so a nested mapping or list under "
+                    "such a key is replaced, not merged; mismatched types are "
+                    "rejected. For a nested edit, read the whole value of yaml_path, "
+                    "not a nested path below it, and use 'replace' with the "
+                    "complete edited value), "
+                    "'replace' (overwrite yaml_path with content), or 'remove' "
+                    "(delete yaml_path entirely)."
                 ),
             ),
         ],
@@ -351,8 +349,8 @@ class YamlConfigTools:
             Field(
                 default=None,
                 description=(
-                    "YAML content for the value under yaml_path. Required for "
-                    "'add' and 'replace' actions. Must be valid YAML."
+                    "YAML content for the value under yaml_path. Required for 'add' and "
+                    "'replace' actions."
                 ),
             ),
         ] = None,
@@ -361,10 +359,8 @@ class YamlConfigTools:
             Field(
                 default="configuration.yaml",
                 description=(
-                    "Relative path to the YAML config file. Defaults to "
-                    "'configuration.yaml'. Also supports 'packages/*.yaml' and "
-                    "'themes/*.yaml' (yaml_path is the theme name; "
-                    "frontend.reload_themes is triggered automatically)."
+                    "Relative path to the YAML config file. Also supports 'packages/*.yaml'"
+                    " and 'themes/*.yaml'."
                 ),
             ),
         ] = "configuration.yaml",
@@ -372,13 +368,7 @@ class YamlConfigTools:
             str | None,
             Field(
                 default=None,
-                description=(
-                    "Confirmation token from a prior preview response. When "
-                    "the YAML edit confirmation flow is enabled (default), "
-                    "the first call writes nothing and returns a unified "
-                    "diff plus confirm_token; repeat the identical call "
-                    "with that token to apply the edit."
-                ),
+                description=("Confirmation token from a prior preview response."),
             ),
         ] = None,
         MandatoryBPS: Annotated[
@@ -392,60 +382,45 @@ class YamlConfigTools:
         """Update raw YAML configuration in configuration.yaml, packages/*.yaml, or themes/*.yaml (LAST RESORT).
 
         MUST call ha_get_skill_guide OR refer to your locally installed skills first.
+        ``template-guidelines.md`` ships under ``skill_content`` by default.
 
-        **WARNING:** Destructive, disabled by default. Dedicated tools exist for
-        almost every use case and should be preferred:
-
-        - Template sensors (state-based or trigger-based) ->
-          ha_config_set_helper(helper_type='template')
-        - Automations (storage-mode) -> ha_config_set_automation
-        - Scripts (storage-mode) -> ha_config_set_script
-        - Scenes (storage-mode) -> ha_config_set_scene
-        - All 28 helper types (input_*, counter, timer, schedule, zone, person,
-          tag, group, min_max, threshold, derivative, statistics, utility_meter,
-          trend, filter, switch_as_x, etc.) -> ha_config_set_helper
+        Destructive, disabled by default. Prefer the dedicated tools:
+        ha_config_set_helper for template sensors and every other helper type,
+        ha_config_set_automation / ha_config_set_script / ha_config_set_scene
+        for storage-mode items.
 
         Intended for YAML-only integrations with no config-flow or API
         equivalent (command_line, rest, shell_command, notify platforms),
         for integrations with significant YAML-only configuration (knx
         entities in package files), for registering YAML-mode dashboards via
         ``lovelace.dashboards.<url_path>`` (no other ``lovelace.*`` keys),
-        and for editing theme files in ``themes/*.yaml`` (keyed by theme name;
-        ``frontend.reload_themes`` is triggered automatically so no restart is
-        needed). Themes only load when configuration.yaml carries the
-        ``frontend: themes:`` include (e.g. ``!include_dir_merge_named themes``);
-        this tool cannot add that include (``frontend`` is not an allowed key).
-        Also accepts ``automation``, ``script``, and ``scene`` keys when
-        ``file`` is a ``packages/*.yaml`` — for git-managed YAML configs
-        that track these alongside templates and other YAML items. Writes
-        to ``configuration.yaml`` for those three keys remain rejected so
-        storage-mode and YAML-mode collections don't collide; use the
-        dedicated storage-mode tools instead.
-        Check ``post_action`` in the response: most keys need a full HA
-        restart. For ``themes/*.yaml`` this tool *performs* the reload itself
-        (``frontend.reload_themes``), so ``post_action`` is ``reload_performed``
-        (or ``reload_available`` plus ``reload_error`` if that reload failed).
-        For template, mqtt, group, automation, script, and scene it only
-        *advertises* the reload service (``post_action: reload_available`` with
-        a ``reload_service`` to call yourself); the edit is on disk but not yet
+        and for editing theme files in ``themes/*.yaml``. Themes only load when
+        configuration.yaml carries the ``frontend: themes:`` include (e.g.
+        ``!include_dir_merge_named themes``); this tool cannot add that include
+        (``frontend`` is not an allowed key). ``automation``, ``script`` and
+        ``scene`` keys are accepted only when ``file`` is a ``packages/*.yaml``
+        and the operator has turned on that key's packages setting (each is
+        off by default); writes of those keys to ``configuration.yaml`` are
+        rejected; use the storage-mode tools.
+
+        Check ``post_action`` in the response. For ``themes/*.yaml`` this tool
+        *performs* the reload itself (``frontend.reload_themes``), so
+        ``post_action`` is ``reload_performed`` (or ``reload_available`` plus
+        ``reload_error`` if that reload failed). For any other key it is
+        ``reload_available`` with the ``reload_service`` to call yourself when
+        Home Assistant has ``<key>.reload`` (the key's integration is loaded),
+        and ``restart_required`` otherwise; the edit is on disk but not yet
         live. Preserves YAML comments and HA tags (``!include``,
         ``!secret``) on round-trip; ``replace`` swaps the subtree as-is.
 
         Two-step confirmation (default ON, toggle ENABLE_YAML_EDIT_CONFIRM /
         Server Settings): the first call returns ``preview: true`` with a
         unified ``diff`` of exactly what would change on disk and a
-        ``confirm_token`` — nothing is written. Review the diff for
-        changes outside the requested edit, then repeat the identical
-        call adding ``confirm_token`` to apply. Every applied write also
-        returns the final ``diff``. A token mismatch means the file
-        changed since the preview (or the token was wrong); use the
-        freshly returned token.
-
-        ``template-guidelines.md`` ships in this response under ``skill_content``
-        by default — YAML packages frequently include
-        template sensors / command_line entities / mqtt templates, exactly where
-        template misuse causes the subtlest bugs. For deeper routing guidance
-        beyond what ships here, use ha_get_skill_guide.
+        ``confirm_token`` — nothing is written. Review the diff, then repeat
+        the identical call adding ``confirm_token`` to apply. Every applied
+        write also returns the final ``diff``. A token mismatch means the file
+        changed since the preview (or the token was wrong); use the freshly
+        returned token.
         """
         try:
             _validate_yaml_action_and_content(action, content)
@@ -464,6 +439,8 @@ class YamlConfigTools:
             # Check if custom component is available
             await _assert_mcp_tools_available(self._client)
 
+            extra_keys = await effective_extra_yaml_write_keys(self._client, settings)
+
             # Build service data
             service_data: dict[str, Any] = {
                 "file": file,
@@ -472,6 +449,8 @@ class YamlConfigTools:
                 "disabled_packages_keys": disabled_keys,
                 "require_confirm": settings.enable_yaml_edit_confirm,
             }
+            if extra_keys:
+                service_data["extra_allowed_keys"] = extra_keys
             if content is not None:
                 service_data["content"] = content
             if confirm_token is not None:
@@ -517,7 +496,7 @@ class YamlConfigTools:
 
         except ToolError as te:
             raise augment_tool_error_with_skill_content(te, bp_warnings=None) from None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error = exception_to_structured_error(
                 e,
                 context={

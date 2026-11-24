@@ -1,0 +1,5 @@
+# 版本上限 (Version Ceiling; WOOW addon pipeline release-gating #216, parent #191).
+# The highest webhook proxy version (config.yaml version:) that may get a formal Release; see
+# .mirror/homeassistant-addon/version-ceiling.yaml.
+ceiling: "3.0.4"
+reason: "3.0.5 was checked with ha_mcp 9.2.0 on the shipping HA 2026.7.2 (#214); newer ones pair with ha_mcp above its ceiling"

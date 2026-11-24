@@ -493,6 +493,8 @@
     font-size: 0.7rem; font-family: 'Roboto Mono', 'Courier New', monospace;
   }
   .feature-locked-note { font-size: 0.72rem; color: var(--warning); margin-top: 4px; font-style: italic; }
+  /* setStatusAlert marks a failed save role=alert; show it as an error too. */
+  .feature-help[role="alert"] { color: var(--danger-text); }
   .feature-control { flex-shrink: 0; display: flex; align-items: center; }
   .feature-control input[type="number"] {
     width: 64px; padding: 4px 8px;
@@ -509,28 +511,35 @@
   .feature-row.beta-sub,
   .feature-row.codemode-sub,
   .feature-row.yaml-packages-sub,
-  .feature-row.mandatory-bps-sub { position: relative; }
+  .feature-row.mandatory-bps-sub,
+  .feature-row.redact-sub { position: relative; }
   .feature-row.beta-sub::before,
   .feature-row.codemode-sub::before,
   .feature-row.yaml-packages-sub::before,
-  .feature-row.mandatory-bps-sub::before {
+  .feature-row.mandatory-bps-sub::before,
+  .feature-row.redact-sub::before {
     content: ""; position: absolute; top: 0; bottom: 0; width: 2px; background: var(--border);
   }
   .feature-row.beta-sub.dimmed,
   .feature-row.codemode-sub.dimmed,
   .feature-row.yaml-packages-sub.dimmed,
-  .feature-row.mandatory-bps-sub.dimmed { opacity: 0.38; }
+  .feature-row.mandatory-bps-sub.dimmed,
+  .feature-row.redact-sub.dimmed { opacity: 0.38; }
   .feature-row.beta-sub.dimmed input,
   .feature-row.codemode-sub.dimmed input,
   .feature-row.yaml-packages-sub.dimmed input,
-  .feature-row.mandatory-bps-sub.dimmed input { cursor: not-allowed; }
+  .feature-row.mandatory-bps-sub.dimmed input,
+  .feature-row.redact-sub.dimmed input { cursor: not-allowed; }
 
   /* Depth 1 — nested directly under a top-level toggle (beta-sub under the
-     master; strict-mode under the non-beta enable_mandatory_bps row). */
+     master; strict-mode under the non-beta enable_mandatory_bps row; extra
+     redacted app option keys under redact_secrets). */
   .feature-row.beta-sub,
-  .feature-row.mandatory-bps-sub { padding-left: 32px; }
+  .feature-row.mandatory-bps-sub,
+  .feature-row.redact-sub { padding-left: 32px; }
   .feature-row.beta-sub::before,
-  .feature-row.mandatory-bps-sub::before { left: 12px; }
+  .feature-row.mandatory-bps-sub::before,
+  .feature-row.redact-sub::before { left: 12px; }
 
   /* Depth 2 — nested under a beta-sub parent (yaml packages under
      enable_yaml_config_editing; code-mode numerics under enable_code_mode). */
@@ -538,6 +547,20 @@
   .feature-row.yaml-packages-sub { padding-left: 56px; }
   .feature-row.codemode-sub::before,
   .feature-row.yaml-packages-sub::before { left: 36px; }
+
+  .list-editor { flex-direction: column; align-items: stretch; }
+  .list-editor .feature-control { width: 100%; flex-direction: column; align-items: stretch; }
+  .list-editor textarea {
+    box-sizing: border-box; width: 100%; min-height: 6rem; resize: vertical;
+    padding: 8px; color: var(--text);
+    font: inherit; font-size: 0.875rem;
+  }
+  .list-editor textarea:disabled { cursor: not-allowed; }
+  .list-editor-actions {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px;
+  }
+  .list-editor-actions button { white-space: nowrap; }
+  .list-editor-actions .a11y-reset { height: 40px; }
 
   /* ── ADVANCED SETTINGS ───────────────────────────────────────────────── */
   .adv-section-title {
@@ -711,10 +734,17 @@
   #panel-tool-security-policies > h2 {
     font-size: 1.125rem; font-weight: 500; margin-bottom: 8px;
   }
-  .policy-rule-card {
+  .policy-rule-card, .policy-pending-card {
     background: var(--surface); border: var(--card-border); border-radius: 12px;
     padding: 14px 16px; margin: 8px 0;
   }
+  .policy-pending-card strong { font-size: 0.9375rem; font-weight: 500; }
+  .policy-pending-args {
+    white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg);
+    padding: 8px; margin: 6px 0; border-radius: 6px; font-size: 0.8rem;
+  }
+  .policy-pending-expires { font-size: 0.75rem; color: var(--text-secondary); }
+  .policy-pending-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .policy-rule-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .policy-rule-header strong { font-size: 0.9375rem; font-weight: 500; }
   .policy-rule-remove {
@@ -734,6 +764,22 @@
     cursor: pointer; font-size: 0.8rem; font-family: inherit; padding: 2px 4px;
   }
   .policy-predicate-row button:hover { text-decoration: underline; }
+  .policy-and-join,
+  .policy-or-join { color: var(--text-secondary); font-size: 0.75rem; font-weight: 500; }
+  .policy-predicate-form-hint { color: var(--text-secondary); font-size: 0.8rem; }
+  /* ha-alert warning look, sized to sit inside a condition row. */
+  .policy-condition-warning {
+    position: relative; flex-basis: 100%;
+    padding: 4px 10px 4px 32px; border-radius: 6px;
+    font-size: 0.78rem; line-height: 1.4; color: var(--text);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+  }
+  .policy-condition-warning::before {
+    content: ""; position: absolute; left: 8px; top: 5px; width: 16px; height: 16px;
+    background-color: var(--warning);
+    -webkit-mask: var(--icon-warning) no-repeat center / contain;
+    mask: var(--icon-warning) no-repeat center / contain;
+  }
   .policy-add-predicate {
     background: transparent; border: 1px dashed var(--border); color: var(--accent);
     padding: 6px 12px; border-radius: 4px; cursor: pointer;
@@ -896,6 +942,7 @@
   .adv-control input[type="number"],
   .adv-control select,
   .feature-control input[type="number"],
+  .list-editor textarea,
   .backup-field-control input[type="number"],
   .backup-filters input,
   .policy-predicate-form input,
@@ -913,6 +960,7 @@
   .adv-control input[type="number"]:hover,
   .adv-control select:hover,
   .feature-control input[type="number"]:hover,
+  .list-editor textarea:not(:disabled):hover,
   .backup-field-control input[type="number"]:hover,
   .backup-filters input:hover,
   .policy-predicate-form input:hover,
@@ -926,6 +974,7 @@
   .adv-control input[type="number"]:focus,
   .adv-control select:focus,
   .feature-control input[type="number"]:focus,
+  .list-editor textarea:focus,
   .backup-field-control input[type="number"]:focus,
   .backup-filters input:focus,
   .policy-predicate-form input:focus,

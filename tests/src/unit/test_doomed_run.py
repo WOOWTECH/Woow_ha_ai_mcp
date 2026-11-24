@@ -1,11 +1,20 @@
 """Unit tests for the e2e fail-fast ``DoomedRunDetector``.
 
-Covers the abort threshold, the reset-on-real-pass/fail semantics, and the
-rerun/skip exclusions — the branching the e2e hook relies on (which is otherwise
-only exercised incidentally on real e2e runs).
+Covers the abort threshold, reset-on-real-pass/fail semantics, rerun/skip
+exclusions, and retention of the original fixture failure when an xdist worker
+aborts while another worker is passing tests.
 """
 
+import re
+import textwrap
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
 from tests.src.doomed_run import DoomedRunDetector
+
+from ._pytest_subprocess import run_pytest
 
 
 def test_call_pass_resets_streak():
@@ -65,5 +74,117 @@ def test_skip_and_passing_setup_do_not_increment():
     assert d.streak == 0
 
 
-def test_default_threshold_is_50():
-    assert DoomedRunDetector().threshold == 50
+def test_xdist_abort_retains_first_shared_fixture_failure(tmp_path):
+    """A worker exit must not hide the exception that doomed that worker."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    # Register the actual E2E hook, without registering its HA/container fixtures.
+    (tmp_path / "conftest.py").write_text(
+        "from tests.src.doomed_run import pytest_runtest_logreport\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_broken.py").write_text(
+        textwrap.dedent(
+            """\
+            import time
+            from pathlib import Path
+            import pytest
+
+            @pytest.fixture(scope="session")
+            def broken_session():
+                deadline = time.monotonic() + 10
+                while not Path("healthy-started").exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("healthy worker did not start")
+                    time.sleep(0.01)
+                raise RuntimeError("ORIGINAL_" + "SESSION_SETUP_SENTINEL")
+
+            @pytest.mark.parametrize("case", range(55))
+            def test_broken_session(case, broken_session):
+                pass
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "test_healthy.py").write_text(
+        textwrap.dedent(
+            """\
+            import time
+            from pathlib import Path
+            import pytest
+
+            @pytest.mark.parametrize("case", range(100))
+            def test_healthy(case):
+                Path("healthy-started").touch()
+                time.sleep(0.01)
+            """
+        ),
+        encoding="utf-8",
+    )
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("", encoding="utf-8")
+    result = run_pytest(
+        tmp_path,
+        "-p",
+        "xdist.plugin",
+        "-n2",
+        "--dist=loadscope",
+        "-vv",
+        env={
+            "HAMCP_ENV_FILE": str(empty_env),
+            "HA_MCP_CONFIG_DIR": str(tmp_path / "config"),
+        },
+    )
+    output = result.stdout + result.stderr
+    (tmp_path / "subprocess.log").write_text(output, encoding="utf-8")
+    assert result.returncode != 0, output
+    assert re.search(r"\[gw\d+\].*PASSED test_healthy.py", output), output
+    assert re.search(r"\[gw\d+\].*ERROR test_broken.py", output), output
+    assert "50 errors" in output, output
+    assert "ORIGINAL_SESSION_SETUP_SENTINEL" in output, output
+    assert output.count("First setup failure on ") == 1, output
+
+
+@pytest.mark.parametrize("when", ["setup", "teardown"])
+def test_e2e_lanes_report_each_workers_first_fixture_failure_and_count_it(when):
+    """The hook every e2e lane registers reports the first fixture failure of
+    each worker, and each failure still counts toward aborting a doomed run."""
+    import importlib
+
+    from tests.src.e2e import _conftest_collection as e2e
+
+    doomed_run = importlib.reload(e2e.doomed_run)
+    terminal = Mock()
+    config = SimpleNamespace(pluginmanager=Mock())
+    config.pluginmanager.get_plugin.return_value = terminal
+
+    def report(worker, nodeid, longrepr):
+        return SimpleNamespace(
+            node=SimpleNamespace(config=config, gateway=SimpleNamespace(id=worker)),
+            when=when,
+            outcome="failed",
+            nodeid=nodeid,
+            longrepr=longrepr,
+        )
+
+    try:
+        e2e.pytest_runtest_logreport(report("gw0", "first_test", "original failure"))
+        e2e.pytest_runtest_logreport(report("gw0", "second_test", "repeated failure"))
+        e2e.pytest_runtest_logreport(
+            report("gw1", "other_test", "other worker failure")
+        )
+
+        assert terminal.write_sep.call_args_list == [
+            (("!", f"First {when} failure on gw0: first_test"),),
+            (("!", f"First {when} failure on gw1: other_test"),),
+        ]
+        assert terminal.write_line.call_args_list == [
+            (("original failure",),),
+            (("other worker failure",),),
+        ]
+        # The three reported failures count: the run is doomed at the threshold.
+        for n in range(doomed_run.DOOMED_RUN_ERROR_STREAK - 4):
+            e2e.pytest_runtest_logreport(report("gw0", f"more_{n}", "again"))
+        with pytest.raises(pytest.exit.Exception):
+            e2e.pytest_runtest_logreport(report("gw0", "last", "again"))
+    finally:
+        importlib.reload(doomed_run)

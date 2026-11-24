@@ -1,414 +1,581 @@
-"""Unit tests for the ``ha_mcp_tools`` capability gate (``component_api``).
+"""The ``ha_mcp_tools`` capability gate (``component_api``) on real Home Assistant Core.
 
-Covers the negotiation the server does before routing a read tool through the
-custom component: the single cached ``ha_mcp_tools/info`` probe, the
-cache-on-failure taxonomy, and the ``code``-based ``unknown_command`` detector.
-The WebSocket client is an ``AsyncMock`` whose ``send_command`` dispatches on
-the command type, mirroring the live component's info/search surface.
+The server's own client probes ``ha_mcp_tools/info`` on a real ``hass``: the
+component's commands answer it (``component_core_client``), or no component is
+installed (``core_client``) and Core answers ``unknown_command``. Another
+component version is the component's own constants changed; a Core restart is
+the pooled WebSocket connection closing or being replaced.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
-from unittest.mock import AsyncMock, patch
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 import pytest
+from freezegun.api import TickingDateTimeFactory
+from homeassistant.auth.const import GROUP_ID_ADMIN
+from homeassistant.components import websocket_api
+from homeassistant.core import HomeAssistant
+from homeassistant.core_config import Config
+from pytest_homeassistant.common import CLIENT_ID, MockUser
+from websockets.exceptions import ConnectionClosedError
 
+from custom_components.ha_mcp_tools import websocket_api as component_commands
+from custom_components.ha_mcp_tools.const import COMPONENT_VERSION
+from custom_components.ha_mcp_tools.websocket_api import system
+from custom_components.ha_mcp_tools.websocket_api.constants import (
+    CAPABILITIES,
+    LIMITS,
+    SCHEMA_VERSION,
+    WS_INFO,
+    WS_OVERVIEW,
+    WS_REGISTRY_FIELDS,
+)
+from ha_mcp.__main__ import OAuthProxyClient
+from ha_mcp._vendor.fastmcp.server.auth import AccessToken
+from ha_mcp._vendor.mcp.server.auth.middleware.auth_context import auth_context_var
+from ha_mcp._vendor.mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from ha_mcp.client.rest_client import (
+    HomeAssistantClient,
     HomeAssistantCommandError,
     HomeAssistantConnectionError,
 )
+from ha_mcp.client.websocket_client import websocket_manager
 from ha_mcp.tools import component_api
 from ha_mcp.tools.component_api import (
     SUPPORTED_SCHEMA_VERSION,
     ComponentCaps,
+    ComponentDiscoveryError,
+    ask_component,
+    component_probe_auth_kind,
     component_supports,
     get_component_caps,
     invalidate_caps,
-    is_unknown_command,
 )
 
-_INFO_OK = {
-    "schema_version": 1,
-    "component_version": "1.1.0",
-    "capabilities": ["search", "overview"],
-    "limits": {"max_results": 500},
-}
+from ._client_spies import sent_commands
+from ._command_faults import dropped_on, pooled_socket, received
+from ._component_frames import older_component
+
+# ``get_component_caps``: an inconclusive probe holds for 30 seconds, a
+# component found absent for five minutes.
+FAILURE_WINDOW_S = 30
+ABSENCE_WINDOW_S = 300
+# A capability the running component gains when it is upgraded.
+UPGRADED = "added_by_the_upgrade"
+# Core's freezer also freezes the event loop's clock; a ticking one keeps
+# the client's WebSocket handshake polling.
+TICKING = pytest.mark.freeze_time(tick=True)
 
 
-class _FakeClient:
-    """Weakref-able credentialed client stand-in (real REST client is a class)."""
-
-    def __init__(
-        self,
-        base_url: str = "http://ha.local:8123",
-        token: str = "tok",
-        verify_ssl: bool | None = None,
-    ):
-        self.base_url = base_url
-        self.token = token
-        self.verify_ssl = verify_ssl
+def _at(freezer: TickingDateTimeFactory, mark: datetime, seconds: float) -> None:
+    """Move the clock to ``seconds`` after ``mark``, a reading taken right after
+    the probe that opened the window, so setup time never counts against it."""
+    freezer.move_to(mark + timedelta(seconds=seconds))
 
 
-class _BareClient:
-    """Weakref-able client with no credentials (nothing to negotiate over)."""
+def _info_probes(spy: AsyncMock) -> int:
+    return sum(1 for call in spy.call_args_list if call.args[0] == WS_INFO)
 
 
-def _client() -> Any:
-    return _FakeClient()
+async def _restart_core(client: HomeAssistantClient) -> None:
+    """Core restarted: the pooled connection closed and the pool opened another."""
+    await websocket_manager.disconnect()
+    await pooled_socket(client)
 
 
-def _make_ws(
-    *,
-    info_result: dict[str, Any] | None = None,
-    info_exc: Exception | None = None,
-) -> AsyncMock:
-    ws = AsyncMock()
-
-    async def _send(command_type: str, **kwargs: Any) -> dict[str, Any]:
-        if command_type == "ha_mcp_tools/info":
-            if info_exc is not None:
-                raise info_exc
-            return {"success": True, "result": info_result}
-        raise AssertionError(f"unexpected command {command_type!r}")
-
-    ws.send_command = AsyncMock(side_effect=_send)
-    return ws
+def _component_not_set_up(hass: HomeAssistant, *commands: str) -> None:
+    """Core is up, but the component has not registered ``commands`` yet."""
+    for command in commands:
+        del hass.data[websocket_api.DOMAIN][command]
 
 
-def _patch_ws(ws: AsyncMock) -> Any:
-    return patch.object(
-        component_api, "get_websocket_client", AsyncMock(return_value=ws)
+async def test_the_component_info_is_what_routing_may_use(
+    component_core_client: HomeAssistantClient,
+) -> None:
+    """Routing goes through exactly the commands the running component lists."""
+    caps = await get_component_caps(component_core_client)
+
+    assert caps is not None
+    assert caps.capabilities == frozenset(CAPABILITIES)
+    assert caps.schema_version == SCHEMA_VERSION == SUPPORTED_SCHEMA_VERSION
+    assert caps.component_version == COMPONENT_VERSION
+    assert caps.limits == LIMITS
+    assert all(component_supports(caps, name) for name in CAPABILITIES)
+    assert not component_supports(caps, UPGRADED)
+    assert not component_supports(None, CAPABILITIES[0])
+
+
+async def test_a_client_without_tls_verification_probes_on_its_own_connection(
+    component_core_client: HomeAssistantClient,
+) -> None:
+    """A ``verify_ssl=False`` client that probed over a verifying connection
+    could never reach the component on an HTTPS install with its own
+    certificate."""
+    assert component_core_client.verify_ssl is False
+
+    assert await get_component_caps(component_core_client) is not None
+
+    assert (
+        websocket_manager.pooled_client(
+            url=component_core_client.base_url,
+            token=component_core_client.token,
+            verify_ssl=False,
+        )
+        is not None
     )
 
 
-@pytest.mark.asyncio
-async def test_info_probe_parses_capabilities() -> None:
-    ws = _make_ws(info_result=_INFO_OK)
-    with _patch_ws(ws):
-        caps = await get_component_caps(_client())
-
-    assert isinstance(caps, ComponentCaps)
-    assert caps.capabilities == frozenset({"search", "overview"})
-    assert caps.schema_version == 1
-    assert caps.component_version == "1.1.0"
-    assert caps.limits == {"max_results": 500}
-    # _INFO_OK carries no timezone (a component too old to report it): None.
-    assert caps.timezone is None
-
-
-@pytest.mark.asyncio
-async def test_info_probe_threads_verify_ssl() -> None:
-    """The caps probe threads the client's ``verify_ssl`` into
-    ``get_websocket_client`` so a ``verify_ssl=False`` client can establish (and key)
-    its own pooled connection — otherwise every component capability is silently
-    unreachable on an HTTPS + verify_ssl=False install."""
-    ws = _make_ws(info_result=_INFO_OK)
-    factory = AsyncMock(return_value=ws)
-    with patch.object(component_api, "get_websocket_client", factory):
-        caps = await get_component_caps(_FakeClient(verify_ssl=False))
-
-    assert isinstance(caps, ComponentCaps)
-    assert factory.await_args is not None
-    assert factory.await_args.kwargs.get("verify_ssl") is False
-
-
-@pytest.mark.asyncio
-async def test_info_probe_parses_timezone_present() -> None:
-    """An ``info`` payload carrying ``timezone`` (a newer component) is cached."""
-    ws = _make_ws(info_result={**_INFO_OK, "timezone": "Europe/London"})
-    with _patch_ws(ws):
-        caps = await get_component_caps(_client())
-
-    assert isinstance(caps, ComponentCaps)
-    assert caps.timezone == "Europe/London"
-
-
-@pytest.mark.asyncio
-async def test_info_probe_non_string_timezone_is_none() -> None:
-    """A non-string ``timezone`` (malformed / drift) is ignored (None)."""
-    ws = _make_ws(info_result={**_INFO_OK, "timezone": 123})
-    with _patch_ws(ws):
-        caps = await get_component_caps(_client())
-
-    assert caps.timezone is None
-
-
-@pytest.mark.asyncio
-async def test_caps_cached_one_probe_per_client() -> None:
-    ws = _make_ws(info_result=_INFO_OK)
-    client = _client()
-    with _patch_ws(ws):
-        first = await get_component_caps(client)
-        second = await get_component_caps(client)
+async def test_one_info_probe_serves_every_later_call(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    with received(hass, WS_INFO) as seen:
+        first = await get_component_caps(component_core_client)
+        second = await get_component_caps(component_core_client)
 
     assert first is second
-    info_calls = [
-        c for c in ws.send_command.call_args_list if c.args[0] == "ha_mcp_tools/info"
+    assert len(seen[WS_INFO]) == 1
+
+
+@pytest.mark.parametrize("absence", ["no_component", "unsupported_schema"])
+@TICKING
+async def test_an_absent_component_is_not_asked_again_for_five_minutes(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    absence: str,
+) -> None:
+    """A definitive absence keeps its five minutes past the failure window, and
+    strict callers fall back to Core's own commands meanwhile."""
+    if absence == "unsupported_schema":
+        component_commands.async_register_commands(hass)
+        monkeypatch.setattr(system, "SCHEMA_VERSION", SUPPORTED_SCHEMA_VERSION + 1)
+    socket = await pooled_socket(core_client)
+
+    with sent_commands(socket) as sent:
+        assert await get_component_caps(core_client) is None
+        probed = datetime.now(UTC)
+        _at(freezer, probed, FAILURE_WINDOW_S + 1)
+        assert await get_component_caps(core_client, strict=True) is None
+        _at(freezer, probed, ABSENCE_WINDOW_S - 1)
+        assert await get_component_caps(core_client) is None
+
+    assert _info_probes(sent) == 1
+
+
+@TICKING
+async def test_a_component_installed_after_the_probe_is_adopted_after_five_minutes(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+) -> None:
+    assert await get_component_caps(core_client) is None
+    probed = datetime.now(UTC)
+    component_commands.async_register_commands(hass)
+    _at(freezer, probed, ABSENCE_WINDOW_S + 1)
+
+    assert isinstance(await get_component_caps(core_client), ComponentCaps)
+
+
+async def test_an_unsupported_schema_version_is_logged_once(
+    component_core_client: HomeAssistantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(system, "SCHEMA_VERSION", SUPPORTED_SCHEMA_VERSION + 1)
+
+    with caplog.at_level(logging.WARNING, logger=component_api.__name__):
+        first = await get_component_caps(component_core_client)
+        second = await get_component_caps(component_core_client)
+
+    assert first is None
+    assert second is None
+    warnings = [
+        r.getMessage() for r in caplog.records if "schema_version" in r.getMessage()
     ]
-    assert len(info_calls) == 1
+    assert len(warnings) == 1
+    assert str(SUPPORTED_SCHEMA_VERSION + 1) in warnings[0]
+    assert str(SUPPORTED_SCHEMA_VERSION) in warnings[0]
 
 
-@pytest.mark.asyncio
-async def test_unknown_command_caches_none_and_does_not_reprobe() -> None:
-    ws = _make_ws(
-        info_exc=HomeAssistantCommandError("Command failed: x", "unknown_command")
-    )
-    client = _client()
-    with _patch_ws(ws):
-        first = await get_component_caps(client)
-        second = await get_component_caps(client)
+@TICKING
+async def test_a_probe_that_lost_its_connection_is_retried_after_30_seconds(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+) -> None:
+    """While Home Assistant is unreachable each call answers from the cache
+    instead of waiting on another connect (review-5 M8); once the window has
+    passed the component is found again."""
+    socket = await pooled_socket(component_core_client)
+    with dropped_on(hass, WS_INFO, socket):
+        assert await get_component_caps(component_core_client) is None
+    probed = datetime.now(UTC)
 
-    assert first is None
-    assert second is None
-    # Cached negative: the info command is probed exactly once.
-    assert ws.send_command.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_connection_error_caches_short_transient_negative(monkeypatch) -> None:
-    """A WS-down probe caches a SHORT transient negative: a repeat WITHIN the window
-    skips the (slow) re-connect and serves ``None`` from cache (review-5 M8)."""
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-    ws = _make_ws(info_exc=HomeAssistantConnectionError("WebSocket not authenticated"))
-    client = _client()
-    with _patch_ws(ws):
-        assert await get_component_caps(client) is None
-        # Still inside the short transient window: no re-probe.
-        clock[0] += component_api._TRANSIENT_NEGATIVE_CACHE_TTL_S - 1
-        assert await get_component_caps(client) is None
-    assert ws.send_command.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_expired_transient_negative_reprobes_and_adopts(monkeypatch) -> None:
-    """Past the short transient TTL the negative expires: the next call re-probes
-    and adopts a now-reachable component (self-healing)."""
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-
-    ws = AsyncMock()
-    probe_count = _clock(0.0)
-
-    async def _send(command_type: str, **kwargs: Any) -> dict[str, Any]:
-        assert command_type == "ha_mcp_tools/info"
-        probe_count[0] += 1
-        if probe_count[0] == 1:
-            raise HomeAssistantConnectionError("WebSocket not authenticated")
-        return {"success": True, "result": _INFO_OK}
-
-    ws.send_command = AsyncMock(side_effect=_send)
-    client = _client()
-    with _patch_ws(ws):
-        assert await get_component_caps(client) is None  # transient cached at t0
-        clock[0] += component_api._TRANSIENT_NEGATIVE_CACHE_TTL_S + 1  # expire it
-        caps = await get_component_caps(client)
-
-    assert isinstance(caps, ComponentCaps)
-    assert ws.send_command.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_establish_failure_caches_short_transient_negative(monkeypatch) -> None:
-    """The plain ``Exception`` ``get_websocket_client()`` raises when it can't build
-    the socket (review-5 M8's slow-connect case) also caches the short transient
-    negative, so a repeat within the window skips the connect attempt entirely."""
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-    client = _client()
-    factory = AsyncMock(
-        side_effect=HomeAssistantConnectionError(
-            "Failed to connect to Home Assistant WebSocket"
+    with received(hass, WS_INFO) as seen:
+        _at(freezer, probed, FAILURE_WINDOW_S - 1)
+        assert await get_component_caps(component_core_client) is None
+        assert not seen[WS_INFO]
+        _at(freezer, probed, FAILURE_WINDOW_S + 1)
+        assert isinstance(
+            await get_component_caps(component_core_client), ComponentCaps
         )
-    )
-    with patch.object(component_api, "get_websocket_client", factory):
-        assert await get_component_caps(client) is None
-        clock[0] += component_api._TRANSIENT_NEGATIVE_CACHE_TTL_S - 1
-        assert await get_component_caps(client) is None
-    # The connect attempt ran exactly once — the second call used the cache.
-    assert factory.await_count == 1
+
+    assert len(seen[WS_INFO]) == 1
 
 
-@pytest.mark.asyncio
-async def test_transient_negative_shorter_than_absent_negative(monkeypatch) -> None:
-    """A transport transient negative expires FAST while an absent-negative from the
-    same instant is still live — the two windows are independent."""
-    assert (
-        component_api._TRANSIENT_NEGATIVE_CACHE_TTL_S
-        < component_api._NEGATIVE_CACHE_TTL_S
-    )
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-    ws = _make_ws(info_exc=HomeAssistantConnectionError("ws down"))
-    client = _client()
-    with _patch_ws(ws):
-        assert await get_component_caps(client) is None
-        # Between the transient TTL and the absent TTL: the transient has expired,
-        # so this re-probes (unlike a definitive absent-negative, which would not).
-        clock[0] += component_api._TRANSIENT_NEGATIVE_CACHE_TTL_S + 1
-        assert await get_component_caps(client) is None
-    assert ws.send_command.await_count == 2
+async def test_invalidated_caps_are_probed_again(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    await get_component_caps(component_core_client)
+
+    with received(hass, WS_INFO) as seen:
+        invalidate_caps(component_core_client)
+        await get_component_caps(component_core_client)
+
+    assert len(seen[WS_INFO]) == 1
 
 
-@pytest.mark.asyncio
-async def test_no_credentials_returns_none_without_probing() -> None:
-    ws = _make_ws(info_result=_INFO_OK)
-    bare_client = _BareClient()  # no base_url / token
-    with _patch_ws(ws):
-        caps = await get_component_caps(bare_client)
-
-    assert caps is None
-    ws.send_command.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_malformed_info_result_caches_none() -> None:
-    ws = _make_ws(info_result=None)  # success but no result dict
-    client = _client()
-    with _patch_ws(ws):
-        first = await get_component_caps(client)
-        second = await get_component_caps(client)
-
-    assert first is None
-    assert second is None
-    # A responding-but-malformed component is a stable negative → probed once.
-    assert ws.send_command.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_invalidate_caps_forces_reprobe() -> None:
-    ws = _make_ws(info_result=_INFO_OK)
-    client = _client()
-    with _patch_ws(ws):
-        await get_component_caps(client)
-        invalidate_caps(client)
-        await get_component_caps(client)
-
-    assert ws.send_command.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_supported_schema_version_routes() -> None:
-    """A probe at the supported schema_version yields usable caps."""
-    info = {**_INFO_OK, "schema_version": SUPPORTED_SCHEMA_VERSION}
-    ws = _make_ws(info_result=info)
-    with _patch_ws(ws):
-        caps = await get_component_caps(_client())
-    assert isinstance(caps, ComponentCaps)
-    assert component_supports(caps, "search") is True
-
-
-@pytest.mark.asyncio
-async def test_unsupported_schema_version_caps_none_and_warns(caplog) -> None:
-    """A probe at an unsupported schema_version is a cached negative (logged once)."""
-    info = {**_INFO_OK, "schema_version": SUPPORTED_SCHEMA_VERSION + 1}
-    ws = _make_ws(info_result=info)
-    client = _client()
-    with _patch_ws(ws), caplog.at_level(logging.WARNING, logger=component_api.__name__):
-        first = await get_component_caps(client)
-        second = await get_component_caps(client)
-
-    assert first is None
-    assert second is None
-    # Negative is cached, so the probe (and the warning) happen exactly once.
-    assert ws.send_command.await_count == 1
-    schema_warnings = [r for r in caplog.records if "schema_version" in r.getMessage()]
-    assert len(schema_warnings) == 1
-    assert str(SUPPORTED_SCHEMA_VERSION + 1) in schema_warnings[0].getMessage()
-    assert str(SUPPORTED_SCHEMA_VERSION) in schema_warnings[0].getMessage()
-
-
-def _clock(start: float = 1000.0) -> list[float]:
-    """A one-element mutable clock; tests advance ``holder[0]`` in place."""
-    return [start]
-
-
-@pytest.mark.asyncio
-async def test_fresh_negative_does_not_reprobe(monkeypatch) -> None:
-    """A negative within the TTL window is honored without re-probing."""
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-    ws = _make_ws(
-        info_exc=HomeAssistantCommandError("Command failed: x", "unknown_command")
-    )
-    client = _client()
-    with _patch_ws(ws):
-        assert await get_component_caps(client) is None
-        clock[0] += component_api._NEGATIVE_CACHE_TTL_S - 1  # still inside window
-        assert await get_component_caps(client) is None
-    assert ws.send_command.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_expired_negative_reprobes_and_adopts(monkeypatch) -> None:
-    """Past the TTL the negative expires: the next call re-probes and can adopt."""
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-
-    ws = AsyncMock()
-    probe_count = _clock(0.0)
-
-    async def _send(command_type: str, **kwargs: Any) -> dict[str, Any]:
-        assert command_type == "ha_mcp_tools/info"
-        probe_count[0] += 1
-        if probe_count[0] == 1:
-            raise HomeAssistantCommandError("Command failed: x", "unknown_command")
-        return {"success": True, "result": _INFO_OK}
-
-    ws.send_command = AsyncMock(side_effect=_send)
-    client = _client()
-    with _patch_ws(ws):
-        assert await get_component_caps(client) is None  # negative cached at t0
-        clock[0] += component_api._NEGATIVE_CACHE_TTL_S + 1  # expire it
-        caps = await get_component_caps(client)
-
-    assert isinstance(caps, ComponentCaps)  # mid-session install adopted
-    assert ws.send_command.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_positive_unaffected_by_ttl(monkeypatch) -> None:
-    """A positive entry never expires on the negative TTL timer."""
-    clock = _clock()
-    monkeypatch.setattr(component_api, "_monotonic", lambda: clock[0])
-    ws = _make_ws(info_result=_INFO_OK)
-    client = _client()
-    with _patch_ws(ws):
-        first = await get_component_caps(client)
-        clock[0] += component_api._NEGATIVE_CACHE_TTL_S * 10  # far past any TTL
-        second = await get_component_caps(client)
+@TICKING
+async def test_working_caps_outlive_every_negative_window(
+    component_core_client: HomeAssistantClient, freezer: TickingDateTimeFactory
+) -> None:
+    first = await get_component_caps(component_core_client)
+    _at(freezer, datetime.now(UTC), ABSENCE_WINDOW_S * 10)
 
     assert isinstance(first, ComponentCaps)
-    assert first is second
-    assert ws.send_command.await_count == 1
+    assert await get_component_caps(component_core_client) is first
 
 
-def test_component_supports() -> None:
-    caps = ComponentCaps(
-        schema_version=1,
-        component_version="1.1.0",
-        capabilities=frozenset({"search"}),
-        limits={},
-    )
-    assert component_supports(caps, "search") is True
-    assert component_supports(caps, "overview") is False
-    assert component_supports(None, "search") is False
+async def test_a_component_upgraded_across_a_core_restart_is_adopted(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server outlives the restart that loaded the new component, and must
+    not keep routing on the old one's caps (#2967)."""
+    first = await get_component_caps(component_core_client)
+    monkeypatch.setattr(system, "CAPABILITIES", [*CAPABILITIES, UPGRADED])
+    await _restart_core(component_core_client)
+
+    with received(hass, WS_INFO) as seen:
+        second = await get_component_caps(component_core_client)
+        third = await get_component_caps(component_core_client)
+
+    assert not component_supports(first, UPGRADED)
+    assert component_supports(second, UPGRADED)
+    assert third is second
+    assert len(seen[WS_INFO]) == 1
 
 
-def test_is_unknown_command_keys_off_code_not_message() -> None:
-    # Structured code drives the decision.
-    assert is_unknown_command(
-        HomeAssistantCommandError("Command failed: nope", "unknown_command")
+async def test_caps_are_probed_again_once_their_connection_closed(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    """Core restarting closed the connection and the pool has not replaced it
+    yet: caps from the component that went away are not trusted."""
+    await get_component_caps(component_core_client)
+    await (await pooled_socket(component_core_client)).disconnect()
+
+    with received(hass, WS_INFO) as seen:
+        await get_component_caps(component_core_client)
+
+    assert len(seen[WS_INFO]) == 1
+
+
+async def test_a_reprobe_that_loses_its_connection_keeps_the_caps_that_worked(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Right after a Core restart the re-probe can fail before Core answers; a
+    cached failure would refuse strict callers once Core is back. The caps
+    that worked stay, and are probed again even when no connection is left to
+    compare them with."""
+    working = await get_component_caps(component_core_client)
+    await _restart_core(component_core_client)
+    with dropped_on(hass, WS_INFO, await pooled_socket(component_core_client)):
+        during = await get_component_caps(component_core_client, strict=True)
+    await websocket_manager.disconnect()
+    monkeypatch.setattr(system, "CAPABILITIES", [*CAPABILITIES, UPGRADED])
+
+    after = await get_component_caps(component_core_client, strict=True)
+
+    assert during is working
+    assert component_supports(after, UPGRADED)
+
+
+@TICKING
+async def test_a_component_still_starting_after_a_restart_is_found_within_30_seconds(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+) -> None:
+    """Core answers before the component has registered its commands; that
+    ``unknown_command`` must not hide the component for five minutes."""
+    await get_component_caps(component_core_client)
+    _component_not_set_up(hass, WS_INFO)
+    await _restart_core(component_core_client)
+    during = await get_component_caps(component_core_client)
+    probed = datetime.now(UTC)
+
+    component_commands.async_register_commands(hass)
+    _at(freezer, probed, FAILURE_WINDOW_S + 1)
+
+    assert during is None
+    assert isinstance(await get_component_caps(component_core_client), ComponentCaps)
+
+
+async def test_a_command_the_component_does_not_advertise_is_not_sent(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A component from before ``registry_fields`` is installed: the question
+    is answered with None and the component is sent nothing."""
+    older_component(monkeypatch, "registry_fields")
+
+    with received(hass, WS_REGISTRY_FIELDS) as seen:
+        reply = await ask_component(
+            component_core_client, "registry_fields", registry="label"
+        )
+
+    assert reply is None
+    assert not seen[WS_REGISTRY_FIELDS]
+
+
+@TICKING
+async def test_a_command_refused_while_starting_leaves_the_short_window(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+) -> None:
+    """A component command refused in the same restart gap drops the caps; the
+    probe that follows, still in the gap, gets the 30 seconds too."""
+    await get_component_caps(component_core_client)
+    _component_not_set_up(hass, WS_INFO, WS_OVERVIEW)
+
+    assert await ask_component(component_core_client, "overview") is None
+    assert await get_component_caps(component_core_client) is None
+    probed = datetime.now(UTC)
+
+    component_commands.async_register_commands(hass)
+    _at(freezer, probed, FAILURE_WINDOW_S + 1)
+    assert isinstance(await get_component_caps(component_core_client), ComponentCaps)
+
+
+@TICKING
+async def test_a_failed_reprobe_never_hands_a_malformed_snapshot_to_a_strict_caller(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+) -> None:
+    """Caps read from a malformed ``info`` are not caps that worked."""
+    socket = await pooled_socket(component_core_client)
+    with patch.object(system, "SCHEMA_VERSION", "1"):
+        assert await get_component_caps(component_core_client) is not None
+    _at(freezer, datetime.now(UTC), FAILURE_WINDOW_S + 1)
+
+    with (
+        dropped_on(hass, WS_INFO, socket),
+        pytest.raises(ComponentDiscoveryError),
+    ):
+        await get_component_caps(component_core_client, strict=True)
+
+
+@contextmanager
+def _signed_in(ha_token: str) -> Iterator[None]:
+    """An OAuth request of the user whose Home Assistant token is ``ha_token``."""
+    user = AuthenticatedUser(
+        AccessToken(
+            token="mcp-access-token",
+            client_id="mcp-client",
+            scopes=[],
+            claims={"ha_token": ha_token},
+        )
     )
-    # A message that merely mentions "unknown command" but carries no code does
-    # NOT match — routing must not key off the human-readable text.
-    assert not is_unknown_command(
-        HomeAssistantCommandError("Command failed: unknown command foo")
+    reset = auth_context_var.set(user)
+    try:
+        yield
+    finally:
+        auth_context_var.reset(reset)
+
+
+@pytest.fixture
+async def oauth_proxy(
+    core_client: HomeAssistantClient,
+) -> AsyncIterator[OAuthProxyClient]:
+    """The server's OAuth client: one object naming each request's own client."""
+    proxy = OAuthProxyClient(core_client.base_url)
+    try:
+        yield proxy
+    finally:
+        await proxy.close()
+
+
+async def test_each_oauth_user_is_probed_once_however_requests_alternate(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    oauth_proxy: OAuthProxyClient,
+    hass_access_token: str,
+    hass_owner_user: MockUser,
+) -> None:
+    owner = await hass.auth.async_create_refresh_token(hass_owner_user, CLIENT_ID)
+    tokens = [hass_access_token, hass.auth.async_create_access_token(owner)]
+
+    with received(hass, WS_INFO) as seen:
+        for token in [*tokens, *tokens, tokens[0]]:
+            with _signed_in(token):
+                assert isinstance(await get_component_caps(oauth_proxy), ComponentCaps)
+
+    assert len(seen[WS_INFO]) == 2
+
+
+async def test_a_non_admins_refused_probe_leaves_the_admins_caps(
+    component_core_client: HomeAssistantClient,
+    oauth_proxy: OAuthProxyClient,
+    hass_access_token: str,
+    hass_read_only_access_token: str,
+) -> None:
+    """``info`` is admin-only: a non-admin's refused probe must not fail the
+    administrator's strict reads for the failure window."""
+    with _signed_in(hass_access_token):
+        admin_caps = await get_component_caps(oauth_proxy, strict=True)
+    with (
+        _signed_in(hass_read_only_access_token),
+        pytest.raises(ComponentDiscoveryError),
+    ):
+        await get_component_caps(oauth_proxy, strict=True)
+
+    with _signed_in(hass_access_token):
+        assert await get_component_caps(oauth_proxy, strict=True) is admin_caps
+        assert component_probe_auth_kind(oauth_proxy) is None
+
+
+@asynccontextmanager
+async def _failing_info(
+    failure: str, hass: HomeAssistant, client: HomeAssistantClient
+) -> AsyncIterator[type[BaseException] | None]:
+    """``info`` fails as ``failure`` meanwhile; yields the error the probe meets."""
+    socket = await pooled_socket(client)
+    if failure == "connection":
+        with dropped_on(hass, WS_INFO, socket):
+            yield HomeAssistantConnectionError
+    elif failure == "command":
+        # The component's handler fails, and Core answers with an error.
+        with patch.object(
+            Config,
+            "time_zone",
+            new_callable=PropertyMock,
+            create=True,
+            side_effect=RuntimeError("core drift"),
+        ):
+            yield HomeAssistantCommandError
+    elif failure == "unexpected":
+        # A close seen while sending is re-raised as it is, not as Home
+        # Assistant's error.
+        with patch.object(
+            socket,
+            "send_command",
+            AsyncMock(side_effect=ConnectionClosedError(None, None)),
+        ):
+            yield ConnectionClosedError
+    elif failure == "malformed":
+        with patch.object(system, "SCHEMA_VERSION", "one"):
+            yield None
+    else:
+        with patch.object(system, "CAPABILITIES", [*CAPABILITIES, 17]):
+            yield None
+
+
+@pytest.mark.parametrize(
+    "failure", ["connection", "command", "unexpected", "malformed", "malformed_caps"]
+)
+@TICKING
+async def test_failed_discovery_refuses_strict_callers_for_30_seconds(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    freezer: TickingDateTimeFactory,
+    failure: str,
+) -> None:
+    """A strict caller (a write) must not take a failed probe for an absent
+    component, while reads keep what they can use; the failure then clears."""
+    client = component_core_client
+    async with _failing_info(failure, hass, client) as error:
+        with pytest.raises(ComponentDiscoveryError) as fresh:
+            await get_component_caps(client, strict=True)
+        probed = datetime.now(UTC)
+        # The strict caller whose own probe failed gets that error.
+        cause = fresh.value.__cause__
+        assert (cause is None) if error is None else isinstance(cause, error)
+        first_read = await get_component_caps(client)
+        assert component_supports(first_read, "search") is (failure == "malformed_caps")
+        with pytest.raises(ComponentDiscoveryError) as cached:
+            await get_component_caps(client, strict=True)
+        # A failure read back from the cache carries only its text.
+        assert cached.value.__cause__ is None
+        assert component_probe_auth_kind(client) is None
+
+    _at(freezer, probed, FAILURE_WINDOW_S - 1)
+    assert await get_component_caps(client) is first_read
+    with pytest.raises(ComponentDiscoveryError):
+        await get_component_caps(client, strict=True)
+    _at(freezer, probed, FAILURE_WINDOW_S + 1)
+    assert component_supports(await get_component_caps(client, strict=True), "search")
+
+
+async def test_a_component_without_a_command_lets_strict_callers_fall_back(
+    component_core_client: HomeAssistantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A component that predates ``dashboard_edit`` answered: the write uses
+    Core's own commands instead of being refused."""
+    assert "dashboard_edit" in CAPABILITIES
+    older = [name for name in CAPABILITIES if name != "dashboard_edit"]
+    monkeypatch.setattr(system, "CAPABILITIES", older)
+
+    caps = await get_component_caps(component_core_client, strict=True)
+
+    assert caps is not None
+    assert not component_supports(caps, "dashboard_edit")
+
+
+@TICKING
+async def test_a_refused_probe_is_a_permission_refusal_until_one_succeeds(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    read_only_client: HomeAssistantClient,
+    hass_read_only_user: MockUser,
+    freezer: TickingDateTimeFactory,
+) -> None:
+    """A fire tool stops before sending with a token Core refused; the mark
+    goes once the user may use the component."""
+    assert await get_component_caps(read_only_client) is None
+    probed = datetime.now(UTC)
+    assert component_probe_auth_kind(read_only_client) == "permission"
+
+    await hass.auth.async_update_user(hass_read_only_user, group_ids=[GROUP_ID_ADMIN])
+    _at(freezer, probed, FAILURE_WINDOW_S + 1)
+
+    assert await get_component_caps(read_only_client) is not None
+    assert component_probe_auth_kind(read_only_client) is None
+
+
+# Core closes a socket whose token it refused; the client's close reply then
+# re-arms aiohttp's heartbeat timer on that closed server socket, which nothing
+# cancels.
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_a_rejected_token_is_marked_as_a_token_rejection(
+    core_client: HomeAssistantClient,
+) -> None:
+    client = HomeAssistantClient(
+        base_url=core_client.base_url, token="not-a-token", verify_ssl=False
     )
-    # Some other structured code does not match either.
-    assert not is_unknown_command(
-        HomeAssistantCommandError("Command failed: bad", "invalid_format")
-    )
-    assert not is_unknown_command(ValueError("boom"))
+    try:
+        assert await get_component_caps(client) is None
+        assert component_probe_auth_kind(client) == "token"
+    finally:
+        await client.close()

@@ -15,12 +15,14 @@ families and ``__init__`` can depend on it without cycles.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NamedTuple, NotRequired, TypedDict
 
+from ..server_tool_text import SKILL_TOOL_NAME
 from ..transforms import categorize_capability
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from ha_mcp._vendor.fastmcp import FastMCP
 
     from ..config import Settings
     from ..server import HomeAssistantSmartMCPServer
@@ -36,8 +38,10 @@ class ToolStub(TypedDict):
     runtime (``TRANSFORM_GENERATED_TOOLS``), or it's feature-gated and
     only registers when a setting is on (``FEATURE_GATED_TOOLS``). The
     consumer (`_get_tool_metadata`) renders the same shape for both;
-    ``disabled_by`` is the only field that differs and signals UI
-    placement of the "Beta — set X" hint.
+    ``disabled_by`` is the only field that differs and names the setting
+    that turns the tool on. Whether that setting is a beta flag decides
+    which "how to enable this" hint the UI shows (see ``gate_is_beta``) —
+    most gated tools are beta, ``ha_manage_security_policy`` is not.
     """
 
     title: str
@@ -50,10 +54,37 @@ class ToolStub(TypedDict):
 
 _VALID_STATES = frozenset({"enabled", "disabled", "pinned"})
 
+# Groups not considered "primary" when choosing a tool's canonical group —
+# these are cross-cutting tags (e.g. Z-Wave, Zigbee) that should not
+# override the tool's real domain group.
+SECONDARY_TAGS = frozenset({"Z-Wave", "Zigbee"})
+
+
+def primary_tag(tags: Iterable[str]) -> str:
+    """Return the group heading the settings UI files a tool under.
+
+    The first tag that is not cross-cutting wins, in sorted order; a tool
+    tagged only with cross-cutting tags falls back to its first tag, and an
+    untagged tool to ``Other``. Exported so the locale check in
+    tests/src/unit/test_locale_parity.py derives the set of reachable group
+    names from this rule itself — a copy of the rule drifts even when the
+    set it reads cannot.
+    """
+    ordered = sorted(tags)
+    primary = [tag for tag in ordered if tag not in SECONDARY_TAGS]
+    if primary:
+        return primary[0]
+    return ordered[0] if ordered else "Other"
+
+
 # Tools that are always enabled regardless of saved config — the server
-# strips them out of any disable list before applying. Four of these
-# overlap with DEFAULT_PINNED_TOOLS in transforms/categorized_search.py
-# (ha_search, ha_get_overview, ha_report_issue, ha_manage_backup);
+# strips them out of any disable list before applying. The settings UI
+# additionally locks the pin toggle for mandatory tools, so the four
+# that overlap with DEFAULT_PINNED_TOOLS in
+# transforms/categorized_search.py
+# (ha_search, ha_get_overview, ha_report_issue, ha_manage_backup)
+# cannot be unpinned either — always pinned, not just always enabled
+# (#2058);
 # ha_get_state is mandatory but not pinned-by-default because it is
 # reachable via the ha_call_read_tool proxy when tool search is on.
 # ha_get_skill_guide is conditionally mandatory via BPS_MANDATORY_TOOLS
@@ -77,7 +108,7 @@ MANDATORY_TOOLS: set[str] = {
 # exclusively through ha_get_skill_guide, so disabling the tool in strict
 # mode would permanently lock out every gated write. Regular
 # (non-strict) mandatory BPS does NOT need the tool: it attaches skill
-# content server-side straight from the skills-vendor (util_helpers.
+# content server-side straight from the skills-vendor (config_write_helpers.
 # build_skill_content), so users who consume the skills through a local
 # install (``npx skills add homeassistant-ai/skills``) may disable the
 # tool whenever strict mode is off. Enforced in three places: here at
@@ -86,7 +117,7 @@ MANDATORY_TOOLS: set[str] = {
 # _save_feature_flags) so each direction of the conflict gets an
 # actionable error.
 BPS_MANDATORY_TOOLS: set[str] = {
-    "ha_get_skill_guide",
+    SKILL_TOOL_NAME,
 }
 
 
@@ -106,6 +137,39 @@ def effective_mandatory_tools(settings: Settings) -> set[str]:
     ):
         return MANDATORY_TOOLS | BPS_MANDATORY_TOOLS
     return set(MANDATORY_TOOLS)
+
+
+def ignored_disabled_tools(config: dict[str, Any], settings: Settings) -> list[str]:
+    """Return mandatory tools whose requested disable state is ignored."""
+    mandatory = effective_mandatory_tools(settings)
+    return sorted(
+        name
+        for name, state in config.get("tools", {}).items()
+        if state == "disabled" and name in mandatory
+    )
+
+
+def mandatory_disable_warning(name: str) -> str:
+    """Explain the ignored request, including the strict BPS dependency."""
+    warning = (
+        f"Ignoring disabled_tools entry '{name}': "
+        "this tool is mandatory and remains enabled."
+    )
+    if name in BPS_MANDATORY_TOOLS:
+        warning += (
+            " Strict best-practices mode (enable_strict_mandatory_bps) is on "
+            "and publishes its acknowledgment key only through it. "
+            "Turn strict mode off first to disable the tool."
+        )
+    return warning
+
+
+def tool_config_warnings(config: dict[str, Any], settings: Settings) -> list[str]:
+    """Share mandatory disable warnings across startup, settings, and reports."""
+    return [
+        mandatory_disable_warning(name)
+        for name in ignored_disabled_tools(config, settings)
+    ]
 
 
 # Tools created by FastMCP transforms (not registered through
@@ -174,7 +238,35 @@ FEATURE_GATED_TOOLS: dict[str, ToolStub] = {
         "disabled_by": "enable_filesystem_tools",
         "destructiveHint": True,
     },
+    # The one NON-beta gated tool (#2148): its toggle lives on the Tool
+    # Security Policies tab, not in the dev add-on's beta options. The row
+    # has to exist while the flag is off so a gate rule can be authored
+    # BEFORE the tool is registered — otherwise the first enable+restart
+    # exposes it ungated.
+    "ha_manage_security_policy": {
+        "title": "Manage Security Policy",
+        "primary_tag": "System",
+        "description": (
+            "Read and rewrite the tool security policy that gates "
+            "high-stakes tool calls behind user approval."
+        ),
+        "disabled_by": "enable_security_policy_tool",
+        "destructiveHint": True,
+    },
 }
+
+
+def gate_is_beta(disabled_by: str) -> bool:
+    """Whether a ``disabled_by`` gate names a beta feature flag.
+
+    Feature-gated used to mean beta by definition; ``enable_security_policy_tool``
+    (#2148) broke that, and the two classes need different UI copy (dev
+    add-on / docs/beta.md vs the Tool Security Policies tab) and different
+    LLM-API exposure defaults.
+    """
+    from ..config import BETA_FEATURE_FIELDS
+
+    return disabled_by in BETA_FEATURE_FIELDS
 
 
 def _capability_fields(
@@ -206,8 +298,8 @@ def _render_stub(name: str, meta: ToolStub) -> dict[str, Any]:
 
     Both transform-generated and feature-gated stubs share the same UI
     representation; the only meaningful difference is whether
-    ``disabled_by`` carries the safety-toggle name (which the JS
-    template renders as a "Beta — set X" hint).
+    ``disabled_by`` carries the safety-toggle name (which the JS template
+    renders as an "enable it here" hint, worded per ``disabled_by_beta``).
     """
     rendered: dict[str, Any] = {
         "name": name,
@@ -223,6 +315,9 @@ def _render_stub(name: str, meta: ToolStub) -> dict[str, Any]:
     }
     if "disabled_by" in meta:
         rendered["disabled_by"] = meta["disabled_by"]
+        # Tells the UI which "how to enable this" hint to render: the beta
+        # one (dev add-on config / docs/beta.md) or the plain one.
+        rendered["disabled_by_beta"] = gate_is_beta(meta["disabled_by"])
     return rendered
 
 
@@ -239,22 +334,13 @@ async def _get_tool_metadata(
     list as of v3.2.0.
     """
     tools: list[dict[str, Any]] = []
-    # Groups not considered "primary" when choosing a tool's canonical group —
-    # these are cross-cutting tags (e.g. Z-Wave, Zigbee) that should not
-    # override the tool's real domain group.
-    secondary_tags = {"Z-Wave", "Zigbee"}
 
     registered = await server.mcp.local_provider._list_tools()
     for tool in registered:
         tags = sorted(tool.tags) if tool.tags else []
-        primary_tags = [t for t in tags if t not in secondary_tags]
-        primary = primary_tags[0] if primary_tags else (tags[0] if tags else "Other")
-        read_only = bool(
-            tool.annotations and getattr(tool.annotations, "readOnlyHint", None)
-        )
-        destructive = bool(
-            tool.annotations and getattr(tool.annotations, "destructiveHint", None)
-        )
+        primary = primary_tag(tags)
+        read_only = bool(tool.annotations and tool.annotations.read_only_hint)
+        destructive = bool(tool.annotations and tool.annotations.destructive_hint)
         title = getattr(tool, "title", None) or tool.name
         if tool.annotations and getattr(tool.annotations, "title", None):
             title = tool.annotations.title
@@ -348,19 +434,8 @@ def apply_tool_visibility(
         disabled_names.add("ha_config_set_yaml")
 
     mandatory = effective_mandatory_tools(settings)
-    stripped_bps = disabled_names & mandatory & BPS_MANDATORY_TOOLS
-    if stripped_bps:
-        # The save handlers reject this combination, but env seeds and
-        # hand-edited tool_config.json bypass them — keep the tool on and
-        # say why, rather than silently locking out every strict-gated
-        # write (the acknowledgment key is published only through it).
-        logger.warning(
-            "Keeping %s enabled despite a disable entry: strict "
-            "best-practices mode (enable_strict_mandatory_bps) is on and "
-            "publishes its acknowledgment key only through it. Turn "
-            "strict mode off first to disable the tool.",
-            ", ".join(sorted(stripped_bps)),
-        )
+    for warning in tool_config_warnings(config, settings):
+        logger.warning("%s", warning)
     disabled_names -= mandatory
 
     if disabled_names:

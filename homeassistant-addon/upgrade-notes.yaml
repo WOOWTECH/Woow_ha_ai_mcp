@@ -1,0 +1,10 @@
+# Declared breaking changes of ha_mcp (Store upgrade comparison, pipeline #91; format: Store .addon-sync/addon_sync.py).
+# mirror-sync copies this file into homeassistant-addon/ on every rebuild.
+"9.2.0":
+  breaking:
+    - change: option-removed
+      key: backup_hint
+      migration: >-
+        Nothing to do. Upstream removed the backup_hint option (ha-mcp 6cca0322, #2822); Supervisor skips the
+        stored value with a warning in the add-on log, and ha_manage_backup always gives the former default
+        (normal) backup guidance.

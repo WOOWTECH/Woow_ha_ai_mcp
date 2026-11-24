@@ -10,10 +10,15 @@ real MCP protocol over ``POST /api/webhook/<id>`` — ``initialize`` → ``tools
 full tool inventory is present.
 
 Also proves the conversation-agent LLM API (#1745) for real: the bring-up
-registered it inside HA (log assertion), and the exact client stack
-``llm_api.py`` uses — mcp SDK streamable-HTTP session + ``convert_to_voluptuous``
-— works against the real server and the REAL tool-schema catalog with zero
-conversion failures.
+registered it inside HA (log assertion), and the transport half of the client
+stack ``llm_api.py`` uses — mcp SDK streamable-HTTP session, ``initialize``
+instructions, the full ``tools/list`` catalog, one read-only call, and the
+per-tool exposure stamps — works against the real server. The CONVERSION half
+is not provable from here: this process runs the test host's schema library,
+not the one Home Assistant resolved, and Core re-emits every converted schema
+before a conversation turn sees it. That proof lives in
+``test_llm_api_in_ha.py``, which runs the component's own client path inside
+Home Assistant's interpreter (#2361).
 
 This uses a DEDICATED, module-scoped container (not the shared session one): the
 always-on server would otherwise runtime-install the whole fastmcp tree and run a
@@ -49,7 +54,10 @@ import pytest
 import requests
 from test_constants import HA_TEST_IMAGE, TEST_TOKEN
 
+from ha_mcp.hacs_auto_refresh import MARKER_FILENAME_PREFIX
+
 from ...utilities.streamable_http import parse_mcp_response
+from ...utilities.wait_helpers import wait_for_condition
 
 # ``not_on_embedded``: this test boots its OWN dedicated in-process MCP server container to
 # prove the install method end to end. The embedded backend (E2E_BACKEND=embedded)
@@ -73,6 +81,12 @@ _ENTRY_ID = "e2e_test_ha_mcp_server_entry"
 _WEBHOOK_ID = "mcp_e2e_ha_mcp_server_0123456789abcdef"
 _SECRET_PATH = "/private_e2e_ha_mcp_server_secret"
 _SERVER_PORT = 9584
+# Where the in-process server keeps its data dir: the component points
+# HA_MCP_CONFIG_DIR at ``hass.config.path(SERVER_CONFIG_SUBDIR)``, so it lands
+# under the bind-mounted /config and is readable from the host. Duplicated from
+# custom_components/ha_mcp_tools/const.py (SERVER_CONFIG_SUBDIR), same as
+# _conftest_embedded's _EMBEDDED_SERVER_CONFIG_SUBDIR.
+_SERVER_CONFIG_SUBDIR = ".ha_mcp"
 
 # The whole fastmcp dependency tree is runtime-installed on first bring-up.
 _READY_TIMEOUT_S = 600
@@ -82,6 +96,40 @@ _REPO_ROOT = Path(__file__).resolve().parents[5]
 _INITIAL_STATE = _REPO_ROOT / "tests" / "initial_test_state"
 _INTEGRATION_SRC = _REPO_ROOT / "custom_components" / "ha_mcp_tools"
 
+# Run INSIDE the live HA container (a separate ``python3`` process, so HA itself
+# is never touched) to prove _safe_invalidate_caches() recovers from the
+# Python-3.14 setuptools editable-finder KeyError (#1891/#1985) on the REAL
+# component code + container interpreter. The crash needs a stale editable
+# placeholder the container does not have, so we inject a meta-path finder that raises the
+# exact KeyError while the stale placeholder is cached (what CPython 3.14's
+# PathFinder `del` trips on). With the fix, the helper prunes the placeholder and
+# the retry succeeds; revert the fix and the KeyError propagates → exit != 0.
+_INVALIDATE_RECOVERY_PROBE = """
+import sys
+sys.path.insert(0, "/config")
+from custom_components.ha_mcp_tools.embedded_server import _safe_invalidate_caches
+
+PLACEHOLDER = "__editable__.homeassistant-2026.7.2.finder.__path_hook__"
+
+
+class _EditableFinderKeyErrorSim:
+    def find_spec(self, fullname, path=None, target=None):
+        return None
+
+    def invalidate_caches(self):
+        if PLACEHOLDER in sys.path_importer_cache:
+            raise KeyError(PLACEHOLDER)
+
+
+sys.path_importer_cache[PLACEHOLDER] = None
+sys.meta_path.insert(0, _EditableFinderKeyErrorSim())
+
+_safe_invalidate_caches()
+
+assert PLACEHOLDER not in sys.path_importer_cache, "stale placeholder not pruned"
+print("RECOVERY_OK")
+"""
+
 
 def _docker_available() -> bool:
     try:
@@ -89,7 +137,7 @@ def _docker_available() -> bool:
 
         docker_sdk.from_env().ping()
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -101,7 +149,7 @@ def _build_wheel(dest_dir: Path) -> Path:
     wheel`` exits non-zero — which used to make this test green-by-SKIP on every CI
     run (its wheel path never actually executed). ``uv`` is always on PATH (setup-uv)
     and builds in an isolated env without needing pip in the venv, matching
-    conftest._build_embedded_server_wheel.
+    _conftest_embedded._build_embedded_server_wheel.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -135,12 +183,15 @@ def _seed_config(config_path: Path, wheel_name: str) -> None:
                 "entry_type": "server",
                 "webhook_id": _WEBHOOK_ID,
                 "secret_path": _SECRET_PATH,
+                # The component no longer provisions an administrator (#2427).
+                "admin_token": TEST_TOKEN,
             },
             "disabled_by": None,
             "discovery_keys": {},
             "domain": _DOMAIN,
             "entry_id": _ENTRY_ID,
-            "minor_version": 1,
+            # 2: past the one-time migration that clears pip_spec.
+            "minor_version": 2,
             "modified_at": "2025-09-07T23:56:28.040747+00:00",
             "options": {
                 # file:// wheel + PyPI-resolved deps under HA's constraints file.
@@ -160,19 +211,9 @@ def _seed_config(config_path: Path, wheel_name: str) -> None:
     )
     storage_file.write_text(json.dumps(data, indent=2))
 
-    # The seeded configuration.yaml carries no `logger:` block and this HA
-    # writes only WARNING+ to home-assistant.log (CI-observed), while the
-    # LLM-API registration proof asserts on the component's INFO success
-    # line. Raise just this component's logger, in this container's private
-    # copy of the config dir only.
-    config_yaml = config_path / "configuration.yaml"
-    config_yaml.write_text(
-        config_yaml.read_text(encoding="utf-8")
-        + "\n# e2e: surface the component's INFO lines"
-        " (test_llm_api_registered_inside_ha).\n"
-        "logger:\n  logs:\n    custom_components.ha_mcp_tools: info\n",
-        encoding="utf-8",
-    )
+    # The seeded configuration.yaml already raises custom_components.ha_mcp_tools
+    # to INFO (tests/initial_test_state/configuration.yaml), so the component's
+    # success lines reach home-assistant.log here without a second logger: block.
 
     # HA runs as uid 0 in the test image but the bind mount must be traversable.
     for path in config_path.rglob("*"):
@@ -258,10 +299,12 @@ def _initialize(base_url: str) -> tuple[bool, str | None]:
 def embedded_ha():
     """Boot a dedicated HA container running the in-process MCP server entry.
 
-    Yields ``(base_url, session_id, config_path)`` once the in-process MCP
-    server has installed itself, started, and registered its ingress webhook.
+    Yields ``(base_url, session_id, config_path, container)`` once the in-process
+    MCP server has installed itself, started, and registered its ingress webhook.
     ``config_path`` is the bind-mounted /config dir — the LLM-API test reads
     ``home-assistant.log`` from it to prove the registration ran inside HA.
+    ``container`` is the testcontainers handle — the invalidate-caches recovery
+    test ``exec_run``s an in-container probe through it.
     """
     if not _docker_available():
         pytest.skip("Docker is not available for the embedded-server e2e")
@@ -320,7 +363,7 @@ def embedded_ha():
                 "in-process MCP server did not become reachable via its webhook within "
                 f"{_READY_TIMEOUT_S}s. Container logs:\n{logs}"
             )
-        yield base_url, session_id, config_path
+        yield base_url, session_id, config_path, container
     finally:
         with contextlib.suppress(Exception):
             container.stop()
@@ -328,7 +371,7 @@ def embedded_ha():
 
 class TestEmbeddedServerEndToEnd:
     def test_initialize_and_list_tools(self, embedded_ha):
-        base_url, session_id, _config = embedded_ha
+        base_url, session_id, _config, _container = embedded_ha
         resp = _mcp_post(
             base_url,
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
@@ -345,7 +388,7 @@ class TestEmbeddedServerEndToEnd:
         assert "ha_get_state" in names
 
     def test_read_only_tool_call(self, embedded_ha):
-        base_url, session_id, _config = embedded_ha
+        base_url, session_id, _config, _container = embedded_ha
         resp = _mcp_post(
             base_url,
             {
@@ -365,6 +408,40 @@ class TestEmbeddedServerEndToEnd:
         # The tool ran against the real HA instance and returned content.
         assert parsed["result"].get("content"), parsed
 
+    def test_invalidate_caches_recovers_from_editable_finder_keyerror(
+        self, embedded_ha
+    ):
+        """_safe_invalidate_caches() recovers from the 3.14 editable-finder
+        KeyError on the REAL component code + container interpreter (#1891/#1985).
+
+        The reaching-ready ``embedded_ha`` fixture already proves the happy path
+        (bring-up runs ``installed_ha_mcp_version`` → ``_safe_invalidate_caches``
+        without crashing). This drives the FAILURE path: a ``python3`` process in
+        the same container injects the exact KeyError and asserts the helper
+        prunes the stale entry and the retry completes. Reverting the fix makes
+        the probe exit non-zero.
+
+        NOTE (skip-ceiling coupling): like its siblings this module is
+        ``container_only`` + ``not_on_embedded`` (see the file-level
+        ``pytestmark``), so this test is SKIPPED on the haos, haos_inaddon,
+        haos_embedded, and embedded lanes and RUNS only on the container lane.
+        Each such skip counts toward ``SKIP_CEILING_PER_LANE`` in
+        tests/src/e2e/basic/test_backend_dispatch_smoke.py — adding this test
+        tripped ``test_session_skipped_count_below_ceiling`` until those four
+        ceilings were bumped by 1. Any future marker-gated test added here will
+        trip that guard the same way until its ceilings are bumped.
+        """
+        _base_url, _session_id, _config, container = embedded_ha
+        result = container.get_wrapped_container().exec_run(
+            ["python3", "-c", _INVALIDATE_RECOVERY_PROBE]
+        )
+        output = (result.output or b"").decode("utf-8", "replace")
+        assert result.exit_code == 0, (
+            "in-container _safe_invalidate_caches() did not recover from the "
+            f"injected editable-finder KeyError (exit {result.exit_code}):\n{output}"
+        )
+        assert "RECOVERY_OK" in output, output
+
     def test_llm_api_registered_inside_ha(self, embedded_ha):
         """The bring-up registered the toolset as an LLM API in the REAL HA.
 
@@ -376,7 +453,7 @@ class TestEmbeddedServerEndToEnd:
         (registration runs right after webhook bring-up and imports the mcp
         SDK on the executor first), so the log is polled briefly.
         """
-        _base_url, _session_id, config_path = embedded_ha
+        _base_url, _session_id, config_path, _container = embedded_ha
         log_file = config_path / "home-assistant.log"
         needle = "Registered the HA-MCP toolset as LLM API"
         deadline = time.monotonic() + 60
@@ -397,23 +474,30 @@ class TestEmbeddedServerEndToEnd:
 
         ``llm_api.py`` cannot be imported here (its module-level
         ``homeassistant.*`` imports need a running HA), so this makes the
-        exact same calls it makes, with the real SDK, against the real
+        same call sequence it makes, with the real SDK, against the real
         server: streamable-HTTP session -> ``initialize`` (whose
-        ``instructions`` become the API prompt) -> ``tools/list`` ->
-        ``convert_to_voluptuous`` on EVERY tool's schema -> one read-only
-        ``call_tool`` dumped the way ``HaMcpTool.async_call`` returns it.
+        ``instructions`` become the API prompt) -> ``tools/list`` -> one
+        read-only ``call_tool`` dumped the way ``HaMcpTool.async_call``
+        returns it, plus the per-tool exposure stamps the component filters
+        on. The transport is NOT the same: this drives the webhook relay URL
+        and lets the SDK build its own default httpx client, whereas
+        ``mcp_session`` targets the loopback URL with a dedicated client
+        (explicit generous timeout, ``verify=False``, ``trust_env=False``).
 
-        The zero-conversion-failures assertion is the point: at runtime an
-        unconvertible schema is skipped per-tool with only a warning, so a
-        systemic ``voluptuous_openapi`` incompatibility with the real
-        catalog would silently shrink the toolset — this test fails loudly
-        instead.
+        Schema conversion is deliberately NOT asserted here. Converting in
+        this process runs the TEST HOST's library, which since Core 2026.9 is
+        not even the one Home Assistant resolves (``probatio.from_openapi``),
+        and it never performs the re-emission Core applies before a
+        conversation turn — so a green run here says nothing about whether
+        the toolset converts inside HA. ``test_llm_api_in_ha.py`` runs the
+        component's own conversion path in Home Assistant's own interpreter
+        and owns that proof (#2361).
         """
+        # The SHARED SDK, as llm_api.py uses — not ha-mcp's vendored copy.
         from mcp.client.session import ClientSession
         from mcp.client.streamable_http import streamable_http_client
-        from voluptuous_openapi import convert_to_voluptuous
 
-        base_url, _session_id, _config = embedded_ha
+        base_url, _session_id, _config, _container = embedded_ha
         url = f"{base_url}/api/webhook/{_WEBHOOK_ID}"
 
         async with asyncio.timeout(120):
@@ -429,19 +513,6 @@ class TestEmbeddedServerEndToEnd:
                 listed = await session.list_tools()
                 assert len(listed.tools) > 60, (
                     f"expected the full tool inventory, got {len(listed.tools)}"
-                )
-
-                failures = []
-                for tool in listed.tools:
-                    try:
-                        convert_to_voluptuous(tool.inputSchema)
-                    except Exception as err:  # collecting, not suppressing
-                        failures.append(f"{tool.name}: {err!r}")
-                assert not failures, (
-                    "convert_to_voluptuous failed for "
-                    f"{len(failures)}/{len(listed.tools)} tools — these would "
-                    "be silently skipped from every conversation turn:\n"
-                    + "\n".join(failures)
                 )
 
                 call = await session.call_tool("ha_get_state", {"entity_id": "sun.sun"})
@@ -475,3 +546,56 @@ class TestEmbeddedServerEndToEnd:
                 # component's tool-search mode).
                 assert stamps["ha_search"]["pinned"] is True
                 assert stamps["ha_get_state"]["pinned"] is False
+
+    async def test_embedded_server_leaves_the_nudge_off_by_default(self, embedded_ha):
+        """The in-process server runs the store startup nudge only when opted in.
+
+        ``hacs_refresh_lifespan`` is attached to the server itself, so the
+        in-process server schedules it (``embedded_server`` enters
+        ``mcp._lifespan_manager()`` around uvicorn). The nudge is opt-in, and an
+        embedded install never ran it before, so it has no marker and nothing
+        turns it on for it. The opted-in launcher lanes live in
+        tests/src/e2e/workflows/hacs/test_auto_refresh_startup.py.
+
+        Readiness is the ``embedded_ha`` fixture itself — it only yields once
+        MCP ``initialize`` succeeded, which is past server start and so past
+        the lifespan.
+
+        NOTE (skip-ceiling coupling): see
+        ``test_invalidate_caches_recovers_from_editable_finder_keyerror``
+        above — this module is ``container_only`` + ``not_on_embedded``, so
+        adding a test here bumps the haos, haos_inaddon, haos_embedded and
+        embedded ceilings in
+        tests/src/e2e/basic/test_backend_dispatch_smoke.py by one.
+        """
+        _base_url, _session_id, config_path, _container = embedded_ha
+        data_dir = config_path / _SERVER_CONFIG_SUBDIR
+
+        # The component creates this dir during bring-up; the test seeds
+        # nothing into it. Its absence would mean the glob below is pointed at
+        # the wrong path, which would make "no marker" prove nothing.
+        assert data_dir.is_dir(), (
+            f"{data_dir} does not exist, so the in-process server's data dir "
+            "is not where this test looks — check SERVER_CONFIG_SUBDIR in "
+            "custom_components/ha_mcp_tools/const.py. /config contents: "
+            f"{sorted(p.name for p in config_path.iterdir())}"
+        )
+
+        def marker_files() -> list[Path]:
+            return list(data_dir.glob(f"{MARKER_FILENAME_PREFIX}_*.json"))
+
+        # 10 s: the container ships a loaded store, so a nudge running without
+        # the opt-in completes its pass (and writes the marker) on the first
+        # attempt — this window covers the completion, not the retry schedule.
+        appeared = await wait_for_condition(
+            marker_files,
+            timeout=10,
+            condition_name=(
+                "(not expected) store refresh marker in the in-process server's data dir"
+            ),
+        )
+        assert not appeared, (
+            "The in-process server wrote a store refresh marker "
+            f"({[p.name for p in marker_files()]}) without opting in to the "
+            "nudge (HAMCP_HACS_REFRESH_AFTER_UPDATE)."
+        )

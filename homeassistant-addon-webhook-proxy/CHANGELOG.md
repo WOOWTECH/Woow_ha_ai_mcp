@@ -2,6 +2,252 @@
 
 <!-- version list -->
 
+## v3.0.5 (2026-11-09)
+
+### Features
+
+- Serve `/catalog/full` and `/catalog/search` on the webhook URL, alone or
+  after `/readonly` (`/readonly/catalog/search`), to give a client a fixed tool
+  catalog: the full tool list, or ha-mcp's search tools. Uses the same webhook
+  secret and OAuth sign-in. Requires an MCP server that serves those endpoints.
+
+### Bug Fixes
+
+- `ha_auth` sign-in works when Home Assistant serves HTTPS itself: token and
+  revocation requests go to Core's own listener (its configured listen address,
+  or `127.0.0.1`) without verifying a certificate issued for Home Assistant's
+  hostname, instead of answering 503.
+
+### Documentation
+
+- Update the Claude.ai connector steps for its current form: **Settings** →
+  **Customize** (or **Plugins**) → **Add** → **Add custom connector**, then
+  **Continue** and keep the sign-in settings Claude detects. Add the Team or
+  Enterprise path through **Organization settings** → **Connectors**, and warn
+  that with OAuth off or in `legacy` mode every member who connects it gets the
+  server's Home Assistant access without signing in.
+- Add **Per-URL tool catalog** to the app documentation.
+
+### Maintenance
+
+- Take the Python base image through a `PYTHON_BASE` build argument (default
+  unchanged), so CI can build from Docker Hub when ECR Public rate-limits the
+  pull.
+- Match Home Assistant Core 2026.11's type annotations for the repairs flow,
+  the webhook handler and the protected-resource view. No behavior change.
+
+## v3.0.4 (2026-10-10)
+
+### Features
+
+- Add `/api/webhook/<id>/readonly` connections using the existing
+  authentication, with matching OAuth protected-resource metadata. Requires an
+  MCP server with read-only endpoint support.
+- Relay Nabu Casa cloudhooks (Settings → Home Assistant Cloud → Webhooks): read
+  the body the relay provides and return SSE replies buffered, since the relay
+  cannot stream. A reply that does not finish within 60 s is answered with 504,
+  and an unauthenticated request to an OAuth-gated cloudhook is refused with 400,
+  because the relay drops the `WWW-Authenticate` challenge so OAuth sign-in cannot
+  start there.
+
+### Documentation
+
+- Add **Read-only agent connections** to the app documentation: append
+  `/readonly` to the webhook URL to hide write tools and block write calls for
+  that connection.
+
+### Maintenance
+
+- Pull the Python base image from the ECR Public mirror of the Docker Hub
+  official image (same pinned digest), so building the app no longer depends on
+  Docker Hub's anonymous pull rate limit.
+- Move the OAuth discovery views' provider contract into its own module
+  (`oauth_metadata.py`), without changing behavior.
+
+## v3.0.3 (2026-09-13)
+
+### Security
+
+- Remove the fixed-path OAuth protected-resource document, which exposed the
+  webhook URL to unauthenticated callers while `ha_auth` or `legacy` mode was
+  enabled. Discovery now serves this document only at the path containing the
+  webhook ID, and the webhook's `401` response points clients there.
+- After webhook ID rotation, the old ID's discovery URL returns `404` as soon
+  as the app starts with the new ID, instead of revealing the new URL until
+  Home Assistant restarts. A Repair prompts for the Home Assistant restart
+  needed to register the new discovery URL, including when OAuth is off.
+- **Upgrade guidance:** if this installation ran `ha_auth` or `legacy` mode
+  reachable from the internet before this release, treat its webhook ID as
+  public and rotate it once. Follow **Rotating the webhook URL** in the app
+  documentation, complete the Home Assistant restart Repair, and update your
+  MCP clients with the new URL.
+
+### Bug Fixes
+
+- Percent-encode `ha_auth` authorization query parameters so native clients'
+  loopback callbacks work behind reverse proxies using Nginx Proxy Manager's
+  **Block Common Exploits** filter.
+
+### Documentation
+
+- Update Claude.ai setup instructions and startup hints for its connector
+  wizard: keep hosted client metadata for `ha_auth`, or choose **Use your own
+  OAuth client** and supply the app's credentials for `legacy` mode.
+
+### Maintenance
+
+- Remove an unused OAuth helper and reuse the existing PKCE challenge-length
+  constant in validation and error messages, without changing their behavior.
+
+
+## v3.0.2 (2026-08-24)
+
+### Bug Fixes
+
+- In `ha_auth` mode, loopback-callback and multi-origin registered clients no
+  longer have to sign in again whenever Home Assistant's 30-minute access token
+  expires. Refresh tokens now retain the exact client identity used during
+  authorization; sessions created before this update may need one final
+  reauthorization.
+
+- Revoking one of these refresh tokens now revokes the underlying Home
+  Assistant grant instead of returning success while leaving it active. OAuth
+  discovery advertises a scoped revocation endpoint for `ha_auth`, and
+  temporary forwarding failures return `503` with retry guidance.
+
+
+
+## v3.0.1 (2026-08-18)
+
+### Documentation
+
+- Home Assistant 2026.2 renamed add-ons to apps, so the setup, OAuth and
+  troubleshooting instructions now call the product an app (add-on) on first
+  mention and an app after it. Navigation paths carry Home Assistant's current
+  labels — `Settings > Apps > Install app` — with the pre-2026.2 path in a
+  compatibility note, since on those versions the panel really is *Add-ons*.
+  Slugs, `/addons` Supervisor routes, directory names and the add-on store
+  identity are unchanged.
+
+### Fixed
+
+- Disabling OAuth protection documented an app restart, which is not enough:
+  the OAuth HTTP views are registered with Home Assistant and only drop on a
+  full Home Assistant restart, so following the old instruction could leave
+  the previous OAuth behaviour in force. The instruction now says so.
+
+## v3.0.0 (2026-08-16)
+
+### Changed
+
+- A stopped add-on no longer serves OAuth metadata. The bundled integration's
+  `hass.data` survives an add-on stop (and the persisted proxy config
+  re-populates it at Home Assistant boot), so the OAuth views used to keep
+  advertising a live authorization server indefinitely after the add-on was
+  stopped. `start.py` now touches a heartbeat file every keep-alive iteration
+  and removes it on shutdown, and every OAuth view serves only while that file
+  is fresh; a crash that skips cleanup lets it go stale instead. Clients
+  probing a stopped install now get `404`s, which is what a never-installed
+  proxy already returned — the reason for the major version.
+
+### Features
+
+- Unified, mode-dispatched OAuth endpoints under `/api/mcp_proxy/oauth`
+  (`authorize`, `token`, and `register`). Each request dispatches on the
+  currently live mode — legacy, `ha_auth`, or none-mode auto-approve — so
+  switching modes no longer strands a client on endpoints it cached under the
+  previous one. The host-root `/authorize` and `/token` routes stay bound as
+  legacy compatibility aliases for clients that build those URLs from the
+  resource host instead of reading the metadata document.
+
+- `ha_auth` mode validates Client ID Metadata Documents in the add-on and hands
+  Home Assistant core a client identity its same-origin rule accepts, so
+  cross-origin connectors sign in without waiting on the core-side CIMD fix.
+  Fetches are HTTPS-only, redirect-free, size- and time-bounded, and pinned to
+  pre-validated globally routable addresses, on a connector pool of their own so
+  they never compete with relayed MCP traffic.
+
+- A stateless RFC 7591 registration endpoint for `ha_auth` and none modes. The
+  minted `client_id` is an HMAC-signed blob embedding the registered redirect
+  URIs, so verification needs no registration database and survives restarts.
+  Registrations covering several web origins are accepted, translating from the
+  redirect the client actually presents.
+
+- Turning on **Log inbound requests** additionally surfaces Home Assistant's own
+  webhook log lines. A request that arrives for an unregistered webhook id gets
+  an empty `200` from Home Assistant and never reaches this add-on, and the
+  reason was previously invisible — leaving "no inbound lines" ambiguous between
+  "the request never arrived" and "it arrived for an id nothing is registered
+  under" (#2220).
+
+### Bug Fixes
+
+- The redirect-less refresh grant now reproduces the exact identity the
+  authorize leg presented, or answers `invalid_grant` locally rather than
+  guessing. Home Assistant core compares the refresh `client_id` byte-exactly
+  while its authorize leg lowercases the host, so a mismatch produced a failed
+  exchange that counted against core's login-attempt accounting; a clean
+  re-authorization is the honest outcome when the original identity cannot be
+  reconstructed.
+
+- Anonymous OAuth endpoints answer OAuth errors instead of `500`s for malformed
+  input: unknown `Content-Type` charsets (which raise `LookupError`, not
+  `ValueError`), malformed `client_id` URLs, authorities that Home Assistant's
+  URL builder rejects, non-string multipart form values, deeply nested or
+  oversized registration bodies, and fragmented request bodies.
+
+- Basic-auth client credentials are accepted both form-decoded (RFC 6749
+  §2.3.1) and raw, so a configured credential containing a literal `+` or `%XX`
+  authenticates whether or not the client encodes it.
+
+### Documentation
+
+- Warn Tailscale Funnel users that Claude.ai connectors require the standard
+  HTTPS port 443 (#2080).
+
+
+## v2.1.0 (2026-07-26)
+
+### Features
+
+- Authorization responses from the add-on's own OAuth servers (the legacy
+  `/authorize` view and the none-mode auto-approve `/authorize` view) now carry
+  the RFC 9207 `iss` parameter naming the issuer that produced them, on both the
+  success redirect and the error redirects. The value is the same issuer the
+  add-on's RFC 8414 metadata document advertises — and the metadata documents
+  now declare `authorization_response_iss_parameter_supported` accordingly.
+  Clients that do not implement RFC 9207 ignore the extra query parameter, so
+  existing connectors are unaffected.
+
+### Bug Fixes
+
+- Drop the 5-minute wall-clock `total` timeout from the relay's HTTP client so a
+  long-lived MCP response stream (the upcoming spec's `subscriptions/listen`) is
+  no longer cut every 300 s, forcing the client to re-subscribe. The `sock_read`
+  idle timeout still bounds a dead stream, and a new finite `connect` bound
+  keeps connection-pool acquisition from hanging new requests when long-lived
+  streams occupy the pool.
+
+
+## v2.0.5 (2026-07-20)
+
+### Bug Fixes
+
+- When OAuth is off, serve the add-on's own corrected OAuth discovery documents
+  plus an invisible auto-approve authorization server, so an MCP connector
+  (claude.ai) that intermittently front-loads OAuth discovery resolves against
+  the add-on instead of falling through to Home Assistant core's origin-root
+  `/.well-known/oauth-authorization-server` — which omits
+  `token_endpoint_auth_methods_supported: ["none"]` and has no
+  `registration_endpoint`, so the connector reports "Automatic client
+  registration isn't supported" and cannot connect (issue #1969). The webhook
+  itself stays unauthenticated (URL-only clients are unaffected) and the OAuth
+  flow completes with no Home Assistant login. Switching between OAuth-off and
+  `ha_auth` needs no Home Assistant restart.
+- Follow-up to the above (issue #1978): the none-mode auto-approve OAuth error
+  responses now carry `Cache-Control: no-store` / `Pragma: no-cache`, matching
+  the token responses and the custom-component twin.
+
 
 ## v2.0.4 (2026-07-18)
 

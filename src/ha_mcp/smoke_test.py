@@ -26,11 +26,15 @@ def _print_errors(errors: list[str]) -> None:
 def _test_critical_imports(errors: list[str]) -> int:
     print("\n[1/4] Testing critical library imports...")
     critical_imports = [
-        ("fastmcp", "FastMCP framework"),
+        ("ha_mcp._vendor.fastmcp", "FastMCP framework (vendored)"),
+        ("ha_mcp._vendor.mcp", "MCP SDK (vendored)"),
+        ("ha_mcp._vendor.mcp_types", "MCP protocol types (vendored)"),
+        ("griffe", "FastMCP API introspection"),
         ("httpx", "HTTP client"),
+        ("httpx2", "FastMCP HTTP client"),
         ("pydantic", "Data validation"),
         ("click", "CLI framework"),
-        ("websockets", "WebSocket support"),
+        ("ha_mcp._vendor.websockets", "WebSocket support (vendored)"),
     ]
     for module_name, description in critical_imports:
         try:
@@ -49,7 +53,7 @@ def _test_server_import(errors: list[str]) -> type | None:
 
         print("  ✓ Server module imported successfully")
         return HomeAssistantSmartMCPServer
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         errors.append(f"Failed to import server module: {e}")
         print(f"  ✗ Server module import - FAILED: {e}")
         return None
@@ -62,7 +66,7 @@ def _test_server_instantiation(errors: list[str], server_cls: type) -> Any | Non
         mcp = server.mcp
         print(f"  ✓ Server created: {mcp.name}")
         return mcp
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         errors.append(f"Failed to create server: {e}")
         print(f"  ✗ Server instantiation - FAILED: {e}")
         return None
@@ -82,7 +86,7 @@ def _test_tool_discovery(errors: list[str], mcp: Any) -> int:
             tool_names = [t.name for t in tools[:5]]
             print(f"  ✓ Sample tools: {', '.join(tool_names)}...")
         return tool_count
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         errors.append(f"Failed to discover tools: {e}")
         print(f"  ✗ Tool discovery - FAILED: {e}")
         return 0

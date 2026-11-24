@@ -4,19 +4,21 @@ Configuration management tools for Home Assistant Lovelace dashboards.
 This module provides tools for managing dashboard metadata and content.
 """
 
+import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass, replace
-from typing import Annotated, Any, Literal, cast, overload
+from dataclasses import asdict, dataclass, field, fields, replace
+from typing import Annotated, Any, Literal, NoReturn, cast, overload
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
-from fastmcp.tools.tool import ToolResult
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import ToolResult, tool
 
 from ..client.rest_client import (
     HomeAssistantCommandError,
+    HomeAssistantCommandNotSent,
     HomeAssistantCommandTimeout,
 )
 from ..client.websocket_client import get_websocket_client
@@ -37,11 +39,14 @@ from ..dashboard_screenshot.content import (
 from ..dashboard_screenshot.paths import (
     dashboard_frontend_path,
     dashboard_render_paths,
+    match_dashboard_view,
     resolve_dashboard_view,
 )
-from ..errors import ErrorCode, create_error_response
+from ..error_wording import hyphenated_url_path
+from ..errors import ErrorCode, create_error_response, get_error_code, get_error_message
 from ..strict_bps import BestPracticeKeyParam
 from ..utils.config_hash import compute_config_hash
+from ..utils.dashboard_patch import apply_dashboard_patch
 from ..utils.python_sandbox import (
     PythonSandboxError,
     PythonSandboxExecutionError,
@@ -50,11 +55,43 @@ from ..utils.python_sandbox import (
     safe_execute,
 )
 from .auto_backup import with_auto_backup
+from .coercion import JSON_STRING_COERCION, parse_json_param
 from .component_api import (
     component_supports,
     get_component_caps,
     invalidate_caps,
     is_unknown_command,
+)
+from .component_dashboard_edit import edit_dashboard_via_component
+from .config_write_helpers import (
+    attach_skill_content,
+    augment_error_dict_with_skill_content,
+    augment_tool_error_with_skill_content,
+)
+from .dashboard_card_describe import describe_card_response
+from .dashboard_edit_errors import (
+    raise_dashboard_edit_error,
+    raise_dashboard_edit_fetch_error,
+    raise_dashboard_edit_unsent,
+    raise_known_dashboard_save_rejection,
+)
+from .dashboard_list_checks import (
+    patch_writes_inside_card,
+    reject_malformed_dashboard_config,
+    reject_malformed_dashboard_lists,
+    reject_malformed_dashboard_patch,
+)
+from .dashboard_read_errors import (
+    DASHBOARD_FETCH_FAILED_PREFIX,
+    DASHBOARD_LIST_SUGGESTION,
+    NO_STORED_CONFIG_NOTE,
+    config_not_found,
+    is_no_stored_config_error,
+    is_unknown_dashboard,
+    no_stored_config,
+    raise_registry_read_error,
+    raise_unresolved_delete,
+    read_failure_code,
 )
 from .helpers import (
     exception_to_structured_error,
@@ -63,20 +100,27 @@ from .helpers import (
     raise_tool_error,
     register_tool_methods,
     validate_identifier_not_empty,
+    ws_failure_code,
 )
-from .util_helpers import (
-    JSON_STRING_COERCION,
-    attach_skill_content,
-    augment_error_dict_with_skill_content,
-    augment_tool_error_with_skill_content,
-    parse_json_param,
-)
+from .tool_hints import read_only_hints, write_hints
 
 logger = logging.getLogger(__name__)
 
+_LARGE_DASHBOARD_CONFIG_SIZE = 10000
+
+
+def _large_dashboard_replacement_warning(size: int) -> str | None:
+    """Keep the full-replacement guidance identical on both backends."""
+    if size < _LARGE_DASHBOARD_CONFIG_SIZE:
+        return None
+    return (
+        f"Replaced large config ({size:,} bytes). "
+        "Consider patch for known paths or python_transform for pattern-based edits."
+    )
+
 
 @dataclass(frozen=True, slots=True)
-class _DashboardScreenshotOptions:
+class DashboardScreenshotOptions:
     """Shared render options for get/set screenshot paths."""
 
     view_path: str | None = None
@@ -94,24 +138,27 @@ class _DashboardScreenshotOptions:
     render_timeout_seconds: float = DEFAULT_RENDER_TIMEOUT_SECONDS
 
 
-# dashboard-guide.md + dashboard-cards.md cover layout patterns and the
-# card-type taxonomy — both relevant on every dashboard write.
-_DASHBOARD_SKILL_FILES: tuple[str, ...] = (
-    "references/dashboard-guide.md",
-    "references/dashboard-cards.md",
-)
+# Live card fields replace the static reference only on capable components.
+_DASHBOARD_SKILL_FILES: tuple[str, ...] = ("references/dashboard-guide.md",)
 
 
-def _attach_dashboard_skill(response: dict[str, Any], MandatoryBPS: bool) -> None:
+async def _attach_dashboard_skill(
+    response: dict[str, Any], MandatoryBPS: bool, client: Any
+) -> None:
     """In-place attach skill_content to a dashboard response when applicable.
 
     Delegates to the shared :func:`attach_skill_content` so the
     missing-vendor-warning path is consistent across every write tool.
     """
+    files = _DASHBOARD_SKILL_FILES
+    if MandatoryBPS and not component_supports(
+        await get_component_caps(client), "dashboard_cards"
+    ):
+        files += ("references/dashboard-cards.md",)
     attach_skill_content(
         response,
         MandatoryBPS=MandatoryBPS,
-        canonical_files=_DASHBOARD_SKILL_FILES,
+        canonical_files=files,
         referenced_files=None,
     )
 
@@ -133,24 +180,32 @@ async def _get_dashboard_config_internal(
     ``tools_config_scenes.py``).
 
     Raises ``ToolError`` with ``ErrorCode.SERVICE_CALL_FAILED`` if the
-    WebSocket call reports failure or the response is not a dict; callers
-    can rely on the returned tuple being populated.
+    WebSocket call reports failure or the response is not a dict. HA's
+    upstream error code is preserved as ``ha_error_code`` when present, so
+    callers can distinguish confirmed absence from an unverifiable read.
     """
     get_data: dict[str, Any] = {"type": "lovelace/config", "force": True}
-    if url_path:
+    # No url_path is Core's default: its ``lovelace`` item, else the default store.
+    if url_path and url_path != "lovelace":
         get_data["url_path"] = url_path
 
     response = await client.send_websocket_message(get_data)
 
     if isinstance(response, dict) and not response.get("success", True):
-        error_msg = response.get("error", {})
-        if isinstance(error_msg, dict):
-            error_msg = error_msg.get("message", str(error_msg))
+        error_msg = get_error_message(response)
+        if error_msg is None:
+            error_msg = str(response.get("error", {}))
+        ha_error_code = response.get("error_code") or get_error_code(response)
+        error_context: dict[str, Any] = {"url_path": url_path}
+        if ha_error_code is not None:
+            # Preserve HA's code so downstream safety decisions do not have to
+            # infer an absent config from a multiply-prefixed message alone.
+            error_context["ha_error_code"] = str(ha_error_code)
         raise_tool_error(
             create_error_response(
                 ErrorCode.SERVICE_CALL_FAILED,
-                f"Dashboard fetch failed: {error_msg}",
-                context={"url_path": url_path},
+                f"{DASHBOARD_FETCH_FAILED_PREFIX}{error_msg}",
+                context=error_context,
             )
         )
 
@@ -167,109 +222,58 @@ async def _get_dashboard_config_internal(
     return cast(dict[str, Any], config), compute_config_hash(config)
 
 
-async def _verify_config_unchanged(
-    client: Any,
-    url_path: str,
-    original_hash: str,
-) -> dict[str, Any]:
-    """
-    Verify dashboard config hasn't changed since original read.
-
-    Returns dict with:
-    - success: bool (True if config unchanged)
-    - error: str (if config changed)
-    - suggestions: list[str] (if config changed)
-    """
-    # Re-fetch current config. The component ``get`` reads the same in-memory
-    # object core serves (freshness-safe, audit-verified — the optimistic-lock
-    # re-read must not lag a concurrent save); ``None`` (component unavailable /
-    # YAML body / not found) falls back to the unchanged legacy re-fetch.
-    current_config: Any = await _component_dashboard_config(client, url_path or None)
-    if current_config is None:
-        get_data: dict[str, Any] = {"type": "lovelace/config"}
-        if url_path:
-            get_data["url_path"] = url_path
-
-        result = await client.send_websocket_message(get_data)
-        current_config = (
-            result.get("result", result) if isinstance(result, dict) else result
-        )
-
-    if not isinstance(current_config, dict):
-        return {"success": True}  # Can't verify, proceed anyway
-
-    current_hash = compute_config_hash(current_config)
-
-    if current_hash != original_hash:
-        raise_tool_error(
-            create_error_response(
-                ErrorCode.SERVICE_CALL_FAILED,
-                "Dashboard modified since last read (conflict)",
-                suggestions=[
-                    "Re-read dashboard with ha_config_get_dashboard",
-                    "Then retry the operation with fresh data",
-                ],
-            )
-        )
-
-    return {"success": True}
+def _lovelace_url_path(url_path: str | None) -> str | None:
+    """The ``url_path`` HA's Lovelace reads take: ``None`` for the default dashboard."""
+    return None if not url_path or url_path == "default" else url_path
 
 
-def _badge_matches(badge: Any, entity_id: str) -> bool:
-    """Check if a badge matches the entity_id search criteria.
+def _badge_matches(badge: Any, pattern: str) -> bool:
+    """Whether ``badge``'s entity matches ``pattern`` (see ``_entity_matches``).
 
     Badges can be simple strings (entity IDs) or dicts with an 'entity' field.
-    Supports wildcard matching with *.
     """
-    # Extract entity from badge
-    if isinstance(badge, str):
-        badge_entity = badge
-    elif isinstance(badge, dict):
-        badge_entity = badge.get("entity", "")
-    else:
+    return _entity_matches(
+        pattern, badge.get("entity") if isinstance(badge, dict) else badge
+    )
+
+
+def _entity_matches(pattern: str, candidate: object) -> bool:
+    """Whether ``candidate`` is a non-empty entity id matching ``pattern``.
+
+    ``*`` in ``pattern`` matches any run of characters; every other character
+    is literal, and the whole id must match.
+    """
+    if not isinstance(candidate, str) or not candidate:
         return False
-
-    if not badge_entity:
-        return False
-
-    # Support wildcard matching (same logic as _card_matches)
-    if "*" in entity_id:
-        pattern = entity_id.replace(".", r"\.").replace("*", ".*")
-        return bool(re.match(pattern, badge_entity))
-
-    return entity_id == badge_entity
+    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(regex, candidate) is not None
 
 
-# Keys under which a card nests other cards, by descent rule (issue #1599):
-#   - ``cards`` (list): vertical/horizontal-stack, grid, and any custom wrapper
-#     following the stack convention.
-#   - ``card`` (dict): conditional and wrapper cards such as
-#     ``custom:auto-entities``.
-#   - ``custom_fields`` (dict of field-configs): ``custom:button-card`` embeds
-#     sub-cards under ``custom_fields.<name>.card`` (a very common pattern that
-#     wraps an entire view in one button-card). Each field-config is descended
-#     as a node, so its own ``card`` / ``cards`` are picked up by the recursion.
-#   - ``states`` (name->card map): ``custom:state-switch`` swaps a whole card per
-#     source state. Each value is itself a card, descended directly as a node.
-# Picture-elements ``elements`` is deliberately NOT traversed: it is not one of
-# the descent keys above, so a node carrying it is disclosed at the response
-# boundary instead of being walked (see ``_UNTRAVERSED_NESTED_KEYS`` and the
-# find-card warnings). A blanket "descend every dict with a ``type``" walk is
-# intentionally avoided: tile ``features`` and view ``conditions`` also carry
-# ``type`` and would false-match as cards.
+# Card slots (issue #1599) are a discovery heuristic, not an HA contract: HA has
+# no nested-card map, and each card decides what its keys mean. These are the
+# keys HA's stack/conditional/entity-filter cards and common custom cards use,
+# recognised at any depth (``groups[].cards[].card``; #2694): ``cards`` (list),
+# ``card`` (dict or list), and ``custom_fields`` / ``states`` (name -> card
+# map). A typed dict in a slot is walked as a card; anything else, a typed dict
+# elsewhere or a slot key in another shape, is the owning card's option:
+# ``query`` reads its text, but entity_id/card_type/heading do not match it.
 _NESTED_CARDS_KEY = "cards"
 _NESTED_CARD_KEY = "card"
 _NESTED_CUSTOM_FIELDS_KEY = "custom_fields"
 _NESTED_STATES_KEY = "states"
-# Child-bearing keys recognised but deliberately NOT traversed. A walked card
-# carrying one of these (with a truthy value) cannot be fully covered, so it is
-# its *presence* — not the absence of matches — that the response discloses
-# (issue #1599: disclose by presence, not by absence-inference). picture-elements
-# ``elements`` is the canonical case.
-_UNTRAVERSED_NESTED_KEYS = ("elements",)
-# Defensive bound against pathological/malformed configs. Real dashboards nest
-# only a handful of levels; this guards recursion depth far above any real use.
-_MAX_CARD_DEPTH = 50
+# Keys holding non-card children (picture-elements ``elements``). Their text is
+# read by ``query``, but entity_id/card_type/heading match cards only, so a card
+# carrying one is disclosed by its *presence*, not by the absence of matches
+# (issue #1599).
+_NON_CARD_CHILD_KEYS = ("elements",)
+# The card_type value that selects view badges, which are not cards.
+_BADGE_CARD_TYPE = "badge"
+# Bound on card nesting levels against pathological configs; real dashboards
+# nest a handful. Public so tests can build a config at the boundary.
+MAX_CARD_DEPTH = 50
+# Bound on non-card nesting inside one card, which keeps the recursive split far
+# below Python's recursion limit even at the card bound.
+_MAX_NODE_DEPTH = 100
 
 
 def _py_key(name: str) -> str:
@@ -310,184 +314,187 @@ def _log_non_str_key(container_key: str, name: object, jq_prefix: str) -> None:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _SearchCriteria:
+    """What a card search matches; every criterion that is set must hold.
+
+    Values are trimmed and a blank one counts as not given.
+    """
+
+    entity_id: str | None = None
+    card_type: str | None = None
+    heading: str | None = None
+    query: str | None = None
+
+    def __post_init__(self) -> None:
+        for criterion in fields(self):
+            value = getattr(self, criterion.name)
+            if isinstance(value, str):
+                object.__setattr__(self, criterion.name, value.strip() or None)
+
+    @property
+    def query_lower(self) -> str | None:
+        return self.query.lower() if self.query is not None else None
+
+    def has_card_criteria(self) -> bool:
+        """Whether a criterion that matches card fields (not text) is set."""
+        return any(
+            v is not None for v in (self.entity_id, self.card_type, self.heading)
+        )
+
+    def targets_cards(self) -> bool:
+        """Whether a card-field criterion can select cards (not only badges)."""
+        return self.has_card_criteria() and self.card_type != _BADGE_CARD_TYPE
+
+    def can_match_cards(self) -> bool:
+        """Whether cards can match at all (card_type='badge' selects only badges)."""
+        return self.card_type != _BADGE_CARD_TYPE
+
+    def can_match_badges(self) -> bool:
+        """Whether view badges can match: they carry no heading, and any other
+        card_type names a card."""
+        return self.heading is None and self.card_type in (None, _BADGE_CARD_TYPE)
+
+    def is_empty(self) -> bool:
+        return self.query is None and not self.has_card_criteria()
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchGaps:
+    """Where a search could not look; each list feeds one response warning.
+
+    Frozen only against field reassignment: the lists are shared collectors
+    appended to in place.
+    """
+
+    truncation: list[str] = field(default_factory=list)
+    uncovered: list[str] = field(default_factory=list)
+    unread: list[str] = field(default_factory=list)
+
+    def note_unread(self, value: Any, path: str) -> None:
+        """Record container key ``path`` when present (not ``None``) in a shape
+        the walk does not read.
+
+        Such a list entry, ``None`` included, is recorded directly.
+        """
+        if value is not None:
+            self.unread.append(path)
+
+    def extend(self, other: _SearchGaps, prefix: str) -> None:
+        self.truncation.extend(prefix + p for p in other.truncation)
+        self.uncovered.extend(prefix + p for p in other.uncovered)
+        self.unread.extend(prefix + p for p in other.unread)
+
+
+@dataclass(frozen=True, slots=True)
 class _CardWalkFrame:
-    """Bundles the parameters ``_walk_card`` threads through every recursive
-    descent, so the per-container helpers below don't each need a 9-parameter
-    signature just to forward context unchanged."""
+    """Context ``_walk_card`` carries through every nested card.
 
-    __slots__ = (
-        "card_index",
-        "card_type",
-        "depth",
-        "entity_id",
-        "heading",
-        "section_index",
-        "truncation",
-        "uncovered",
-        "view_index",
-    )
+    ``gaps`` is a shared collector every copy appends to.
+    """
 
-    def __init__(
-        self,
-        entity_id: str | None,
-        card_type: str | None,
-        heading: str | None,
-        *,
-        view_index: int,
-        section_index: int | None,
-        card_index: int | None,
-        depth: int,
-        truncation: list[str] | None,
-        uncovered: list[str] | None,
-    ) -> None:
-        self.entity_id = entity_id
-        self.card_type = card_type
-        self.heading = heading
-        self.view_index = view_index
-        self.section_index = section_index
-        self.card_index = card_index
-        self.depth = depth
-        self.truncation = truncation
-        self.uncovered = uncovered
+    criteria: _SearchCriteria
+    view_index: int
+    section_index: int | None
+    card_index: int | None
+    depth: int
+    gaps: _SearchGaps
 
     def with_indices(
         self, *, section_index: int | None, card_index: int | None
-    ) -> "_CardWalkFrame":
-        """A copy of this frame at the same depth with different top-level indices.
+    ) -> _CardWalkFrame:
+        """The frame for another top-level card of the view, at the same depth."""
+        return replace(self, section_index=section_index, card_index=card_index)
 
-        For locating a *top-level* card within a view — not a recursive descent,
-        so ``depth`` is unchanged (matches the pre-refactor behavior where the
-        top-level ``_walk_card`` call used the default ``depth=0``).
-        """
-        return _CardWalkFrame(
-            self.entity_id,
-            self.card_type,
-            self.heading,
-            view_index=self.view_index,
-            section_index=section_index,
-            card_index=card_index,
-            depth=self.depth,
-            truncation=self.truncation,
-            uncovered=self.uncovered,
-        )
-
-    def descend(self) -> "_CardWalkFrame":
-        """A copy of this frame one level deeper (everything else unchanged)."""
-        return _CardWalkFrame(
-            self.entity_id,
-            self.card_type,
-            self.heading,
-            view_index=self.view_index,
-            section_index=self.section_index,
-            card_index=self.card_index,
-            depth=self.depth + 1,
-            truncation=self.truncation,
-            uncovered=self.uncovered,
-        )
+    def descend(self) -> _CardWalkFrame:
+        """The frame for a card nested one level deeper."""
+        return replace(self, depth=self.depth + 1)
 
 
-def _walk_card_list_key(
-    card: dict[str, Any],
-    key: str,
-    *,
-    jq_prefix: str,
-    python_prefix: str,
-    frame: _CardWalkFrame,
-) -> list[dict[str, Any]]:
-    """Descend a list-of-cards child (the ``cards`` key: stacks, grids, ...)."""
-    matches: list[dict[str, Any]] = []
-    child_list = card.get(key)
-    if isinstance(child_list, list):
-        child_frame = frame.descend()
-        for i, child in enumerate(child_list):
-            matches.extend(
-                _walk_card(
-                    child,
-                    jq_prefix=f"{jq_prefix}.{key}[{i}]",
-                    python_prefix=f"{python_prefix}['{key}'][{i}]",
-                    frame=child_frame,
-                )
-            )
-    elif child_list is not None:
-        # Key present but not a list — structurally malformed slot.
-        logger.debug(
-            "Card-search skipping non-list '%s' under %s (%s)",
-            key,
-            jq_prefix,
-            type(child_list).__name__,
-        )
-    return matches
+@dataclass(slots=True)
+class _CardSplit:
+    """A card's own string leaves, the cards below it, and where descent stopped."""
+
+    leaves: list[tuple[str, str]] = field(default_factory=list)
+    cards: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+    cut: list[str] = field(default_factory=list)
 
 
-def _walk_card_dict_key(
-    card: dict[str, Any],
-    key: str,
-    *,
-    jq_prefix: str,
-    python_prefix: str,
-    frame: _CardWalkFrame,
-) -> list[dict[str, Any]]:
-    """Descend a single-card dict child (the ``card`` key: conditional/wrapper cards)."""
-    matches: list[dict[str, Any]] = []
-    child = card.get(key)
-    if isinstance(child, dict):
-        matches.extend(
-            _walk_card(
-                child,
-                jq_prefix=f"{jq_prefix}.{key}",
-                python_prefix=f"{python_prefix}['{key}']",
-                frame=frame.descend(),
-            )
-        )
-    elif child is not None:
-        # Key present but not a dict — structurally malformed slot.
-        logger.debug(
-            "Card-search skipping non-dict '%s' under %s (%s)",
-            key,
-            jq_prefix,
-            type(child).__name__,
-        )
-    return matches
+def _split_card_node(
+    node: Any, path: tuple[str, str], key: str, out: _CardSplit, depth: int = 0
+) -> None:
+    """Split a card's subtree into its own leaves and the cards below it.
 
-
-def _walk_card_named_children(
-    card: dict[str, Any],
-    key: str,
-    *,
-    jq_prefix: str,
-    python_prefix: str,
-    frame: _CardWalkFrame,
-) -> list[dict[str, Any]]:
-    """Descend a name-keyed dict of card children (``custom_fields``, ``states``).
-
-    Each value is itself descended as a node (its own ``card``/``cards`` and the
-    ``type`` gate are handled by the recursion). Keys are rendered quote/dot-safe
-    so a name like ``o'brien`` yields a usable python_path/jq_path (issue #1599).
+    ``path`` is the (jq, python) suffix of ``node``. Every dict and list is
+    descended, down to ``_MAX_NODE_DEPTH`` levels (deeper subtrees are recorded
+    in ``out.cut``); a typed dict in a card slot goes to ``out.cards`` with its
+    paths instead of contributing leaves. Leaves are strings (scalars as ``str()``)
+    and carry their nearest dict key
+    (a ``custom_fields`` / ``states`` value carries its name).
     """
-    matches: list[dict[str, Any]] = []
-    children = card.get(key)
-    if isinstance(children, dict):
-        child_frame = frame.descend()
-        for name, child in children.items():
-            if not isinstance(name, str):
-                _log_non_str_key(key, name, jq_prefix)
-                continue
-            matches.extend(
-                _walk_card(
-                    child,
-                    jq_prefix=f"{jq_prefix}.{key}{_jq_key(name)}",
-                    python_prefix=f"{python_prefix}['{key}']{_py_key(name)}",
-                    frame=child_frame,
-                )
-            )
-    elif children is not None:
-        logger.debug(
-            "Card-search skipping non-dict '%s' under %s (%s)",
-            key,
-            jq_prefix,
-            type(children).__name__,
-        )
-    return matches
+    jq, py = path
+    if isinstance(node, str):
+        if node:
+            out.leaves.append((key, node))
+        return
+    if isinstance(node, (bool, int, float)):
+        out.leaves.append((key, str(node)))
+        return
+    if not isinstance(node, (list, dict)):
+        return
+    if depth > _MAX_NODE_DEPTH:
+        out.cut.append(jq)
+        return
+    if isinstance(node, list):
+        for i, item in enumerate(node):
+            _split_card_node(item, (f"{jq}[{i}]", f"{py}[{i}]"), key, out, depth + 1)
+        return
+    for k, v in node.items():
+        if isinstance(k, str):
+            _split_card_entry(k, v, path, out, depth + 1)
+        else:
+            _log_non_str_key("card", k, jq)
+
+
+def _split_card_entry(
+    key: str, value: Any, path: tuple[str, str], out: _CardSplit, depth: int
+) -> None:
+    """``_split_card_node`` for one ``key: value`` entry of a dict at ``path``."""
+    child_jq, child_py = f"{path[0]}{_jq_key(key)}", f"{path[1]}{_py_key(key)}"
+    slots = _card_slots(key, value, child_jq)
+    if slots is None:
+        _split_card_node(value, (child_jq, child_py), key, out, depth)
+        return
+    for jq_seg, py_seg, leaf_key, item in slots:
+        item_path = (f"{child_jq}{jq_seg}", f"{child_py}{py_seg}")
+        if isinstance(item, dict) and "type" in item:
+            out.cards.append((*item_path, item))
+        else:
+            _split_card_node(item, item_path, leaf_key, out, depth)
+
+
+def _card_slots(
+    key: str, value: Any, jq: str
+) -> list[tuple[str, str, str, Any]] | None:
+    """``(jq segment, python segment, leaf key, item)`` per slot.
+
+    ``None`` when ``key: value`` holds no card slots.
+    """
+    if key in (_NESTED_CARDS_KEY, _NESTED_CARD_KEY) and isinstance(value, list):
+        return [(f"[{i}]", f"[{i}]", key, item) for i, item in enumerate(value)]
+    if key == _NESTED_CARD_KEY and isinstance(value, dict):
+        return [("", "", key, value)]
+    if key in (_NESTED_CUSTOM_FIELDS_KEY, _NESTED_STATES_KEY) and isinstance(
+        value, dict
+    ):
+        slots: list[tuple[str, str, str, Any]] = []
+        for name, item in value.items():
+            if isinstance(name, str):
+                slots.append((_jq_key(name), _py_key(name), name, item))
+            else:
+                _log_non_str_key(key, name, jq)
+        return slots
+    return None
 
 
 def _walk_card(
@@ -499,141 +506,156 @@ def _walk_card(
 ) -> list[dict[str, Any]]:
     """Return matches for ``card`` and every card nested beneath it.
 
-    Descends ``cards`` (list), ``card`` (dict), each ``custom_fields`` value, and
-    each ``states`` value (custom:state-switch), for nested as well as top-level
-    cards, up to ``_MAX_CARD_DEPTH``.
-
     ``jq_prefix`` / ``python_prefix`` locate ``card`` itself — the former in jq
     dot-notation, the latter as a Python subscript chain usable (appended after
     ``config``) directly in ``ha_config_set_dashboard(python_transform=...)``.
-    Nested descendants extend both prefixes per level, so the path strings are
-    the authoritative locator for nested cards (the flat ``view_index`` /
-    ``section_index`` / ``card_index`` identify the top-level container only and
-    are carried unchanged into nested matches for back-compat).
+    Nested cards (every card slot at any depth, see ``_split_card_node``)
+    extend both prefixes, so the paths are the authoritative locator; the flat
+    ``view_index`` / ``section_index`` / ``card_index`` identify the top-level
+    container only.
 
-    Only a dict carrying a ``type`` key is treated as a card; this keeps non-card
-    dicts reached under these keys (action targets, style blocks, entity rows)
-    from matching. If ``frame.truncation`` is provided, the prefix of any subtree
-    skipped at the depth bound is appended to it. If ``frame.uncovered`` is
-    provided, the path of any walked card carrying a non-traversed child-bearing
-    key (see ``_UNTRAVERSED_NESTED_KEYS``) is appended to it, so the caller can
-    disclose the incompleteness regardless of whether the search matched anything.
+    Only a dict carrying a ``type`` key is matched as a card. Subtrees past
+    ``MAX_CARD_DEPTH`` card levels are recorded in ``frame.gaps.truncation``;
+    cards carrying ``_NON_CARD_CHILD_KEYS`` in ``frame.gaps.uncovered``.
     """
     if not isinstance(card, dict):
-        # Structurally-present but malformed slot (e.g. a string where a card
-        # dict is expected): skip, but breadcrumb so it is not a silent drop.
-        if card is not None:
-            logger.debug(
-                "Card-search skipping non-dict node at %s (%s)",
-                jq_prefix,
-                type(card).__name__,
-            )
+        if frame.criteria.can_match_cards():
+            frame.gaps.unread.append(jq_prefix)
         return []
-    if frame.depth > _MAX_CARD_DEPTH:
-        # Stop, but make the truncation visible rather than silently dropping
-        # any cards nested below this point. Only reachable on pathological or
-        # malformed configs (real dashboards nest a handful of levels).
+    if frame.depth > MAX_CARD_DEPTH:
         logger.warning(
             "Card-search depth bound (%d) exceeded at %s; not descending further",
-            _MAX_CARD_DEPTH,
+            MAX_CARD_DEPTH,
             jq_prefix,
         )
-        if frame.truncation is not None:
-            frame.truncation.append(jq_prefix)
+        frame.gaps.truncation.append(jq_prefix)
         return []
 
+    split = _CardSplit()
+    _split_card_node(card, ("", ""), "", split)
+    frame.gaps.truncation.extend(jq_prefix + cut for cut in split.cut)
     matches: list[dict[str, Any]] = []
     if "type" in card:
-        if _card_matches(card, frame.entity_id, frame.card_type, frame.heading):
-            matches.append(
-                {
-                    "view_index": frame.view_index,
-                    "section_index": frame.section_index,
-                    "card_index": frame.card_index,
-                    "jq_path": jq_prefix,
-                    "python_path": python_prefix,
-                    "card_type": card.get("type"),
-                    "card_config": card,
-                }
+        match = _card_search_match(card, split.leaves, jq_prefix, python_prefix, frame)
+        if match is not None:
+            matches.append(match)
+        _note_uncovered(card, jq_prefix, frame)
+    elif frame.criteria.can_match_cards():
+        # Only top-level and header entries reach here untyped (nested ones are
+        # leaves of their parent); the frontend renders them as error cards.
+        frame.gaps.unread.append(jq_prefix)
+    child_frame = frame.descend()
+    for jq_suffix, py_suffix, child in split.cards:
+        matches.extend(
+            _walk_card(
+                child,
+                jq_prefix=f"{jq_prefix}{jq_suffix}",
+                python_prefix=f"{python_prefix}{py_suffix}",
+                frame=child_frame,
             )
-        # Disclose un-coverable nesting by presence during the walk, not by the
-        # absence of matches: a card that carries e.g. picture-elements
-        # ``elements`` hides content this search cannot reach whether or not it
-        # (or anything else) matched.
-        if frame.uncovered is not None:
-            for key in _UNTRAVERSED_NESTED_KEYS:
-                if card.get(key):
-                    frame.uncovered.append(f"{jq_prefix}.{key}")
-                    break
-
-    matches.extend(
-        _walk_card_list_key(
-            card,
-            _NESTED_CARDS_KEY,
-            jq_prefix=jq_prefix,
-            python_prefix=python_prefix,
-            frame=frame,
         )
-    )
-    matches.extend(
-        _walk_card_dict_key(
-            card,
-            _NESTED_CARD_KEY,
-            jq_prefix=jq_prefix,
-            python_prefix=python_prefix,
-            frame=frame,
-        )
-    )
-    matches.extend(
-        _walk_card_named_children(
-            card,
-            _NESTED_CUSTOM_FIELDS_KEY,
-            jq_prefix=jq_prefix,
-            python_prefix=python_prefix,
-            frame=frame,
-        )
-    )
-    matches.extend(
-        _walk_card_named_children(
-            card,
-            _NESTED_STATES_KEY,
-            jq_prefix=jq_prefix,
-            python_prefix=python_prefix,
-            frame=frame,
-        )
-    )
     return matches
 
 
+def _note_uncovered(
+    card: dict[str, Any], jq_prefix: str, frame: _CardWalkFrame
+) -> None:
+    for key in _NON_CARD_CHILD_KEYS:
+        if card.get(key):
+            frame.gaps.uncovered.append(f"{jq_prefix}.{key}")
+            return
+
+
+def _card_search_match(
+    card: dict[str, Any],
+    leaves: list[tuple[str, str]],
+    jq_prefix: str,
+    python_prefix: str,
+    frame: _CardWalkFrame,
+) -> dict[str, Any] | None:
+    """The match record for ``card`` when it meets every criterion in ``frame``."""
+    criteria = frame.criteria
+    hits = _query_hits(leaves, criteria.query_lower)
+    if hits == [] or not _card_matches(card, criteria):
+        return None
+    match: dict[str, Any] = {
+        "view_index": frame.view_index,
+        "section_index": frame.section_index,
+        "card_index": frame.card_index,
+        "jq_path": jq_prefix,
+        "python_path": python_prefix,
+        "card_type": card.get("type"),
+        "card_config": card,
+    }
+    if hits is not None:
+        match["matched"] = hits
+    return match
+
+
+def _query_hits(
+    leaves: list[tuple[str, str]], query_lower: str | None
+) -> list[dict[str, str]] | None:
+    """``{field, value}`` per leaf containing the lower-cased query; ``None`` without one."""
+    if query_lower is None:
+        return None
+    return [{"field": f, "value": v} for f, v in leaves if query_lower in v.lower()]
+
+
+def _split_badge(badge: Any, out: _CardSplit) -> None:
+    """``_split_card_node`` for a badge, folding any card nested in it into its leaves.
+
+    A badge is one match, so text under a card it holds is the badge's own.
+    """
+    _split_card_node(badge, ("", ""), "badges", out)
+    while out.cards:
+        jq, py, card = out.cards.pop()
+        _split_card_node(card, (jq, py), "", out)
+
+
 def _find_badge_matches_in_view(
-    view: dict[str, Any],
-    view_idx: int,
-    entity_id: str | None,
-    card_type: str | None,
-    heading: str | None,
+    view: dict[str, Any], frame: _CardWalkFrame
 ) -> list[dict[str, Any]]:
-    """Find view-level badges matching the search criteria (entity_id-driven only)."""
+    """View-level badges matching ``frame``'s criteria.
+
+    Badges are entity references, so they answer entity_id and text searches,
+    and ``card_type='badge'`` alone lists every well-formed badge (an entity id
+    or a mapping); entries in any other shape are recorded in ``frame.gaps``.
+    """
+    view_idx = frame.view_index
+    criteria = frame.criteria
+    badges = view.get("badges")
+    if not criteria.can_match_badges():
+        return []
+    if not isinstance(badges, list):
+        frame.gaps.note_unread(badges, f".views[{view_idx}].badges")
+        return []
     matches: list[dict[str, Any]] = []
-    if not (
-        entity_id is not None
-        and heading is None
-        and (card_type is None or card_type == "badge")
-    ):
-        return matches
-    badges = view.get("badges", [])
     for badge_idx, badge in enumerate(badges):
-        if not _badge_matches(badge, entity_id):
-            continue
         is_dict_badge = isinstance(badge, dict)
-        badge_config = badge if is_dict_badge else {"entity": badge}
+        is_entity_badge = isinstance(badge, str) and bool(badge.strip())
+        if not (is_dict_badge or is_entity_badge):
+            frame.gaps.unread.append(f".views[{view_idx}].badges[{badge_idx}]")
+            continue
+        if criteria.entity_id is not None and not _badge_matches(
+            badge, criteria.entity_id
+        ):
+            continue
+        badge_jq = f".views[{view_idx}].badges[{badge_idx}]"
+        split = _CardSplit()
+        if criteria.query is not None:
+            _split_badge(badge, split)
+            frame.gaps.truncation.extend(badge_jq + cut for cut in split.cut)
+        hits = _query_hits(split.leaves, criteria.query_lower)
+        if hits == []:
+            continue
         badge_match: dict[str, Any] = {
             "view_index": view_idx,
             "section_index": None,
             "card_index": None,
             "badge_index": badge_idx,
-            "jq_path": f".views[{view_idx}].badges[{badge_idx}]",
-            "card_type": "badge",
-            "card_config": badge_config,
+            "jq_path": badge_jq,
+            "card_type": _BADGE_CARD_TYPE,
+            "card_config": badge if is_dict_badge else {"entity": badge},
         }
         # A bare-string badge (the common form) is not subscript-assignable, so
         # a python_path spliced into python_transform would raise TypeError.
@@ -641,25 +663,30 @@ def _find_badge_matches_in_view(
         # converted to dict form first.
         if is_dict_badge:
             badge_match["python_path"] = f"['views'][{view_idx}]['badges'][{badge_idx}]"
+        if hits is not None:
+            badge_match["matched"] = hits
         matches.append(badge_match)
     return matches
 
 
 def _find_header_card_matches(
-    view: dict[str, Any], view_idx: int, frame: _CardWalkFrame
+    view: dict[str, Any], frame: _CardWalkFrame
 ) -> list[dict[str, Any]]:
     """Search a sections-view header card (views[n].header.card).
 
     The header accepts a card (typically Markdown) that can contain entity refs.
     """
-    header = view.get("header", {})
-    if not isinstance(header, dict):
+    view_idx = frame.view_index
+    if not frame.criteria.can_match_cards():
         return []
-    header_card = header.get("card")
-    if not isinstance(header_card, dict):
+    header = view.get("header")
+    if not isinstance(header, dict):
+        frame.gaps.note_unread(header, f".views[{view_idx}].header")
+        return []
+    if header.get("card") is None:
         return []
     return _walk_card(
-        header_card,
+        header["card"],
         jq_prefix=f".views[{view_idx}].header.card",
         python_prefix=f"['views'][{view_idx}]['header']['card']",
         frame=frame,
@@ -667,161 +694,150 @@ def _find_header_card_matches(
 
 
 def _find_view_card_matches(
-    view: dict[str, Any], view_idx: int, frame: _CardWalkFrame
+    view: dict[str, Any], frame: _CardWalkFrame
 ) -> list[dict[str, Any]]:
-    """Search the top-level cards of a view (sections-based or flat layout)."""
-    matches: list[dict[str, Any]] = []
-    view_type = view.get("type", "masonry")
+    """Search a view's top-level cards: its ``cards`` and every section's ``cards``.
 
-    if view_type == "sections":
-        sections = view.get("sections", [])
-        for section_idx, section in enumerate(sections):
-            if not isinstance(section, dict):
-                continue
-            cards = section.get("cards", [])
-            for card_idx, card in enumerate(cards):
-                matches.extend(
-                    _walk_card(
-                        card,
-                        jq_prefix=f".views[{view_idx}].sections[{section_idx}].cards[{card_idx}]",
-                        python_prefix=f"['views'][{view_idx}]['sections'][{section_idx}]['cards'][{card_idx}]",
-                        frame=frame.with_indices(
-                            section_index=section_idx, card_index=card_idx
-                        ),
-                    )
-                )
-    else:
-        cards = view.get("cards", [])
+    Both are read whatever the view's ``type``: the frontend renders a view
+    with ``sections`` and no ``type`` as a sections view, and cards a view type
+    does not render still reference entities a rename or removal must find.
+    """
+    if not frame.criteria.can_match_cards():
+        return []
+    matches: list[dict[str, Any]] = []
+    for base, base_py, cards, section_idx in _view_card_lists(view, frame):
         for card_idx, card in enumerate(cards):
             matches.extend(
                 _walk_card(
                     card,
-                    jq_prefix=f".views[{view_idx}].cards[{card_idx}]",
-                    python_prefix=f"['views'][{view_idx}]['cards'][{card_idx}]",
-                    frame=frame.with_indices(section_index=None, card_index=card_idx),
+                    jq_prefix=f"{base}[{card_idx}]",
+                    python_prefix=f"{base_py}[{card_idx}]",
+                    frame=frame.with_indices(
+                        section_index=section_idx, card_index=card_idx
+                    ),
                 )
             )
     return matches
 
 
-def _find_cards_in_config(
+def _view_card_lists(
+    view: dict[str, Any], frame: _CardWalkFrame
+) -> list[tuple[str, str, list[Any], int | None]]:
+    """``(jq path, python path, cards, section index)`` per card list in a view.
+
+    A container present in a shape the walk does not read is recorded in
+    ``frame.gaps``.
+    """
+    view_idx = frame.view_index
+    lists: list[tuple[str, str, list[Any], int | None]] = []
+    cards = view.get("cards")
+    if isinstance(cards, list):
+        lists.append(
+            (
+                f".views[{view_idx}].cards",
+                f"['views'][{view_idx}]['cards']",
+                cards,
+                None,
+            )
+        )
+    else:
+        frame.gaps.note_unread(cards, f".views[{view_idx}].cards")
+    sections = view.get("sections")
+    if not isinstance(sections, list):
+        frame.gaps.note_unread(sections, f".views[{view_idx}].sections")
+        return lists
+    for section_idx, section in enumerate(sections):
+        path = f".views[{view_idx}].sections[{section_idx}]"
+        if not isinstance(section, dict):
+            frame.gaps.unread.append(path)
+            continue
+        section_cards = section.get("cards")
+        if not isinstance(section_cards, list):
+            frame.gaps.note_unread(section_cards, f"{path}.cards")
+            continue
+        lists.append(
+            (
+                f"{path}.cards",
+                f"['views'][{view_idx}]['sections'][{section_idx}]['cards']",
+                section_cards,
+                section_idx,
+            )
+        )
+    return lists
+
+
+def _find_cards_matching(
     config: dict[str, Any],
-    entity_id: str | None = None,
-    card_type: str | None = None,
-    heading: str | None = None,
-    truncation: list[str] | None = None,
-    uncovered: list[str] | None = None,
+    criteria: _SearchCriteria,
+    gaps: _SearchGaps,
 ) -> list[dict[str, Any]]:
+    """Find cards, badges, and header cards in a dashboard config matching ``criteria``.
+
+    ``query`` (case-insensitive) requires a string the card itself holds to
+    contain it, and each such match lists the hits under ``matched``. Cards
+    are searched in a view's ``cards`` and its sections, in every card slot
+    nested at any depth (see ``_split_card_node``), plus view-level badges and
+    sections-view header cards.
+
+    Each match carries ``jq_path``, and ``python_path`` (appended after
+    ``config`` in ``ha_config_set_dashboard(python_transform)``) except a
+    bare-string badge, which is not subscript-assignable. What the walk
+    could not search is recorded in ``gaps``: subtrees past the depth bound,
+    cards holding one of ``_NON_CARD_CHILD_KEYS``, and entries the walk does
+    not read (an untyped card, or a view, section, card list or badge in
+    another shape).
+    Empty criteria match everything, so callers must reject them first (the
+    search entry point, ``_get_dashboard_search_mode``, does).
     """
-    Find cards, badges, and header cards in a dashboard config matching the search criteria.
-
-    Returns a list of matches with location info and card/badge/header config.
-    Searches cards (in sections and flat views), view-level badges, and
-    sections-view header cards (views[n].header.card). Card search recurses into
-    nested containers (``cards`` lists in stacks/grids, ``card`` dicts in
-    conditional/wrapper cards, ``custom_fields`` sub-cards in button-card, and
-    ``states`` sub-cards in custom:state-switch), so a nested card is found like
-    a top-level one (issue #1599) — up to a depth bound.
-
-    Each match carries both ``jq_path`` (jq dot-notation) and ``python_path``
-    (a Python subscript chain appended after ``config`` for
-    ``ha_config_set_dashboard(python_transform)``); these locate nested as well
-    as top-level cards. The flat ``*_index`` fields identify the top-level
-    container only. If ``truncation`` is provided, the prefixes of any subtrees
-    skipped at the depth bound are appended to it. If ``uncovered`` is provided,
-    the paths of any walked cards carrying a non-traversed child-bearing key
-    (e.g. picture-elements ``elements``) are appended to it.
-    """
-    matches: list[dict[str, Any]] = []
-
+    views = config.get("views")
     if "strategy" in config:
-        return []  # Strategy dashboards don't have explicit cards
-
-    views = config.get("views", [])
+        return []  # Strategy dashboards hold no stored cards
+    if not isinstance(views, list):
+        gaps.note_unread(views, ".views")
+        return []
+    matches: list[dict[str, Any]] = []
     for view_idx, view in enumerate(views):
         if not isinstance(view, dict):
+            gaps.unread.append(f".views[{view_idx}]")
             continue
-
-        matches.extend(
-            _find_badge_matches_in_view(view, view_idx, entity_id, card_type, heading)
-        )
-
         frame = _CardWalkFrame(
-            entity_id,
-            card_type,
-            heading,
+            criteria,
             view_index=view_idx,
             section_index=None,
             card_index=None,
             depth=0,
-            truncation=truncation,
-            uncovered=uncovered,
+            gaps=gaps,
         )
-        matches.extend(_find_header_card_matches(view, view_idx, frame))
-        matches.extend(_find_view_card_matches(view, view_idx, frame))
-
+        matches.extend(_find_badge_matches_in_view(view, frame))
+        matches.extend(_find_header_card_matches(view, frame))
+        matches.extend(_find_view_card_matches(view, frame))
     return matches
 
 
-def _card_matches(
-    card: dict[str, Any],
-    entity_id: str | None,
-    card_type: str | None,
-    heading: str | None,
-) -> bool:
-    """Check if a card matches the search criteria."""
-    # Type filter
-    if card_type is not None:
-        if card.get("type") != card_type:
+def _card_matches(card: dict[str, Any], criteria: _SearchCriteria) -> bool:
+    """Check if a card matches the entity_id / card_type / heading criteria."""
+    if criteria.card_type is not None and card.get("type") != criteria.card_type:
+        return False
+
+    if criteria.entity_id is not None:
+        rows = card.get("entities")
+        values = [card.get("entity")] + [
+            row.get("entity") if isinstance(row, dict) else row
+            for row in (rows if isinstance(rows, list) else [])
+        ]
+        # Rows such as dividers carry no entity; _entity_matches skips them.
+        if not any(_entity_matches(criteria.entity_id, v) for v in values):
             return False
 
-    # Entity filter (supports partial matching with *)
-    if entity_id is not None:
-        card_entity = card.get("entity", "")
-        # Also check entities list for cards that have multiple entities
-        card_entities = card.get("entities", [])
-        if isinstance(card_entities, list):
-            all_entities = [card_entity] + [
-                e.get("entity", e) if isinstance(e, dict) else e for e in card_entities
-            ]
-        else:
-            all_entities = [card_entity]
-
-        # Support wildcard matching
-        if "*" in entity_id:
-            pattern = entity_id.replace(".", r"\.").replace("*", ".*")
-            if not any(re.match(pattern, e) for e in all_entities if e):
-                return False
-        else:
-            if entity_id not in all_entities:
-                return False
-
-    # Heading filter (for heading cards or section titles)
-    if heading is not None:
-        card_heading = card.get("heading", card.get("title", ""))
-        # Case-insensitive partial match
-        if heading.lower() not in card_heading.lower():
+    if criteria.heading is not None:
+        card_heading = card.get("heading", card.get("title"))
+        if (
+            card_heading is None
+            or criteria.heading.lower() not in str(card_heading).lower()
+        ):
             return False
 
     return True
-
-
-# Substring in WS error message that signals the dashboard identifier was not
-# accepted by lovelace/config (e.g., caller passed an internal id where url_path
-# is expected). Used to gate the lazy resolver fallback in get/set tools.
-#
-# Source: homeassistant/components/lovelace/websocket.py, _handle_errors —
-# emits f"Unknown config specified: {url_path}" paired with structured
-# error.code "config_not_found". The websocket client currently surfaces only
-# the message string, so substring matching is the only signal available at
-# the tool layer. If HA reformats this string, the lazy fallback regresses
-# silently to never firing — re-verify with major HA upgrades.
-_LAZY_RESOLVE_TRIGGER = "Unknown config specified"
-
-
-def _should_lazy_resolve(error_msg: str) -> bool:
-    """Return True if a WS error message indicates the identifier needs resolving."""
-    return _LAZY_RESOLVE_TRIGGER in error_msg
 
 
 # The ha_mcp_tools/dashboards WS command: list / get / search over the live
@@ -845,19 +861,13 @@ WS_DASHBOARDS = "ha_mcp_tools/dashboards"
 # since listing metadata is safe.
 _DASHBOARD_STORAGE_MODE = "storage"
 
-# Cross-dashboard ``search`` match cap — mirrors the component's
-# ``_DASHBOARD_MATCH_CAP`` so the component-less legacy walk truncates identically
-# (parity pinned by test_component_dashboards_contract.py).
-_SEARCH_ALL_MATCH_CAP = 200
-
-# Structural keys walked as their own card containers, never scored as leaf
-# strings — mirrors the component's ``_DASHBOARD_STRUCTURAL_KEYS``.
-_SEARCH_ALL_STRUCTURAL_KEYS = frozenset({"cards", "sections"})
+# Card search match cap, so one response stays bounded.
+_SEARCH_MATCH_CAP = 200
 
 
 async def _dashboards_via_component(
     client: Any,
-    mode: str,
+    mode: Literal["list", "get", "search", "docs"],
     *,
     url_path: str | None = None,
     query: str | None = None,
@@ -866,7 +876,7 @@ async def _dashboards_via_component(
 
     Global-Constraint-2 idiom (mirrors
     ``component_devices.fetch_device_via_component``). Returns the component's
-    ``result`` dict for ``mode`` (``list`` / ``get`` / ``search``) when the
+    ``result`` dict for ``mode`` (``list`` / ``get`` / ``search`` / ``docs``) when the
     component advertises the ``dashboards`` capability AND reports
     ``available: true`` (the lovelace integration is set up). Returns ``None`` —
     the caller runs its unchanged legacy path — on capability miss, downgrade
@@ -892,7 +902,11 @@ async def _dashboards_via_component(
     if query is not None:
         kwargs["query"] = query
     try:
-        ws = await get_websocket_client(url=client.base_url, token=client.token)
+        ws = await get_websocket_client(
+            url=client.base_url,
+            token=client.token,
+            verify_ssl=getattr(client, "verify_ssl", None),
+        )
         raw = await ws.send_command(WS_DASHBOARDS, **kwargs)
     except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
         if is_unknown_command(exc):
@@ -900,7 +914,7 @@ async def _dashboards_via_component(
         else:
             logger.warning("%s failed; fell back to legacy: %r", WS_DASHBOARDS, exc)
         return None
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # HomeAssistantConnectionError: a pooled-WS drop or a failed
         # (re)connect. Fall back to the
         # legacy bridge rather than escape here; if the transport is genuinely
@@ -960,9 +974,24 @@ async def _component_dashboard_config(
     internal id) both return ``None`` so the caller runs its unchanged legacy
     read. ``url_path`` ``None`` targets the default dashboard.
     """
+    status, config = await _component_dashboard_read(client, url_path)
+    return config if status == "ok" else None
+
+
+async def _component_dashboard_read(
+    client: Any, url_path: str | None
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The component ``get``'s status and config; ``(None, None)`` when the
+    component is unavailable or its body is malformed.
+
+    ``no_config`` is Core's ``ConfigNotFound`` (see ``dashboard_read_errors``).
+    """
     result = await _dashboards_via_component(client, "get", url_path=url_path)
-    if result is None or result.get("status") != "ok":
-        return None
+    if result is None:
+        return None, None
+    status = result.get("status")
+    if status != "ok":
+        return status, None
     config = result.get("config")
     if not isinstance(config, dict):
         logger.debug(
@@ -971,304 +1000,8 @@ async def _component_dashboard_config(
             WS_DASHBOARDS,
             url_path,
         )
-        return None
-    return config
-
-
-# --- Cross-dashboard search walk (component-less legacy path) -----------------
-# Byte-for-byte port of the component's ``_search_dashboard_docs`` walk
-# (custom_components/ha_mcp_tools/websocket_api.py) so a component-less install
-# gets the SAME cross-dashboard ``search`` matches, just at N+1 WS cost. The two
-# implementations are pinned equal by test_component_dashboards_contract.py.
-
-
-def _walk_all_dashboard_docs(
-    docs: list[dict[str, Any]], query_lower: str
-) -> tuple[list[dict[str, Any]], bool]:
-    """Walk each dashboard config for ``query_lower``; return ``(matches, truncated)``.
-
-    An empty query matches nothing (a bare substring would match every string).
-    Matches are capped at :data:`_SEARCH_ALL_MATCH_CAP` with a ``truncated`` flag.
-    """
-    if not query_lower:
-        return [], False
-    matches: list[dict[str, Any]] = []
-    for doc in docs:
-        _collect_all_dashboard_doc_matches(doc, query_lower, matches)
-    truncated = len(matches) > _SEARCH_ALL_MATCH_CAP
-    return matches[:_SEARCH_ALL_MATCH_CAP], truncated
-
-
-def _collect_all_dashboard_doc_matches(
-    doc: dict[str, Any], query_lower: str, matches: list[dict[str, Any]]
-) -> None:
-    """Append every ``query_lower`` hit in one dashboard config to ``matches``.
-
-    Walks each view's card containers (``cards`` + sections-view ``sections.cards``,
-    nested cards recursed), plus the two view-level containers the card walk never
-    visits: ``badges`` and a sections-view ``header.card``. Mirrors the component's
-    ``_collect_dashboard_matches`` visit order exactly so both paths return the
-    same match records (a badge- or header-card-only entity reference is no longer
-    a cross-path blind spot).
-    """
-    config = doc.get("config")
-    if not isinstance(config, dict):
-        return
-    views = config.get("views")
-    if not isinstance(views, list):
-        return
-    url_path = doc.get("url_path")
-    dash_title = doc.get("title")
-    for view_index, view in enumerate(views):
-        if not isinstance(view, dict):
-            continue
-        view_title = view.get("title")
-        for cards, base_path in _all_dashboard_view_card_containers(view, view_index):
-            _collect_all_dashboard_card_matches(
-                cards,
-                base_path,
-                url_path,
-                dash_title,
-                view_index,
-                view_title,
-                query_lower,
-                matches,
-            )
-        _collect_all_dashboard_badge_matches(
-            view, view_index, url_path, dash_title, view_title, query_lower, matches
-        )
-        _collect_all_dashboard_header_card_matches(
-            view, view_index, url_path, dash_title, view_title, query_lower, matches
-        )
-
-
-def _all_dashboard_view_card_containers(
-    view: dict[str, Any], view_index: int
-) -> list[tuple[Any, str]]:
-    """The card lists in a view: top-level ``cards`` plus each section's ``cards``."""
-    containers: list[tuple[Any, str]] = []
-    if isinstance(view.get("cards"), list):
-        containers.append((view["cards"], f"views[{view_index}].cards"))
-    sections = view.get("sections")
-    if isinstance(sections, list):
-        for si, section in enumerate(sections):
-            if isinstance(section, dict) and isinstance(section.get("cards"), list):
-                containers.append(
-                    (section["cards"], f"views[{view_index}].sections[{si}].cards")
-                )
-    return containers
-
-
-def _all_dashboard_match(
-    url_path: Any,
-    dash_title: Any,
-    view_index: int,
-    view_title: Any,
-    card_path: str,
-    card_type: Any,
-    matched_field: str,
-    matched_value: str,
-) -> dict[str, Any]:
-    """One MODE 4 cross-dashboard search match record (shared, fixed shape).
-
-    Mirrors the component's ``_dashboard_match`` so every match site — cards,
-    badges, header cards — emits the identical wire shape on both paths.
-    """
-    return {
-        "url_path": url_path,
-        "title": dash_title,
-        "view_index": view_index,
-        "view_title": view_title,
-        "card_path": card_path,
-        "card_type": card_type,
-        "matched_field": matched_field,
-        "matched_value": matched_value,
-    }
-
-
-def _collect_all_dashboard_card_matches(
-    cards: Any,
-    base_path: str,
-    url_path: Any,
-    dash_title: Any,
-    view_index: int,
-    view_title: Any,
-    query_lower: str,
-    matches: list[dict[str, Any]],
-) -> None:
-    """Recurse a card list, recording one match per string leaf containing the query."""
-    if not isinstance(cards, list):
-        return
-    for card_index, card in enumerate(cards):
-        if not isinstance(card, dict):
-            continue
-        _collect_one_all_dashboard_card_matches(
-            card,
-            f"{base_path}[{card_index}]",
-            url_path,
-            dash_title,
-            view_index,
-            view_title,
-            query_lower,
-            matches,
-        )
-
-
-def _collect_one_all_dashboard_card_matches(
-    card: dict[str, Any],
-    card_path: str,
-    url_path: Any,
-    dash_title: Any,
-    view_index: int,
-    view_title: Any,
-    query_lower: str,
-    matches: list[dict[str, Any]],
-) -> None:
-    """Record matches for a SINGLE card at ``card_path`` and recurse its nested cards.
-
-    Mirrors the component's ``_collect_one_card_matches`` — shared by the
-    list-indexed card walk and the header-card walk (a header card is a single
-    card, not list-indexed).
-    """
-    card_type = card.get("type")
-    for field, value in _all_dashboard_card_string_leaves(card):
-        if query_lower in value.lower():
-            matches.append(
-                _all_dashboard_match(
-                    url_path,
-                    dash_title,
-                    view_index,
-                    view_title,
-                    card_path,
-                    card_type,
-                    field,
-                    value,
-                )
-            )
-    nested = card.get("cards")
-    if isinstance(nested, list):
-        _collect_all_dashboard_card_matches(
-            nested,
-            f"{card_path}.cards",
-            url_path,
-            dash_title,
-            view_index,
-            view_title,
-            query_lower,
-            matches,
-        )
-
-
-def _collect_all_dashboard_badge_matches(
-    view: dict[str, Any],
-    view_index: int,
-    url_path: Any,
-    dash_title: Any,
-    view_title: Any,
-    query_lower: str,
-    matches: list[dict[str, Any]],
-) -> None:
-    """Record query hits in a view's ``badges`` — entity refs the card walk misses.
-
-    Mirrors the component's ``_collect_badge_matches``: a bare-string badge is
-    recorded as a ``badges`` leaf (``card_type="badge"``); a dict badge's string
-    leaves are walked like a card's (``card_type`` = its ``type`` or ``"badge"``).
-    """
-    badges = view.get("badges")
-    if not isinstance(badges, list):
-        return
-    for badge_index, badge in enumerate(badges):
-        badge_path = f"views[{view_index}].badges[{badge_index}]"
-        if isinstance(badge, str):
-            if badge and query_lower in badge.lower():
-                matches.append(
-                    _all_dashboard_match(
-                        url_path,
-                        dash_title,
-                        view_index,
-                        view_title,
-                        badge_path,
-                        "badge",
-                        "badges",
-                        badge,
-                    )
-                )
-        elif isinstance(badge, dict):
-            badge_type = badge.get("type") or "badge"
-            for field, value in _all_dashboard_card_string_leaves(badge):
-                if query_lower in value.lower():
-                    matches.append(
-                        _all_dashboard_match(
-                            url_path,
-                            dash_title,
-                            view_index,
-                            view_title,
-                            badge_path,
-                            badge_type,
-                            field,
-                            value,
-                        )
-                    )
-
-
-def _collect_all_dashboard_header_card_matches(
-    view: dict[str, Any],
-    view_index: int,
-    url_path: Any,
-    dash_title: Any,
-    view_title: Any,
-    query_lower: str,
-    matches: list[dict[str, Any]],
-) -> None:
-    """Record query hits in a sections-view header card (``views[n].header.card``).
-
-    Mirrors the component's ``_collect_header_card_matches`` — the card walk never
-    visits the header card, so it is walked here as a single card.
-    """
-    header = view.get("header")
-    if not isinstance(header, dict):
-        return
-    header_card = header.get("card")
-    if not isinstance(header_card, dict):
-        return
-    _collect_one_all_dashboard_card_matches(
-        header_card,
-        f"views[{view_index}].header.card",
-        url_path,
-        dash_title,
-        view_index,
-        view_title,
-        query_lower,
-        matches,
-    )
-
-
-def _all_dashboard_card_string_leaves(card: dict[str, Any]) -> list[tuple[str, str]]:
-    """``(immediate_key, string)`` for every string leaf of a card.
-
-    Descends nested dicts/lists but NOT the structural ``cards``/``sections`` keys
-    (those are walked as their own cards). The key attributed to a leaf is the
-    nearest dict key, matching the component's field taxonomy.
-    """
-    out: list[tuple[str, str]] = []
-    _walk_all_dashboard_card_leaves(card, "", out)
-    return out
-
-
-def _walk_all_dashboard_card_leaves(
-    value: Any, key: str, out: list[tuple[str, str]]
-) -> None:
-    """Recursive worker for :func:`_all_dashboard_card_string_leaves`."""
-    if isinstance(value, str):
-        if value:
-            out.append((key, value))
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            if k not in _SEARCH_ALL_STRUCTURAL_KEYS:
-                _walk_all_dashboard_card_leaves(v, str(k), out)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _walk_all_dashboard_card_leaves(item, key, out)
+        return None, None
+    return status, config
 
 
 async def fetch_dashboards_list(
@@ -1282,7 +1015,8 @@ async def fetch_dashboards_list(
     every fetch site rather than silently degrading.
 
     When the ``ha_mcp_tools`` component advertises the ``dashboards`` capability
-    the storage-only rows are served from one in-process ``list`` frame (the
+    the rows — YAML rows included, tagged with ``mode`` (see
+    ``_component_dashboard_rows``) — are served from one in-process ``list`` frame (the
     ``_resolve_dashboard`` / ``_lookup_existing_dashboards`` / list-mode callers
     all funnel here); otherwise the legacy ``lovelace/dashboards/list`` WS read
     runs unchanged.
@@ -1329,17 +1063,17 @@ async def _resolve_dashboard(
     Three call sites:
     - **Lazy fallback** (``_lazy_resolve_and_retry``): only invoked after
       ``lovelace/config`` rejected the identifier with
-      ``_LAZY_RESOLVE_TRIGGER`` — the round-trip is gated by the caller.
+      ``UNKNOWN_CONFIG_PREFIX`` — the round-trip is gated by the caller.
       Discards ``dashboards``.
     - **Eager pre-resolve** (``_resolve_set_dashboard_url_path``, called
-      from ``ha_config_set_dashboard``): invoked before hyphen validation
-      so callers may pass either form; gated on a cheap heuristic ("no
-      hyphen, not 'lovelace'") rather than an error from HA. Reuses
+      from ``ha_config_set_dashboard``): lets callers pass either form;
+      gated on a cheap heuristic ("no hyphen, not 'lovelace'") rather than
+      an error from HA. Reuses
       ``dashboards`` for the existence-check in ``_lookup_existing_dashboards``
       (threaded through as ``pre_fetched_dashboards``).
     - **Delete** (``ha_config_delete_dashboard``): resolves either form
-      to the registry id before issuing the delete. Discards
-      ``dashboards``.
+      to the registry id before issuing the delete; ``dashboards`` names
+      a YAML-mode match or the available paths on a miss.
     """
     dashboards = await fetch_dashboards_list(client)
     if dashboards is None:
@@ -1388,7 +1122,7 @@ async def _lazy_resolve_and_retry(
     """Trigger-gated lazy resolve + single retry of a lovelace/config call.
 
     If `response` indicates HA rejected the identifier with the
-    _LAZY_RESOLVE_TRIGGER substring, resolves `url_path` via
+    UNKNOWN_CONFIG_PREFIX substring, resolves `url_path` via
     lovelace/dashboards/list and retries the WS call with the canonical
     url_path. Returns the (possibly updated) url_path and the
     (possibly retried) response so the caller can chain naturally:
@@ -1400,8 +1134,8 @@ async def _lazy_resolve_and_retry(
     No-op when:
     - the response is not a failure (success=True or non-dict),
     - ``url_path`` is empty,
-    - the error message does not contain ``_LAZY_RESOLVE_TRIGGER``
-      (the substring miss),
+    - Core's code is not ``config_not_found``, or its message does not
+      name the identifier as unknown,
     - the resolver finds no match,
     - or the resolver itself raises (logged at WARNING).
 
@@ -1420,12 +1154,12 @@ async def _lazy_resolve_and_retry(
 
     err = response.get("error", {})
     err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-    if not _should_lazy_resolve(err_msg):
+    if not config_not_found(response) or not is_unknown_dashboard(err_msg):
         return url_path, response
 
     try:
         resolved, _ = await _resolve_dashboard(client, url_path)
-    except Exception as resolver_exc:
+    except Exception as resolver_exc:  # noqa: BLE001
         # Resolver itself raised (timeout, network blip, etc.). Don't let
         # this exception escape and replace the original HA error with
         # one about the resolver — fall through with the original
@@ -1461,7 +1195,7 @@ def _attach_dashboard_render_paths(
         result.setdefault("warnings", []).extend(warnings)
 
 
-async def _attach_dashboard_render_paths_after_write(
+async def attach_dashboard_render_paths_after_write(
     client: Any,
     result: dict[str, Any],
     url_path: str,
@@ -1473,8 +1207,11 @@ async def _attach_dashboard_render_paths_after_write(
     back before claiming canonical render paths. The submitted config remains a
     screenshot-targeting fallback only when that readback fails.
     """
+    result.update(config_hash=None, write_committed=True, post_write_verified=False)
     try:
-        authoritative_config, _ = await _get_dashboard_config_internal(client, url_path)
+        authoritative_config, config_hash = await _get_dashboard_config_internal(
+            client, url_path
+        )
     except ToolError as exc:
         result.setdefault("warnings", []).append(
             "Canonical render paths unavailable after the dashboard write: "
@@ -1495,31 +1232,34 @@ async def _attach_dashboard_render_paths_after_write(
             f"Canonical render paths unavailable after the dashboard write: {exc}"
         )
         return fallback_config
+    result.update(config_hash=config_hash, post_write_verified=True)
     _attach_dashboard_render_paths(result, url_path, authoritative_config)
     return authoritative_config
 
 
-def _note_screenshot_ignored(
+def note_screenshot_ignored(
     result: dict[str, Any],
     *,
     include_screenshot: bool,
     full_page: bool = False,
-    options: _DashboardScreenshotOptions | None = None,
+    options: DashboardScreenshotOptions | None = None,
     mode: str,
 ) -> None:
-    """Warn when a screenshot was requested in a mode that can't render one.
+    """Warn when get-mode-only options are passed to a mode that ignores them.
 
-    Screenshot options are only honoured in get mode. In list and search mode
-    they are accepted but inapplicable, so surface a
-    ``warnings`` entry rather than dropping the request as a silent no-op
-    (matches the warn-don't-fail contract the params document)."""
-    capture_options = options or _DashboardScreenshotOptions(full_page=full_page)
-    if include_screenshot or capture_options != _DashboardScreenshotOptions():
+    Screenshot options — and ``view_path``, which is a get-mode scoping
+    parameter that merely travels inside the options dataclass — are only
+    honoured in get mode. In list and search mode they are accepted but
+    inapplicable, so surface a ``warnings`` entry rather than dropping the
+    request as a silent no-op (matches the warn-don't-fail contract the
+    params document)."""
+    capture_options = options or DashboardScreenshotOptions(full_page=full_page)
+    if include_screenshot or capture_options != DashboardScreenshotOptions():
         result.setdefault("warnings", []).append(
-            f"include_screenshot and screenshot render options are ignored in {mode} "
-            "mode; call "
+            f"include_screenshot, view_path, and screenshot render options are "
+            f"ignored in {mode} mode; call "
             "ha_config_get_dashboard with a url_path (and no search criteria) "
-            "to get a screenshot."
+            "to scope to a view or get a screenshot."
         )
 
 
@@ -1529,7 +1269,7 @@ async def _capture_dashboard_screenshot_result(
     *,
     client: Any | None,
     config: dict[str, Any] | None,
-    options: _DashboardScreenshotOptions,
+    options: DashboardScreenshotOptions,
 ) -> ToolResult:
     """Render configured captures and attach their ordered MCP metadata."""
     from ..dashboard_screenshot import capture as screenshot_capture
@@ -1601,7 +1341,7 @@ async def _capture_dashboard_screenshot_result(
         )
     except ToolError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         error_payload = create_error_response(
             ErrorCode.IMAGE_SERIALIZATION_FAILED,
             "Rendered dashboard images could not be packaged into the MCP response.",
@@ -1619,17 +1359,17 @@ async def _capture_dashboard_screenshot_result(
     raise AssertionError("unreachable: raise_tool_error always raises")
 
 
-async def _maybe_attach_screenshot(
+async def maybe_attach_screenshot(
     result: dict[str, Any],
     url_path: str | None,
     requested: bool,
     *,
     client: Any | None = None,
     config: dict[str, Any] | None = None,
-    options: _DashboardScreenshotOptions | None = None,
+    options: DashboardScreenshotOptions | None = None,
     full_page: bool = False,
     raise_on_failure: bool = False,
-) -> "dict[str, Any] | ToolResult":
+) -> dict[str, Any] | ToolResult:
     """Optionally render a dashboard and attach ordered native image blocks.
 
     Shared by ``ha_config_get_dashboard`` (include_screenshot) and
@@ -1648,12 +1388,12 @@ async def _maybe_attach_screenshot(
     warning the caller may never inspect. A disabled feature flag is always a
     warning either way — it is an expected configuration state, not a failure.
     """
-    capture_options = options or _DashboardScreenshotOptions(full_page=full_page)
+    capture_options = options or DashboardScreenshotOptions(full_page=full_page)
     if options is not None and full_page and not capture_options.full_page:
         capture_options = replace(capture_options, full_page=True)
 
     if not requested:
-        defaults = _DashboardScreenshotOptions()
+        defaults = DashboardScreenshotOptions()
         if capture_options != defaults:
             result.setdefault("warnings", []).append(
                 "Screenshot render options are ignored because no screenshot "
@@ -1682,7 +1422,7 @@ async def _maybe_attach_screenshot(
     except ToolError as e:
         if raise_on_failure:
             raise
-        return _attach_screenshot_tool_error(result, e)
+        return attach_screenshot_tool_error(result, e)
     except Exception as e:
         # On the set path a screenshot failure must never break a write that
         # already committed, so catch everything non-ToolError (lazy import
@@ -1700,13 +1440,13 @@ async def _maybe_attach_screenshot(
         return result
 
 
-def _attach_screenshot_tool_error(
+def attach_screenshot_tool_error(
     result: dict[str, Any], error: ToolError
 ) -> dict[str, Any]:
     """Preserve a structured capture failure on an already-committed write."""
     try:
         error_payload = json.loads(str(error))
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError, TypeError:
         error_payload = {}
     if not isinstance(error_payload, dict):
         error_payload = {}
@@ -1738,6 +1478,88 @@ def _attach_screenshot_tool_error(
     return result
 
 
+def _find_cards_in_docs(
+    docs: list[dict[str, Any]], criteria: _SearchCriteria, *, name_dashboards: bool
+) -> tuple[list[dict[str, Any]], _SearchGaps]:
+    """Matches over ``docs`` (``{url_path, config}``) and where the search could not look.
+
+    Each match is stamped with its dashboard's ``url_path`` and ``config_hash``;
+    with ``name_dashboards`` each gap location is prefixed with ``<url_path>:``.
+    """
+    matches: list[dict[str, Any]] = []
+    gaps = _SearchGaps()
+    for doc in docs:
+        # The default dashboard has no url_path; "default" is what the get and
+        # set tools accept for it.
+        url_path = doc["url_path"] or "default"
+        doc_gaps = _SearchGaps()
+        found = _find_cards_matching(doc["config"], criteria, doc_gaps)
+        if found:
+            config_hash = compute_config_hash(doc["config"])
+            for match in found:
+                match["url_path"] = url_path
+                match["config_hash"] = config_hash
+        matches.extend(found)
+        gaps.extend(doc_gaps, f"{url_path}:" if name_dashboards else "")
+    return matches, gaps
+
+
+def _search_warnings(
+    *, truncated: bool, gaps: _SearchGaps, warn_uncovered: bool
+) -> list[str]:
+    """Warnings that keep an incomplete search from reading as complete.
+
+    Disclosure keys off the *presence* of a match cap, a depth-truncated
+    subtree, unsearched picture-elements or an unread entry, not off a
+    0-match. ``warn_uncovered`` gates the picture-elements warning.
+    """
+    uncovered = gaps.uncovered if warn_uncovered else []
+    warnings: list[str] = []
+    if truncated:
+        warnings.append(
+            f"Results capped at {_SEARCH_MATCH_CAP} matches; narrow the search "
+            "(url_path, card_type, query) for a complete list."
+        )
+    if gaps.truncation:
+        warnings.append(
+            f"Search stopped at a nesting depth bound in {len(gaps.truncation)} "
+            "place(s); content nested deeper was not searched, so results may "
+            "be incomplete."
+        )
+    if uncovered:
+        locations = ", ".join(sorted(set(uncovered)))
+        warnings.append(
+            "entity_id, card_type and heading do not match inside "
+            f"picture-elements 'elements', present at: {locations}. Use query= "
+            "to search their text, or fetch the full config to inspect them."
+        )
+    if gaps.unread:
+        warnings.append(
+            "Not searched as cards or badges (no 'type' key, or an entry in a "
+            f"shape the search does not read): {', '.join(gaps.unread)}. Fetch "
+            "the config to see them."
+        )
+    return warnings
+
+
+def _unread_dashboards_warning(failed: int | list[str]) -> list[str]:
+    """The warning for storage dashboards that could not be read.
+
+    ``failed`` is the component's count (it does not name them) or the url_paths
+    the legacy reads collected.
+    """
+    if not failed:
+        return []
+    if isinstance(failed, int):
+        return [
+            f"Could not read {failed} storage dashboard(s), so they were not searched."
+        ]
+    return [
+        f"Could not read {len(failed)} storage dashboard(s), so they were not "
+        f"searched: {', '.join(failed)}. Get one by url_path to see its error."
+    ]
+
+
 class DashboardConfigTools:
     """Home Assistant dashboard configuration tools."""
 
@@ -1747,12 +1569,7 @@ class DashboardConfigTools:
     @tool(
         name="ha_config_get_dashboard",
         tags={"Dashboards"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "title": "Get Dashboard",
-        },
+        annotations=read_only_hints("Get Dashboard", open_world=True),
     )
     @log_tool_usage
     async def ha_config_get_dashboard(
@@ -1760,166 +1577,141 @@ class DashboardConfigTools:
         url_path: Annotated[
             str | None,
             Field(
-                description="Dashboard URL path (e.g., 'lovelace-home'). "
-                "Use 'default' for default dashboard. "
-                "If omitted with list_only=True, lists all dashboards."
+                description="Dashboard URL path (e.g. 'lovelace-home'); 'default' for the "
+                "default dashboard."
             ),
         ] = None,
         list_only: Annotated[
             bool,
             Field(
-                description="If True, list all dashboards instead of getting config. "
-                "When True, url_path is ignored.",
+                description="List every dashboard's metadata instead of reading one; "
+                "ignored when a search parameter is given.",
             ),
         ] = False,
         force_reload: Annotated[
             bool,
             Field(
-                description="Force reload from storage (bypass cache). Not applicable in search mode (search always uses force=True for fresh results)."
+                description="Get only: bypass the config cache (searches always read "
+                "fresh config)."
             ),
         ] = False,
         entity_id: Annotated[
             str | None,
             Field(
-                description="Find cards by entity ID. Supports wildcards, e.g. "
-                "'sensor.temperature_*'. Matches cards with this entity in "
-                "'entity' or 'entities' field, view-level badges, and header cards. "
-                "When provided, activates search mode (returns matches, not full config)."
+                description="Search: cards whose entity/entities field holds this "
+                "entity ID; '*' matches any run of characters (including none) "
+                "and the whole ID must match (e.g. 'sensor.temperature_*')."
             ),
         ] = None,
         card_type: Annotated[
             str | None,
             Field(
-                description="Find cards by type, e.g. 'tile', 'button', 'heading'. "
-                "When provided, activates search mode."
+                description="Search: cards of this type, e.g. 'tile'; 'badge' selects "
+                "view badges instead (alone, it lists them all). With "
+                "describe=True: the type to describe."
             ),
         ] = None,
         heading: Annotated[
             str | None,
             Field(
-                description="Find cards by heading/title text (case-insensitive partial match). "
-                "When provided, activates search mode."
+                description="Search: cards whose heading/title contains this text "
+                "(case-insensitive)."
             ),
         ] = None,
         include_config: Annotated[
             bool,
             Field(
-                description="In search mode: include each matched card's own configuration "
-                "object in results (increases output size). Note that a matched container "
-                "card's config contains its descendants, which are themselves separate "
-                "matches with their own config, so deeply-nested stacks multiply the "
-                "payload — keep the default (False) unless you need the bodies. Does not "
-                "affect whether the full dashboard config is returned — search mode always "
-                "returns matches only, not the full dashboard. Config bodies are surfaced "
-                "only for dashboards provably in storage mode; for a YAML or unconfirmed "
-                "dashboard the bodies are withheld (they may carry resolved !secret values) "
-                "and the response says so, with match locations still reported. Ignored "
-                "outside search mode."
+                description="Search: include each matched card's own config. A "
+                "container's body includes its nested cards, which are also matches, "
+                "so nested stacks multiply the payload. Withheld, with a warning, for "
+                "a dashboard not provably storage-mode (a YAML config may carry "
+                "resolved !secret values)."
             ),
         ] = False,
         include_screenshot: Annotated[
             bool,
             Field(
-                description="Get mode only: also return rendered image(s) of the "
-                "dashboard for visual verification. Requires the 'dashboard "
-                "screenshot' beta feature + engine add-on/sidecar. If the "
-                "feature is disabled the config is returned with a warning; if "
-                "the engine is configured but the render fails, the call errors "
-                "(the screenshot is the requested payload). Ignored in "
-                "list/search mode."
+                description="Get mode only: also return rendered image(s) of the dashboard for "
+                "visual verification. Requires the 'dashboard screenshot' beta feature "
+                "+ engine app (add-on)/sidecar. If the feature is disabled the config "
+                "is returned with a warning; if the engine is configured but the render"
+                " fails, the call errors."
             ),
         ] = False,
         view_path: Annotated[
             str | None,
             Field(
-                description="With include_screenshot: stable Lovelace "
-                "views[].path to render. Omit to render the dashboard base route."
-            ),
-        ] = None,
-        mode: Annotated[
-            Literal["search"] | None,
-            Field(
-                description="Set to 'search' for a CROSS-dashboard search: which "
-                "dashboards contain a given entity_id or text (requires query). "
-                "Leave unset for the default list/get/single-dashboard-search "
-                "behavior selected by list_only / entity_id / card_type / heading."
+                description="Get mode: return ONLY the view whose Lovelace views[].path matches "
+                "(response carries 'view' + 'view_index' instead of the full 'config')."
+                " With include_screenshot, also selects the view to render."
             ),
         ] = None,
         query: Annotated[
             str | None,
             Field(
-                description="With mode='search': the entity_id or substring to "
-                "find across all storage-mode dashboards. Ignored otherwise."
+                description="Search: text or entity ID contained in any value a card "
+                "holds (case-insensitive); the matching values are listed under "
+                "`matched`."
             ),
         ] = None,
-    ) -> "dict[str, Any] | ToolResult":
-        """
-        Get dashboard info - list all dashboards, get config, or search for cards.
+        describe: Annotated[
+            bool,
+            Field(description="Return card_type's fields from HA's card editor"),
+        ] = False,
+    ) -> dict[str, Any] | ToolResult:
+        """Get Lovelace dashboards: list them, read one config, or search their cards.
 
-        MODE 1 — List: list_only=True
-          Lists every dashboard's metadata (url_path, title, icon), storage and
-          YAML alike (metadata only — bodies are never included here).
+        Not for a render alone: ha_get_dashboard_screenshot (screenshot beta
+        feature) returns images without the config. Not for entity discovery:
+        use ha_search.
 
-        MODE 2 — Search: any of entity_id / card_type / heading provided
-          Finds cards, badges, and header cards matching the criteria, including
-          cards nested inside stacks, grids, conditional cards, button-card
-          custom_fields, and state-switch states. Each match carries a
-          python_path and a jq_path that locate the card for nested as well as
-          top-level cards. The python_path is a Python subscript chain to be
-          appended after `config` — e.g.
-          python_transform=f'config{m["python_path"]}["icon"] = "mdi:x"' (it is
-          NOT valid on its own without the `config` prefix). jq_path is the same
-          location in jq dot-notation.
-          Multiple criteria are AND-ed. Always fetches fresh config (force=True).
-          Search covers cards/card/custom_fields/states containers up to a depth
-          bound; if the dashboard carries a non-traversed child-bearing shape
-          (e.g. picture-elements `elements`), the result carries a `warnings`
-          entry naming where, so its hidden content is not mistaken for absent.
-          Strategy dashboards are not searchable (no explicit cards).
+        The parameters pick the mode:
+        - list_only=True: storage and YAML dashboards alike.
+        - Any of query / entity_id / card_type / heading searches cards and
+          header cards, AND-ing the criteria, in url_path or, when it is
+          omitted, every storage dashboard. View badges answer entity_id and
+          query, and heading excludes them.
+          Cards nested at any depth count, including
+          custom cards' own keys such as groups[].cards[].card. Nesting is
+          found heuristically, under the keys cards, card, custom_fields and
+          states; a card under any other key is read only as its parent's
+          text, by query. Each match has a
+          jq_path and a python_path to append to `config` in
+          ha_config_set_dashboard(python_transform=...), e.g.
+          f'config{m["python_path"]}["icon"] = "mdi:x"'. Each match carries its
+          dashboard's url_path and config_hash; a one-dashboard search also
+          returns the config_hash at the top level.
+        - Otherwise the full config of url_path (the default dashboard when
+          omitted) is returned; with view_path only that view, while config_hash
+          still covers the full config. stored_config is false (config null)
+          when Home Assistant holds no config for the dashboard.
 
-        MODE 3 — Get: Active when list_only=False and no search parameters are provided.
-          Returns the full Lovelace dashboard config, defaulting to the
-          main dashboard if url_path is omitted.
-
-        MODE 4 — Search all: mode="search" with query=<entity_id or text>
-          Answers "which dashboards contain this entity/card" by walking every
-          storage-mode dashboard's views/cards/sections for the query substring.
-          Each match names the url_path, view, card_path, card_type, and the
-          matched field/value. Takes precedence over the other modes (list_only /
-          entity_id / card_type / heading are ignored when mode="search").
-          YAML-mode dashboards are never searched on either path — the component
-          walk skips them in-process and the component-less legacy walk skips any
-          row tagged mode="yaml" — because HA resolves `!secret` when loading a
-          YAML Lovelace config, so searching one could surface resolved secrets.
-          On installs without the ha_mcp_tools component, the default (unnamed)
-          dashboard is also not searched — only dashboards with a url_path are.
-
-        Return a stable `config_hash` (Get and Search modes only; not present in list_only mode) across consecutive reads of an unchanged config — `compute_config_hash` documents the underlying contract.
+        Caveats: config_hash stays the same across reads of an unchanged config.
+        Searches stop at 200 matches (`truncated`). A search across dashboards
+        skips YAML dashboards (HA resolves !secret in them) and, without a
+        current ha_mcp_tools component, the default dashboard (with a warning);
+        name either by url_path.
+        Strategy dashboards have no stored cards to search. An unknown view_path
+        errors and lists the available ones.
 
         EXAMPLES:
         - List all dashboards: ha_config_get_dashboard(list_only=True)
-        - Get default dashboard: ha_config_get_dashboard(url_path="default")
-        - Get custom dashboard: ha_config_get_dashboard(url_path="lovelace-mobile")
-        - Force reload: ha_config_get_dashboard(url_path="lovelace-home", force_reload=True)
-        - Find cards by entity: ha_config_get_dashboard(url_path="my-dash", entity_id="light.living_room")
-        - Find by wildcard: ha_config_get_dashboard(url_path="my-dash", entity_id="sensor.temperature_*")
-        - Find by type: ha_config_get_dashboard(url_path="my-dash", card_type="tile")
+        - Get one view only: ha_config_get_dashboard(url_path="lovelace-mobile", view_path="office")
+        - Find cards by entity (wildcards allowed): ha_config_get_dashboard(url_path="my-dash", entity_id="sensor.temperature_*")
         - Find heading: ha_config_get_dashboard(url_path="my-dash", heading="Climate", card_type="heading")
-
-        SEARCH WORKFLOW EXAMPLE:
-        1. find = ha_config_get_dashboard(url_path="my-dash", entity_id="light.bedroom")
-        2. ha_config_set_dashboard(
-               url_path="my-dash",
-               config_hash=find["config_hash"],
-               python_transform=f'config{find["matches"][0]["python_path"]}["icon"] = "mdi:lamp"'
-           )
-
-        Note: YAML-mode dashboards (defined in configuration.yaml) are not included in list.
+        - Which dashboards use an entity: ha_config_get_dashboard(query="light.bedroom")
+        - Fields of a card type before writing one (omit card_type to list types):
+          ha_config_get_dashboard(card_type="tile", describe=True)
         """
-        screenshot_options = _DashboardScreenshotOptions(view_path=view_path)
-        search_mode = (
-            entity_id is not None or card_type is not None or heading is not None
+        if describe:
+            return await describe_card_response(self._client, card_type)
+        screenshot_options = DashboardScreenshotOptions(view_path=view_path)
+        criteria = _SearchCriteria(
+            entity_id=entity_id, card_type=card_type, heading=heading, query=query
         )
+        # The raw parameters, not criteria.is_empty(): a blank-only search must
+        # reach its "Search needs ..." error instead of falling through to a get.
+        search_mode = any(v is not None for v in (query, entity_id, card_type, heading))
         # Mutable single-element holder so the mode helpers can surface the
         # lazy-resolved/canonicalized url_path back to this scope even when
         # they raise an unexpected (non-ToolError) exception instead of
@@ -1927,11 +1719,7 @@ class DashboardConfigTools:
         # accurate error context.
         resolved_url_path: list[str | None] = [url_path]
         try:
-            if mode == "search":
-                # Cross-dashboard search takes precedence over every other mode.
-                return await self._get_dashboard_search_all_mode(query)
-
-            if list_only:
+            if list_only and not search_mode:
                 return await self._get_dashboard_list_mode(
                     include_screenshot=include_screenshot,
                     screenshot_options=screenshot_options,
@@ -1960,10 +1748,9 @@ class DashboardConfigTools:
                 return await self._get_dashboard_search_mode(
                     url_path,
                     resolved_url_path=resolved_url_path,
-                    entity_id=entity_id,
-                    card_type=card_type,
-                    heading=heading,
+                    criteria=criteria,
                     include_config=include_config,
+                    list_only=list_only,
                     include_screenshot=include_screenshot,
                     screenshot_options=screenshot_options,
                 )
@@ -1972,33 +1759,24 @@ class DashboardConfigTools:
                 url_path,
                 resolved_url_path=resolved_url_path,
                 force_reload=force_reload,
+                view_path=view_path,
                 include_screenshot=include_screenshot,
                 screenshot_options=screenshot_options,
             )
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             effective_url_path = resolved_url_path[0]
-            if mode == "search":
-                suggestions = [
-                    "Check HA connection",
-                    "Verify dashboards with ha_config_get_dashboard(list_only=True)",
-                ]
-                context: dict[str, Any] = {
-                    "action": "search_all",
-                    "query": query,
-                }
-            elif search_mode:
+            context: dict[str, Any]
+            if search_mode:
                 suggestions = [
                     "Check HA connection",
                     "Verify dashboard with ha_config_get_dashboard(list_only=True)",
                 ]
                 context = {
-                    "action": "find_card",
+                    "action": "search",
                     "url_path": effective_url_path,
-                    "entity_id": entity_id,
-                    "card_type": card_type,
-                    "heading": heading,
+                    **asdict(criteria),
                 }
             else:
                 suggestions = [
@@ -2021,7 +1799,7 @@ class DashboardConfigTools:
         self,
         *,
         include_screenshot: bool,
-        screenshot_options: _DashboardScreenshotOptions,
+        screenshot_options: DashboardScreenshotOptions,
     ) -> dict[str, Any]:
         """``list_only=True`` mode: list every dashboard's metadata row.
 
@@ -2036,7 +1814,7 @@ class DashboardConfigTools:
             "dashboards": dashboards,
             "count": len(dashboards),
         }
-        _note_screenshot_ignored(
+        note_screenshot_ignored(
             list_result,
             include_screenshot=include_screenshot,
             options=screenshot_options,
@@ -2045,13 +1823,8 @@ class DashboardConfigTools:
         return list_result
 
     async def _fetch_search_dashboard_config(
-        self,
-        url_path: str | None,
-        *,
-        entity_id: str | None,
-        card_type: str | None,
-        heading: str | None,
-    ) -> tuple[dict[str, Any], str | None, str | None]:
+        self, url_path: str
+    ) -> tuple[dict[str, Any], str, str | None]:
         """Fetch + resolve the dashboard config for search mode.
 
         Returns ``(config, url_path, search_resolved_from)`` — ``url_path`` is
@@ -2060,25 +1833,23 @@ class DashboardConfigTools:
         it differed from the canonical form, else ``None``.
         """
         get_data: dict[str, Any] = {"type": "lovelace/config", "force": True}
-        effective_url_path: str | None = (
-            url_path if url_path and url_path != "default" else None
-        )
-        if effective_url_path is not None:
-            get_data["url_path"] = effective_url_path
+        lovelace_url_path = _lovelace_url_path(url_path)
+        if lovelace_url_path is not None:
+            get_data["url_path"] = lovelace_url_path
 
         response = await self._client.send_websocket_message(get_data)
 
         # Lazy resolver fallback: same gate as get-mode. If the caller passed
         # an internal id where url_path is expected, HA rejects with the
         # trigger substring; resolve and retry once. (set_dashboard handles
-        # this via an eager pre-resolver before the hyphen check, so it has
-        # no equivalent fallback here.)
+        # this via an eager pre-resolver, so it has no equivalent fallback
+        # here.)
         search_resolved_from: str | None = None
-        if effective_url_path is not None:
+        if lovelace_url_path is not None:
             new_url_path, response = await _lazy_resolve_and_retry(
-                self._client, effective_url_path, get_data, response
+                self._client, lovelace_url_path, get_data, response
             )
-            if new_url_path != effective_url_path:
+            if new_url_path != lovelace_url_path:
                 # Surface the original caller-passed identifier so the
                 # caller can see their input was canonicalized.
                 search_resolved_from = url_path
@@ -2088,15 +1859,27 @@ class DashboardConfigTools:
             error_msg = response.get("error", {})
             if isinstance(error_msg, dict):
                 error_msg = error_msg.get("message", str(error_msg))
+            if no_stored_config(response):
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_FAILED,
+                        f"{NO_STORED_CONFIG_NOTE} It has no cards to search.",
+                        suggestions=[
+                            "For a storage dashboard, save a config with "
+                            "ha_config_set_dashboard first",
+                        ],
+                        context={"action": "search", "url_path": url_path},
+                    )
+                )
             raise_tool_error(
                 create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
+                    read_failure_code(response),
                     f"Failed to get dashboard: {error_msg}",
                     suggestions=[
                         "Verify dashboard exists with ha_config_get_dashboard(list_only=True)",
                         "Check HA connection",
                     ],
-                    context={"action": "find_card", "url_path": url_path},
+                    context={"action": "search", "url_path": url_path},
                 )
             )
 
@@ -2107,7 +1890,7 @@ class DashboardConfigTools:
                     ErrorCode.SERVICE_CALL_FAILED,
                     "Dashboard config is empty or invalid",
                     suggestions=["Initialize dashboard with ha_config_set_dashboard"],
-                    context={"action": "find_card", "url_path": url_path},
+                    context={"action": "search", "url_path": url_path},
                 )
             )
 
@@ -2120,7 +1903,7 @@ class DashboardConfigTools:
                         "Use 'Take Control' in HA UI to convert to editable",
                         "Or create a non-strategy dashboard",
                     ],
-                    context={"action": "find_card", "url_path": url_path},
+                    context={"action": "search", "url_path": url_path},
                 )
             )
 
@@ -2128,154 +1911,160 @@ class DashboardConfigTools:
 
     @staticmethod
     def _build_search_result(
-        config: dict[str, Any],
-        url_path: str | None,
+        docs: list[dict[str, Any]],
         *,
-        entity_id: str | None,
-        card_type: str | None,
-        heading: str | None,
+        criteria: _SearchCriteria,
         include_config: bool,
-        search_resolved_from: str | None,
+        url_path: str | None = None,
         config_suppressed_note: str | None = None,
     ) -> dict[str, Any]:
-        """Run the card search over ``config`` and assemble the response dict.
+        """Run the card search over ``docs`` (``{url_path, config}``) and assemble it.
 
-        ``config_suppressed_note`` (set by the caller when the target dashboard is
-        not provably storage-mode) forces the matched-card config bodies to be
-        withheld even with ``include_config=True`` and surfaces the note as a
-        warning — a YAML dashboard's card config may carry HA-resolved ``!secret``
-        plaintext. Match LOCATIONS are always reported.
+        ``url_path`` names the one dashboard a scoped search read; its
+        ``config_hash`` then also appears at the top level (``None`` across
+        dashboards). ``config_suppressed_note`` (a dashboard not provably
+        storage-mode) withholds card bodies and the matched values ``query``
+        found — a YAML dashboard may carry HA-resolved ``!secret`` plaintext.
+        Match LOCATIONS and the matched field names are always reported.
         """
-        truncation: list[str] = []
-        uncovered: list[str] = []
-        matches = _find_cards_in_config(
-            config,
-            entity_id,
-            card_type,
-            heading,
-            truncation=truncation,
-            uncovered=uncovered,
+        matches, gaps = _find_cards_in_docs(
+            docs, criteria, name_dashboards=url_path is None
         )
-
-        surface_config = include_config and config_suppressed_note is None
-        if not surface_config:
+        truncated = len(matches) > _SEARCH_MATCH_CAP
+        matches = matches[:_SEARCH_MATCH_CAP]
+        if not include_config or config_suppressed_note is not None:
             for match in matches:
                 del match["card_config"]
+        if config_suppressed_note is not None:
+            for match in matches:
+                if "matched" in match:
+                    match["matched"] = [{"field": h["field"]} for h in match["matched"]]
 
-        config_hash: str | None = compute_config_hash(config)
-
-        # Warn-don't-truncate (AGENTS.md Return Values): the walker covers
-        # cards / card / custom_fields / states containers and stops at
-        # the depth bound, so neither a depth-truncated search nor a
-        # search over a dashboard carrying a non-traversed child-bearing
-        # shape may read as an authoritative complete result. Disclosure
-        # keys off the *presence* of such a shape (collected during the
-        # walk), not off a 0-match — a matching un-walkable container no
-        # longer suppresses the warning, and a true negative over a
-        # fully-coverable dashboard no longer cries wolf.
-        warnings: list[str] = []
+        # query reads picture-elements text, and card_type='badge' cannot match
+        # a card; only criteria that can select cards make unsearched
+        # 'elements' worth a warning.
+        warnings = _search_warnings(
+            truncated=truncated, gaps=gaps, warn_uncovered=criteria.targets_cards()
+        )
         if config_suppressed_note is not None and matches:
-            warnings.append(config_suppressed_note)
-        if truncation:
-            warnings.append(
-                f"Search stopped at the nesting depth bound "
-                f"(_MAX_CARD_DEPTH={_MAX_CARD_DEPTH}) in "
-                f"{len(truncation)} place(s); cards nested deeper were not "
-                "searched, so results may be incomplete."
-            )
-        if uncovered:
-            locations = ", ".join(sorted(set(uncovered)))
-            warnings.append(
-                "Cards nesting content under keys this search does not "
-                "traverse (e.g. picture-elements 'elements') are present at: "
-                f"{locations}. That nested content is not searched; fetch the "
-                "full config (ha_config_get_dashboard without search params) "
-                "to inspect those."
-            )
+            warnings.insert(0, config_suppressed_note)
 
         if matches:
             hint = (
-                "Use python_path with "
-                "ha_config_set_dashboard(python_transform=...) for targeted "
-                "updates"
+                "Use a match's python_path and config_hash with "
+                "ha_config_set_dashboard(python_transform=...) for targeted updates."
             )
         else:
             hint = (
-                "No matches in searched containers. Try other criteria, or "
-                "fetch the full config (no search params) to inspect nesting "
-                "shapes this search does not cover."
+                "No card matches. Try other criteria, or fetch the full config "
+                "(no search params) to inspect the dashboard."
             )
-
-        search_result: dict[str, Any] = {
+        result: dict[str, Any] = {
             "success": True,
-            "action": "find_card",
+            "action": "search",
             "url_path": url_path,
-            "config_hash": config_hash,
-            "search_criteria": {
-                "entity_id": entity_id,
-                "card_type": card_type,
-                "heading": heading,
-            },
+            "config_hash": (
+                compute_config_hash(docs[0]["config"]) if url_path is not None else None
+            ),
+            "search_criteria": asdict(criteria),
             "matches": matches,
             "match_count": len(matches),
+            "truncated": truncated,
             "hint": hint,
         }
         if warnings:
-            search_result["warnings"] = warnings
-        if search_resolved_from is not None:
-            search_result["resolved_from"] = search_resolved_from
-        return search_result
+            result["warnings"] = warnings
+        return result
 
     async def _get_dashboard_search_mode(
         self,
         url_path: str | None,
         *,
         resolved_url_path: list[str | None],
-        entity_id: str | None,
-        card_type: str | None,
-        heading: str | None,
+        criteria: _SearchCriteria,
         include_config: bool,
+        list_only: bool,
         include_screenshot: bool,
-        screenshot_options: _DashboardScreenshotOptions,
+        screenshot_options: DashboardScreenshotOptions,
     ) -> dict[str, Any]:
-        """Search mode: find cards, badges, or header cards matching criteria."""
-        (
-            config,
-            url_path,
-            search_resolved_from,
-        ) = await self._fetch_search_dashboard_config(
-            url_path, entity_id=entity_id, card_type=card_type, heading=heading
-        )
-        # Surface the canonicalized url_path to the caller's scope now, so
-        # an unexpected exception from the search/hashing below still
-        # reports the resolved identifier (see ha_config_get_dashboard's
-        # except block).
-        resolved_url_path[0] = url_path
-        # Fail-closed storage guard (mirrors the cross-dashboard MODE 4 walk):
-        # matched-card config bodies are surfaced ONLY for a dashboard PROVABLY
-        # tagged mode="storage". A YAML dashboard — or one whose mode we cannot
-        # confirm (untagged, or the default dashboard, which the list omits) —
-        # may carry HA-resolved !secret plaintext in its cards, so we withhold
-        # the bodies and say so. Only paid when the caller asked for bodies.
-        config_suppressed_note: str | None = None
-        if include_config and not await self._dashboard_is_storage_mode(url_path):
-            config_suppressed_note = (
-                "Matched-card config bodies were withheld: dashboard "
-                f"{url_path!r} is not provably storage-mode (a YAML dashboard's "
-                "config can carry resolved !secret values). Match locations are "
-                "reported; the config was not surfaced."
+        """Search cards, badges and header cards in one dashboard or all of them.
+
+        With ``url_path`` the dashboard is read directly (YAML included, with
+        bodies withheld). Without it every storage dashboard is searched: the
+        component serves all their configs in one frame, and otherwise each
+        storage dashboard HA lists is read (never the default, which HA does
+        not list).
+        """
+        if not criteria.can_match_cards() and not criteria.can_match_badges():
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "card_type='badge' cannot be combined with heading: view badges "
+                    "have no heading, so the search could never match",
+                    suggestions=[
+                        "Drop heading to list badges, or drop card_type='badge' to "
+                        "search cards by heading",
+                    ],
+                    context={"action": "search"},
+                )
             )
-        search_result = self._build_search_result(
-            config,
-            url_path,
-            entity_id=entity_id,
-            card_type=card_type,
-            heading=heading,
-            include_config=include_config,
-            search_resolved_from=search_resolved_from,
-            config_suppressed_note=config_suppressed_note,
-        )
-        _note_screenshot_ignored(
+        if criteria.is_empty():
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "Search needs a non-blank query, entity_id, card_type or heading",
+                    suggestions=[
+                        "Pass query='light.kitchen' to find cards mentioning it",
+                        "Use list_only=True to list dashboards, or url_path=... to get one",
+                    ],
+                    context={"action": "search"},
+                )
+            )
+
+        notes: list[str] = []
+        if url_path is None:
+            docs, notes = await self._search_docs()
+            search_result = self._build_search_result(
+                docs, criteria=criteria, include_config=include_config
+            )
+        else:
+            (
+                config,
+                url_path,
+                search_resolved_from,
+            ) = await self._fetch_search_dashboard_config(url_path)
+            # Surface the canonicalized url_path to the caller's scope now, so
+            # an unexpected exception below still reports the resolved
+            # identifier (see ha_config_get_dashboard's except block).
+            resolved_url_path[0] = url_path
+            # Fail-closed storage guard: bodies and query-matched values are
+            # surfaced ONLY for a dashboard PROVABLY tagged mode="storage". A
+            # YAML or unconfirmed (untagged, default) dashboard may carry
+            # resolved !secret plaintext. Only paid when either was asked for.
+            config_suppressed_note: str | None = None
+            if (
+                include_config or criteria.query is not None
+            ) and not await self._dashboard_is_storage_mode(url_path):
+                config_suppressed_note = (
+                    "Matched values and card config bodies were withheld: "
+                    f"dashboard {url_path!r} is not provably storage-mode (a YAML "
+                    "dashboard's config can carry resolved !secret values). Match "
+                    "locations and field names are reported."
+                )
+            search_result = self._build_search_result(
+                [{"url_path": url_path, "config": config}],
+                criteria=criteria,
+                include_config=include_config,
+                url_path=url_path,
+                config_suppressed_note=config_suppressed_note,
+            )
+            if search_resolved_from is not None:
+                search_result["resolved_from"] = search_resolved_from
+        if list_only:
+            notes.append("list_only was ignored because search parameters were given.")
+        if notes:
+            search_result.setdefault("warnings", []).extend(notes)
+        note_screenshot_ignored(
             search_result,
             include_screenshot=include_screenshot,
             options=screenshot_options,
@@ -2283,117 +2072,71 @@ class DashboardConfigTools:
         )
         return search_result
 
-    async def _get_dashboard_search_all_mode(self, query: str | None) -> dict[str, Any]:
-        """mode='search': find which storage dashboards contain ``query``.
+    async def _search_docs(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Every storage dashboard's ``{url_path, config}`` and warnings about gaps.
 
-        The component ``search`` walks every storage dashboard in one in-process
-        frame; a component-less install runs the SAME walk server-side over each
-        dashboard's config (one WS get per storage dashboard). Both paths return
-        byte-identical match records.
+        One component frame when it advertises ``dashboards_docs``; otherwise, or
+        when that frame is unavailable, one read per storage dashboard HA lists,
+        which never includes the default.
         """
-        if not query or not query.strip():
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    "query is required for mode='search'",
-                    suggestions=[
-                        "Pass query='light.kitchen' to find dashboards using that entity",
-                        "Use list_only=True to list dashboards, or url_path=... to get one",
-                    ],
-                    context={"action": "search_all"},
-                )
-            )
+        caps = await get_component_caps(self._client)
+        if component_supports(caps, "dashboards_docs"):
+            result = await _dashboards_via_component(self._client, "docs")
+            if result is not None and isinstance(result.get("docs"), list):
+                failed = int(result.get("load_failed", 0) or 0)
+                return result["docs"], _unread_dashboards_warning(failed)
+        docs, unread = await self._collect_legacy_search_docs()
+        return docs, [
+            *unread,
+            "The default dashboard was not searched: only the dashboard read of a "
+            "current ha_mcp_tools component reaches it, and that read was not "
+            "available. Search it with url_path='default'.",
+        ]
 
-        matches, truncated = await self._search_all_dashboards(query)
-        result: dict[str, Any] = {
-            "success": True,
-            "action": "search_all",
-            "query": query,
-            "matches": matches,
-            "match_count": len(matches),
-            "truncated": truncated,
-            "hint": (
-                "Each match names the dashboard (url_path), view, and card path. "
-                "Use ha_config_get_dashboard(url_path=..., entity_id=...) for the "
-                "python_path to edit a specific card."
-                if matches
-                else "No storage-mode dashboard card contains that query."
-            ),
-        }
-        if truncated:
-            result["warnings"] = [
-                f"Results capped at {_SEARCH_ALL_MATCH_CAP} matches; "
-                "refine the query for a complete list."
+    async def _collect_legacy_search_docs(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Storage dashboards' ``{url_path, config}`` and warnings about unread ones.
+
+        One ``lovelace/config`` read per dashboard ``fetch_dashboards_list``
+        returns. A body is read ONLY when its row is EXPLICITLY tagged
+        ``mode == "storage"`` — fail-closed: HA resolves ``!secret`` when it
+        loads a YAML Lovelace config. Core stamps ``mode`` on both kinds of row,
+        so beyond YAML rows this skips only an untagged row (a storage item
+        persisted before core's mode default existed). A dashboard with no
+        stored config yet has nothing to search; any other read failure is
+        reported, not hidden.
+        """
+        rows = await fetch_dashboards_list(self._client)
+        if rows is None:
+            return [], [
+                "The dashboards list could not be read, so no stored dashboard "
+                "was searched."
             ]
-        return result
-
-    async def _search_all_dashboards(
-        self, query: str
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Cross-dashboard matches for ``query`` — component frame or legacy walk.
-
-        Returns ``(matches, truncated)``. When the component serves ``search`` the
-        matches come straight from its one in-process frame; otherwise the storage
-        dashboards are listed, each config fetched, and the SAME walk run
-        server-side (parity pinned by test_component_dashboards_contract.py).
-        """
-        result = await _dashboards_via_component(self._client, "search", query=query)
-        if result is not None:
-            matches = result.get("matches")
-            return (
-                matches if isinstance(matches, list) else [],
-                bool(result.get("truncated")),
-            )
-
-        docs = await self._collect_legacy_search_docs()
-        # Mirror the component's query normalization exactly (parity).
-        query_lower = (query or "").strip().lower()
-        return _walk_all_dashboard_docs(docs, query_lower)
-
-    async def _collect_legacy_search_docs(self) -> list[dict[str, Any]]:
-        """Storage-dashboard ``{url_path, title, config}`` docs for the legacy walk.
-
-        One ``lovelace/config`` read per STORAGE dashboard from
-        ``fetch_dashboards_list``. A body is read ONLY when its row is EXPLICITLY
-        tagged ``mode == "storage"`` — fail-closed. HA resolves ``!secret`` when it
-        loads a YAML Lovelace config, so reading a YAML (or unknown-mode) body could
-        leak resolved secrets into a match. Core's own schemas stamp ``mode`` on
-        both kinds of row (storage items default it; YAML entries require it), so
-        the legacy walk searches storage dashboards normally; the fail-closed check
-        additionally skips the rare UNTAGGED row (a storage item persisted before
-        core's mode default existed) rather than read a body it can't prove is
-        storage. A per-dashboard read failure is skipped (fail-soft, mirroring the
-        component's per-dashboard skip) so one broken dashboard doesn't fail the
-        whole search.
-        """
-        rows = await fetch_dashboards_list(self._client) or []
         docs: list[dict[str, Any]] = []
+        failed: list[str] = []
         for row in rows:
             url_path = row.get("url_path")
-            if not url_path:
+            if not url_path or row.get("mode") != _DASHBOARD_STORAGE_MODE:
                 continue
-            if row.get("mode") != _DASHBOARD_STORAGE_MODE:
-                # Fail-closed: only an explicit storage tag is safe to read. A YAML
-                # body may carry resolved !secret plaintext, and an untagged row
-                # (every row on a component-less install) is not provably storage.
+            try:
+                config, _config_hash = await _get_dashboard_config_internal(
+                    self._client, url_path
+                )
+            except ToolError as exc:
+                if not is_no_stored_config_error(exc):
+                    logger.warning(
+                        "Card search could not read dashboard %r: %s", url_path, exc
+                    )
+                    failed.append(url_path)
                 continue
-            config = await self._fetch_dashboard_config_fail_soft(url_path)
-            if config is None:
-                continue
-            title = config.get("title")
-            docs.append(
-                {
-                    "url_path": url_path,
-                    "title": str(title) if title is not None else None,
-                    "config": config,
-                }
-            )
-        return docs
+            docs.append({"url_path": url_path, "config": config})
+        return docs, _unread_dashboards_warning(failed)
 
     async def _dashboard_is_storage_mode(self, url_path: str | None) -> bool:
         """True only when ``url_path`` is a dashboard PROVABLY tagged mode="storage".
 
-        Fail-closed, mirroring the cross-dashboard (MODE 4) walk's storage check:
+        Fail-closed, like the storage check of ``_collect_legacy_search_docs``:
         the dashboards-list row for ``url_path`` must carry an explicit
         ``mode == "storage"``. A YAML row, an untagged row, or a dashboard absent
         from the list (the default dashboard is never listed) all return ``False``
@@ -2406,61 +2149,38 @@ class DashboardConfigTools:
                 return row.get("mode") == _DASHBOARD_STORAGE_MODE
         return False
 
-    async def _fetch_dashboard_config_fail_soft(
-        self, url_path: str
-    ) -> dict[str, Any] | None:
-        """One dashboard's config, or ``None`` when it is unreadable (fail-soft).
-
-        A ``ToolError`` (dashboard missing / config invalid) is swallowed so the
-        cross-dashboard walk skips that dashboard; a transport error propagates to
-        the tool's outer handler.
-        """
-        try:
-            config, _config_hash = await _get_dashboard_config_internal(
-                self._client, url_path
-            )
-        except ToolError as exc:
-            logger.debug(
-                "Cross-dashboard search skipping unreadable dashboard %r: %r",
-                url_path,
-                exc,
-            )
-            return None
-        return config
-
     async def _get_dashboard_get_mode(
         self,
         url_path: str | None,
         *,
         resolved_url_path: list[str | None],
         force_reload: bool,
+        view_path: str | None,
         include_screenshot: bool,
-        screenshot_options: _DashboardScreenshotOptions,
-    ) -> "dict[str, Any] | ToolResult":
+        screenshot_options: DashboardScreenshotOptions,
+    ) -> dict[str, Any] | ToolResult:
         """Get mode: return the full Lovelace config for a single dashboard.
 
         The component ``get`` serves this from one in-process, freshness-safe read
         (the default dashboard included — the tool's ``"default"``/omitted alias
         maps to the component's ``None`` url_path); ``None`` falls back to the
         unchanged legacy ``lovelace/config`` read, which also covers YAML bodies
-        (never served in-process) and internal-id lazy-resolve.
+        (never served in-process) and internal-id lazy-resolve. Either path
+        answers a dashboard Core holds no config for with ``stored_config``
+        false instead of an error.
 
         ``force_reload`` bypasses the component fast path entirely: the component
         ``get`` carries no force semantic, so a forced read must go straight to the
         legacy ``lovelace/config`` request below (which threads ``force=True``) to
-        actually bust HA's Lovelace cache. (The optimistic-lock re-read in
-        ``_verify_config_unchanged`` deliberately keeps the no-force component read
-        — it wants the same in-memory object core serves.)
+        actually bust HA's Lovelace cache.
         """
-        component_url_path = (
-            None if (not url_path or url_path == "default") else url_path
-        )
-        component_config = (
-            None
+        lovelace_url_path = _lovelace_url_path(url_path)
+        component_status, component_config = (
+            (None, None)
             if force_reload
-            else await _component_dashboard_config(self._client, component_url_path)
+            else await _component_dashboard_read(self._client, lovelace_url_path)
         )
-        if component_config is not None:
+        if component_config is not None or component_status == "no_config":
             # The component matches an exact url_path (or the default), so no
             # lazy-resolve is possible: original == final, resolved_from unset.
             resolved_url_path[0] = url_path
@@ -2468,14 +2188,15 @@ class DashboardConfigTools:
                 url_path,
                 component_config,
                 original_url_path=url_path,
+                view_path=view_path,
                 include_screenshot=include_screenshot,
                 screenshot_options=screenshot_options,
+                stored_config=component_status != "no_config",
             )
 
         data: dict[str, Any] = {"type": "lovelace/config", "force": force_reload}
-        # Handle "default" as special value for default dashboard
-        if url_path and url_path != "default":
-            data["url_path"] = url_path
+        if lovelace_url_path is not None:
+            data["url_path"] = lovelace_url_path
 
         response = await self._client.send_websocket_message(data)
 
@@ -2493,15 +2214,19 @@ class DashboardConfigTools:
         # except block).
         resolved_url_path[0] = url_path
 
-        # Check if request failed (after potential retry)
+        # A legacy read distinguishes the two causes of config_not_found.
+        error_msg: str | None = None
         if isinstance(response, dict) and not response.get("success", True):
-            error_msg = response.get("error", {})
-            if isinstance(error_msg, dict):
-                error_msg = error_msg.get("message", str(error_msg))
+            error = response.get("error", {})
+            error_msg = str(
+                error.get("message", error) if isinstance(error, dict) else error
+            )
+        stored_config = not (isinstance(response, dict) and no_stored_config(response))
+        if error_msg is not None and stored_config:
             raise_tool_error(
                 create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
-                    str(error_msg),
+                    read_failure_code(response),
+                    error_msg,
                     suggestions=[
                         "Use ha_config_get_dashboard(list_only=True) to see available dashboards",
                         "Check if you have permission to access this dashboard",
@@ -2516,10 +2241,12 @@ class DashboardConfigTools:
 
         return await self._finalize_get_result(
             url_path,
-            config,
+            config if stored_config else None,
             original_url_path=original_url_path,
+            view_path=view_path,
             include_screenshot=include_screenshot,
             screenshot_options=screenshot_options,
+            stored_config=stored_config,
         )
 
     async def _finalize_get_result(
@@ -2528,9 +2255,11 @@ class DashboardConfigTools:
         config: Any,
         *,
         original_url_path: str | None,
+        view_path: str | None,
         include_screenshot: bool,
-        screenshot_options: _DashboardScreenshotOptions,
-    ) -> "dict[str, Any] | ToolResult":
+        screenshot_options: DashboardScreenshotOptions,
+        stored_config: bool = True,
+    ) -> dict[str, Any] | ToolResult:
         """Shape + return the get-mode response for an already-fetched config.
 
         Shared by the component fast path and the legacy path so both produce a
@@ -2538,6 +2267,14 @@ class DashboardConfigTools:
         render paths, ``resolved_from`` (when the legacy lazy resolver
         canonicalised an internal id), the large-config disclosure hint, and an
         optional screenshot.
+
+        ``view_path`` scopes the payload to one view: the response carries
+        ``view`` + ``view_index`` instead of ``config``. The scoped envelope
+        deliberately has NO ``config`` key so the view object cannot be
+        mistaken for a full config and pushed back through
+        ``ha_config_set_dashboard(config=...)``, which would drop every other
+        view; ``config_hash``/``config_size_bytes`` still describe the full
+        config so ``python_transform`` optimistic locking works unchanged.
         """
         # Compute hash for optimistic locking in subsequent operations
         config_hash = compute_config_hash(config) if isinstance(config, dict) else None
@@ -2545,53 +2282,152 @@ class DashboardConfigTools:
         # Calculate config size for progressive disclosure hint
         config_size = len(json.dumps(config)) if isinstance(config, dict) else 0
 
-        get_result: dict[str, Any] = {
-            "success": True,
-            "action": "get",
-            "url_path": url_path,
-            "config": config,
-            "config_hash": config_hash,
-            "config_size_bytes": config_size,
-        }
-        _attach_dashboard_render_paths(
-            get_result,
-            url_path,
-            config if isinstance(config, dict) else None,
-        )
+        if view_path is not None and not stored_config:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    NO_STORED_CONFIG_NOTE,
+                    context={"url_path": url_path, "view_path": view_path},
+                    suggestions=[
+                        "Omit view_path: there are no static views to scope to"
+                    ],
+                )
+            )
+        if view_path is not None:
+            get_result = self._scoped_view_get_result(
+                url_path,
+                config,
+                view_path=view_path,
+                config_hash=config_hash,
+                config_size=config_size,
+            )
+        else:
+            get_result = {
+                "success": True,
+                "action": "get",
+                "url_path": url_path,
+                "config": config,
+                "config_hash": config_hash,
+                "config_size_bytes": config_size,
+            }
+            _attach_dashboard_render_paths(
+                get_result,
+                url_path,
+                config if isinstance(config, dict) else None,
+            )
+            # Add hint for large configs (progressive disclosure) - 10KB ≈ 2-3k tokens
+            if config_size >= 10000:
+                get_result["hint"] = (
+                    f"Large config ({config_size:,} bytes). Pass view_path=... "
+                    "to fetch a single view, or use "
+                    "ha_config_get_dashboard(entity_id=...) to find card positions, "
+                    "then ha_config_set_dashboard(python_transform=...) "
+                    "instead of full config replacement."
+                )
         # Surface the original caller-passed identifier when the lazy
         # resolver canonicalised it (parity with delete_dashboard's
         # resolved_id field). Caller can use this to detect that their
         # input was an internal id rather than a url_path.
         if original_url_path is not None and original_url_path != url_path:
             get_result["resolved_from"] = original_url_path
+        get_result["stored_config"] = stored_config
+        if not stored_config:
+            get_result["message"] = NO_STORED_CONFIG_NOTE
 
-        # Add hint for large configs (progressive disclosure) - 10KB ≈ 2-3k tokens
-        if config_size >= 10000:
-            get_result["hint"] = (
-                f"Large config ({config_size:,} bytes). For edits, use "
-                "ha_config_get_dashboard(entity_id=...) to find card positions, "
-                "then ha_config_set_dashboard(python_transform=...) "
-                "instead of full config replacement."
-            )
-
-        return await _maybe_attach_screenshot(
+        return await maybe_attach_screenshot(
             get_result,
             url_path,
             include_screenshot,
             client=self._client,
             config=config if isinstance(config, dict) else None,
-            options=screenshot_options,
+            # view_path doubles as the get-mode scoping parameter now, so a
+            # scoped read without a screenshot request must not trip the
+            # "screenshot render options are ignored" warning.
+            options=(
+                screenshot_options
+                if include_screenshot
+                else replace(screenshot_options, view_path=None)
+            ),
             raise_on_failure=True,
         )
+
+    def _scoped_view_get_result(
+        self,
+        url_path: str | None,
+        config: Any,
+        *,
+        view_path: str,
+        config_hash: str | None,
+        config_size: int,
+    ) -> dict[str, Any]:
+        """Build the view-scoped get-mode envelope (issue #2010).
+
+        Raises the shared matcher's structured errors for an empty, unknown,
+        or ambiguous ``view_path`` and for strategy dashboards (no static
+        views). Pure config walking — works whether or not the dashboard
+        screenshot beta feature is enabled.
+        """
+        if not isinstance(config, dict):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    "Dashboard config is unavailable, so view_path cannot be resolved.",
+                    context={"url_path": url_path, "view_path": view_path},
+                    suggestions=["Retry without view_path to inspect the raw response"],
+                )
+            )
+        view_index, view = match_dashboard_view(
+            url_path or "default",
+            config,
+            view_path,
+            strategy_suggestions=(
+                "Omit view_path — strategy dashboards generate their views at "
+                "runtime, so there is no static view config to return",
+            ),
+        )
+        views = config.get("views")
+        view_count = len(views) if isinstance(views, list) else 0
+        get_result: dict[str, Any] = {
+            "success": True,
+            "action": "get",
+            "url_path": url_path,
+            "view_path": view_path,
+            "view_index": view_index,
+            "view_count": view_count,
+            "view": view,
+            "config_hash": config_hash,
+            "config_size_bytes": config_size,
+            "view_size_bytes": len(json.dumps(view)),
+            "hint": (
+                f"Scoped to view '{view_path}' — config['views'][{view_index}] "
+                f"of {view_count} views. config_hash and config_size_bytes "
+                "cover the FULL dashboard config, so "
+                "ha_config_set_dashboard(python_transform=...) edits addressed "
+                f"via config['views'][{view_index}] validate as-is. Do NOT "
+                "pass this view object as the config parameter — that would "
+                "replace the entire dashboard. Omit view_path for the full "
+                "config."
+            ),
+        }
+        _attach_dashboard_render_paths(get_result, url_path, config)
+        render_paths = get_result.get("render_paths")
+        if isinstance(render_paths, list):
+            get_result["render_paths"] = [
+                row
+                for row in render_paths
+                if isinstance(row, dict) and row.get("view_index") == view_index
+            ]
+        return get_result
 
     @tool(
         name="ha_config_set_dashboard",
         tags={"Dashboards"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "title": "Create or Update Dashboard",
-        },
+        annotations=write_hints(
+            "Create or Update Dashboard",
+            destructive=True,
+            idempotent=False,
+            open_world=True,
+        ),
     )
     @with_auto_backup(domain="dashboard", id_param="url_path")
     @log_tool_usage
@@ -2602,7 +2438,7 @@ class DashboardConfigTools:
             Field(
                 description="Dashboard URL path (e.g., 'my-dashboard'). "
                 "Use 'default' or 'lovelace' for the default dashboard. "
-                "New dashboards must use a hyphenated path."
+                "Home Assistant requires a hyphen in new dashboard paths."
             ),
         ],
         config: Annotated[
@@ -2611,14 +2447,14 @@ class DashboardConfigTools:
             Field(
                 description="Dashboard configuration with views and cards. "
                 "Omit or set to None to create dashboard without initial config. "
-                "Mutually exclusive with python_transform."
+                "Mutually exclusive with python_transform and patch."
             ),
         ] = None,
         python_transform: Annotated[
             str | None,
             Field(
                 description="Python expression to transform existing dashboard config. "
-                "Mutually exclusive with config. "
+                "Mutually exclusive with config and patch. "
                 "Requires config_hash for validation. "
                 "See PYTHON TRANSFORM SECURITY below for allowed operations. "
                 "Examples: "
@@ -2632,19 +2468,20 @@ class DashboardConfigTools:
             str | None,
             Field(
                 description="Config hash from ha_config_get_dashboard for optimistic locking. "
-                "REQUIRED for python_transform (validates dashboard unchanged). "
+                "REQUIRED for python_transform and patch (validates dashboard unchanged). "
                 "Optional for config (validates before full replacement if provided)."
             ),
         ] = None,
         title: Annotated[
             str | None,
-            Field(description="Dashboard display name shown in sidebar"),
+            Field(description="Sidebar name; required when creating a dashboard"),
         ] = None,
         icon: Annotated[
             str | None,
             Field(
                 description="MDI icon name (e.g., 'mdi:home', 'mdi:cellphone'). "
-                "Defaults to 'mdi:view-dashboard'"
+                "Omit to store none (the sidebar then shows mdi:view-dashboard); "
+                "'' clears a stored icon."
             ),
         ] = None,
         require_admin: Annotated[
@@ -2671,11 +2508,10 @@ class DashboardConfigTools:
         return_screenshot: Annotated[
             bool,
             Field(
-                description="After writing, also return rendered image(s) of the "
-                "dashboard so you can see what it looks like in a single call "
-                "(the dashboard creation/iteration loop). Requires the "
-                "'dashboard screenshot' beta feature + engine add-on/sidecar; "
-                "if unavailable, the write result is returned with a warning."
+                description="After writing, also return rendered image(s) of the dashboard. "
+                "Requires the 'dashboard screenshot' beta feature + engine app "
+                "(add-on)/sidecar; if unavailable, the write result is returned with a "
+                "warning."
             ),
         ] = False,
         view_path: Annotated[
@@ -2685,131 +2521,66 @@ class DashboardConfigTools:
                 "views[].path to render."
             ),
         ] = None,
-    ) -> "dict[str, Any] | ToolResult":
-        """
-        Create or update a Home Assistant dashboard.
+        patch: Annotated[
+            list[dict[str, Any]] | None,
+            JSON_STRING_COERCION,
+            Field(
+                description="Structured dashboard edits: up to 100 JSON Patch "
+                "add, remove, replace or test operations using RFC 6901 paths. "
+                "Use /- to append to an array; escape ~ as ~0 and / as ~1 in keys. "
+                "Mutually exclusive with config and python_transform. "
+                "Strings in value are preserved literally."
+            ),
+        ] = None,
+    ) -> dict[str, Any] | ToolResult:
+        """Create or update a Home Assistant dashboard.
 
         MUST call ha_get_skill_guide OR refer to your locally installed skills first.
+        `dashboard-guide.md` ships under `skill_content` by default. A card's
+        fields: ha_config_get_dashboard(card_type=..., describe=True).
 
-        Creates a new dashboard or updates an existing one with the provided configuration.
-        Supports two modes: full config replacement OR Python transformation.
+        MODES (pick one):
+        - patch: edit known paths with literal values using JSON Patch
+          add/remove/replace/test and config_hash, e.g.
+          patch=[{"op": "replace", "path": "/views/0/title", "value": "Home"}].
+          move/copy are unsupported. Full guide:
+          https://github.com/homeassistant-ai/ha-mcp/blob/master/docs/dashboard-edits.md
+        - python_transform: loops or pattern-based changes across cards and views,
+          e.g. 'config["views"][0]["cards"].append({"type": "button", "entity": "light.bedroom"})'.
+          After delete/add operations indices shift, so chain multiple ops in ONE
+          expression where possible; a later call needs a fresh config_hash from
+          ha_config_get_dashboard().
+        - config: new dashboards only, or a full restructure. Replaces everything.
+          Omit it to create a dashboard without initial config.
 
-        Use 'default' or 'lovelace' to target the built-in default dashboard.
-        New dashboards require a hyphenated url_path (e.g., 'my-dashboard').
+        Use ha_config_get_dashboard(entity_id=...) to get the path of any card,
+        and ha_search / ha_get_overview to find entity IDs — never guess them.
+        For visual re-checks after the write, use ha_get_dashboard_screenshot
+        (when available) instead of re-sending config.
 
-        WHEN TO USE WHICH MODE:
-        - python_transform: RECOMMENDED for edits. Surgical/pattern-based updates, works on all platforms.
-        - config: New dashboards only, or full restructure. Replaces everything.
+        title/icon/require_admin/show_in_sidebar can be updated in a
+        metadata-only call or alongside a full config replacement; with
+        python_transform or patch, update metadata in a separate call (combining
+        it with patch is rejected). Strategy dashboards (config
+        {"strategy": {...}}) cannot be converted to custom dashboards here; use
+        "Take Control" in the Home Assistant UI.
 
-        IMPORTANT: After delete/add operations, indices shift! Subsequent python_transform calls
-        must use fresh config_hash from ha_config_get_dashboard()
-        to get updated structure. Chain multiple ops in ONE expression when possible.
+        EXAMPLE:
+        ha_config_set_dashboard(url_path="home-dashboard", title="Home Overview",
+            config={"views": [{"title": "Home", "type": "sections", "sections": [{"title": "Climate", "cards": [{"type": "tile", "entity": "climate.living_room"}]}]}]})
 
-        TIP: Use ha_config_get_dashboard(entity_id=...) to get the path for any card.
-
-        PYTHON TRANSFORM EXAMPLES (RECOMMENDED):
-        - Update card icon: 'config["views"][0]["cards"][0]["icon"] = "mdi:thermometer"'
-        - Add card: 'config["views"][0]["cards"].append({"type": "button", "entity": "light.bedroom"})'
-        - Delete card: 'del config["views"][0]["cards"][2]'
-        - Pattern-based update: 'for card in config["views"][0]["cards"]: if "light" in card.get("entity", ""): card["icon"] = "mdi:lightbulb"'
-        - Multi-operation: 'config["views"][0]["cards"][0]["icon"] = "mdi:a"; config["views"][0]["cards"][1]["icon"] = "mdi:b"'
-
-        MODERN DASHBOARD BEST PRACTICES:
-        - Use "sections" view type (default) with grid-based layouts
-        - Use "tile" cards as primary card type (replaces legacy entity/light/climate cards)
-        - Use "grid" cards for multi-column layouts within sections
-        - Create multiple views with navigation paths (avoid single-view endless scrolling)
-        - Use "area" cards with navigation for hierarchical organization
-
-        DISCOVERING ENTITY IDs FOR DASHBOARDS:
-        Do NOT guess entity IDs - use these tools to find exact entity IDs:
-        1. ha_get_overview(include_entity_id=True) - Get all entities organized by domain/area
-        2. ha_search(query, domain_filter, area_filter, search_types) - Find entities and config-body references in one call
-
-        If unsure about entity IDs, ALWAYS use one of these tools first.
-
-        DASHBOARD DOCUMENTATION:
-        - dashboard-guide.md and dashboard-cards.md ship in this response
-          under ``skill_content`` by default — layout patterns,
-          card-type taxonomy, and worked examples.
-        - ha_get_skill_guide — deeper card-type and configuration guidance.
-
-        EXAMPLES:
-
-        Create empty dashboard:
-        ha_config_set_dashboard(
-            url_path="mobile-dashboard",
-            title="Mobile View",
-            icon="mdi:cellphone"
-        )
-
-        Create dashboard with modern sections view:
-        ha_config_set_dashboard(
-            url_path="home-dashboard",
-            title="Home Overview",
-            config={
-                "views": [{
-                    "title": "Home",
-                    "type": "sections",
-                    "sections": [{
-                        "title": "Climate",
-                        "cards": [{
-                            "type": "tile",
-                            "entity": "climate.living_room",
-                            "features": [{"type": "target-temperature"}]
-                        }]
-                    }]
-                }]
-            }
-        )
-
-        Create strategy-based dashboard (auto-generated):
-        ha_config_set_dashboard(
-            url_path="my-home",
-            title="My Home",
-            config={
-                "strategy": {
-                    "type": "home",
-                    "favorite_entities": ["light.bedroom"]
-                }
-            }
-        )
-
-        Note: Strategy dashboards cannot be converted to custom dashboards via this tool.
-        Use the "Take Control" feature in the Home Assistant interface to convert them.
-
-        Update existing dashboard config:
-        ha_config_set_dashboard(
-            url_path="existing-dashboard",
-            config={
-                "views": [{
-                    "title": "Updated View",
-                    "type": "sections",
-                    "sections": [{
-                        "cards": [{"type": "markdown", "content": "Updated!"}]
-                    }]
-                }]
-            }
-        )
-
-        Note: When updating an existing dashboard, title/icon/require_admin/show_in_sidebar
-        are also updated if explicitly provided alongside (or instead of) a config change.
-
-        STORAGE-MODE vs YAML-MODE DASHBOARDS:
-        This tool only manages storage-mode dashboards (created via UI/API and stored in
-        Home Assistant's storage backend). It does NOT touch YAML-defined dashboards.
-        Two distinct YAML cases exist and this tool covers neither:
-        - "YAML-mode" dashboards: written in their own .yaml file referenced from
-          configuration.yaml under ``lovelace: dashboards:``. The dashboard itself lives
-          in a separate YAML file but its registration is in configuration.yaml.
-        - Dashboards inlined directly in ``configuration.yaml`` under the ``lovelace:``
-          key (legacy single-dashboard mode).
-        For either YAML case, edit the dashboard's .yaml file directly.
-        ``ha_config_set_yaml`` can update the ``lovelace:`` registration
-        entry in configuration.yaml but does NOT touch the dashboard
-        body in the referenced .yaml file.
+        This tool manages storage-mode dashboards only. YAML-mode dashboards (a
+        .yaml file registered under ``lovelace: dashboards:`` in
+        configuration.yaml) and dashboards inlined under ``lovelace:`` are
+        edited in their .yaml file; ``ha_config_set_yaml`` can update the
+        ``lovelace:`` registration but not the dashboard body.
         """
-        screenshot_options = _DashboardScreenshotOptions(view_path=view_path)
+        action = (
+            "patch"
+            if patch is not None
+            else ("python_transform" if python_transform is not None else "set")
+        )
+        screenshot_options = DashboardScreenshotOptions(view_path=view_path)
         try:
             # Reject an invalid view_path BEFORE committing the write. On the
             # return_screenshot path a screenshot failure is demoted to a
@@ -2820,28 +2591,63 @@ class DashboardConfigTools:
                     create_error_response(
                         ErrorCode.VALIDATION_INVALID_PARAMETER,
                         "view_path cannot be empty.",
-                        context={"view_path": view_path},
+                        context={"action": action, "view_path": view_path},
                     )
                 )
             (
                 url_path,
                 pre_resolved_from,
                 pre_fetched_dashboards,
-            ) = await self._resolve_set_dashboard_url_path(url_path)
+            ) = await self._resolve_set_dashboard_url_path(url_path, action=action)
 
-            # Validate mutual exclusivity of config and python_transform
-            if config is not None and python_transform is not None:
+            if (
+                sum(value is not None for value in (config, python_transform, patch))
+                > 1
+            ):
                 raise_tool_error(
                     create_error_response(
                         ErrorCode.VALIDATION_INVALID_PARAMETER,
-                        "Cannot use both config and python_transform simultaneously",
+                        "config, python_transform and patch are mutually exclusive "
+                        "and cannot be used simultaneously",
                         suggestions=[
-                            "Use only ONE of: config or python_transform",
+                            "Use only ONE of: config, python_transform or patch",
                             "config: Full replacement",
-                            "python_transform: Python-based edits (recommended)",
+                            "python_transform: Loops and pattern-based edits",
                         ],
-                        context={"action": "set", "url_path": url_path},
+                        context={"action": action, "url_path": url_path},
                     )
+                )
+
+            if patch is not None and any(
+                value is not None
+                for value in (title, icon, require_admin, show_in_sidebar)
+            ):
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "patch cannot be combined with dashboard metadata "
+                        "(title, icon, require_admin, show_in_sidebar)",
+                        suggestions=[
+                            "Update metadata in a separate ha_config_set_dashboard call "
+                            "without patch, config or python_transform",
+                        ],
+                        context={
+                            "action": action,
+                            "url_path": url_path,
+                            "write_committed": False,
+                        },
+                    )
+                )
+
+            if patch is not None:
+                return await self._run_dashboard_patch(
+                    url_path,
+                    config_hash,
+                    patch,
+                    pre_resolved_from,
+                    MandatoryBPS,
+                    return_screenshot=return_screenshot,
+                    screenshot_options=screenshot_options,
                 )
 
             if python_transform is not None:
@@ -2872,16 +2678,10 @@ class DashboardConfigTools:
 
         except ToolError as te:
             raise augment_tool_error_with_skill_content(te, bp_warnings=None) from None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error = exception_to_structured_error(
                 e,
-                context={"action": "set", "url_path": url_path},
-                suggestions=[
-                    "Ensure url_path is unique (not already in use for different dashboard type)",
-                    "New dashboards require a hyphenated url_path",
-                    "Check that you have admin permissions",
-                    "Verify config format is valid Lovelace JSON",
-                ],
+                context={"action": action, "url_path": url_path},
                 raise_error=False,
             )
             augment_error_dict_with_skill_content(error, bp_warnings=None)
@@ -2889,9 +2689,12 @@ class DashboardConfigTools:
             return None
 
     async def _resolve_set_dashboard_url_path(
-        self, url_path: str
+        self, url_path: str, *, action: str = "set"
     ) -> tuple[str, str | None, list[dict[str, Any]] | None]:
-        """Validate + canonicalize ``url_path`` for ``ha_config_set_dashboard``.
+        """Canonicalize supported dashboard identifiers for the set tool.
+
+        Home Assistant itself rejects a new hyphenless ``url_path`` on create;
+        this only maps HA-MCP's aliases onto an existing dashboard.
 
         Returns ``(url_path, pre_resolved_from, pre_fetched_dashboards)``:
         ``url_path`` is canonicalized (``"default"`` -> ``"lovelace"``, and an
@@ -2904,10 +2707,8 @@ class DashboardConfigTools:
         """
         # ``url_path`` is required (always non-None). Reject empty/
         # whitespace up-front so the caller gets a structured parameter
-        # error instead of a misleading downstream failure (the
-        # subsequent "default" alias, pre-resolver, and hyphen check
-        # all assume a usable string). Extension of the #1312
-        # validate_identifier_not_empty pattern to the dashboards
+        # error instead of a misleading downstream failure. Extension of
+        # the #1312 validate_identifier_not_empty pattern to the dashboards
         # family per #1313.
         validate_identifier_not_empty(
             url_path,
@@ -2916,72 +2717,42 @@ class DashboardConfigTools:
                 "Pass a dashboard URL path (e.g. 'my-dashboard')",
                 "Use 'default' or 'lovelace' for the default dashboard",
             ],
-            context={"action": "set"},
+            context={"action": action},
         )
         # Handle "default" as alias for the default dashboard
         # (matches ha_config_get_dashboard behavior)
         if url_path == "default":
             url_path = "lovelace"
 
-        # Pre-resolve internal dashboard ID to url_path form before the
-        # hyphen check below, so callers may pass either form. Only fires
-        # when the identifier looks like an internal id (no hyphen, not
-        # the built-in "lovelace") and matches a known dashboard.
-        #
-        # Caveat: if a caller passes a hyphenless identifier intending
-        # to *create* a new dashboard, but it happens to match an
-        # existing dashboard's id, the rewrite silently re-targets the
-        # operation onto that existing dashboard. Pre-PR they'd have
-        # hit the hyphen-validation error and known their input was
-        # invalid; now the create-vs-update distinction depends on
-        # whether the registry happens to contain a matching id.
-        # We log the rewrite and surface the original identifier as
-        # ``resolved_from`` on the success response so callers can
-        # detect this redirect.
+        # A hyphenless identifier may be an internal ID (``my_dash``) of an
+        # existing dashboard (``my-dash``). This is still a create-or-update
+        # API: ``action`` reports create vs update; ``resolved_from``
+        # additionally reports only this rewrite.
         pre_resolved_from: str | None = None
-        # When the pre-resolver fires and finds a match, ``_resolve_dashboard``
-        # has already fetched ``lovelace/dashboards/list``. Capture that list
-        # so the existence-check site below can reuse it instead of paying
-        # a second round-trip.
         pre_fetched_dashboards: list[dict[str, Any]] | None = None
         if "-" not in url_path and url_path != "lovelace":
             resolved, dashboards = await _resolve_dashboard(self._client, url_path)
-            if resolved is not None and resolved["url_path"]:
-                original_url_path = url_path
+            if dashboards is None:
+                raise_registry_read_error(action=action, url_path=url_path)
+            pre_fetched_dashboards = dashboards
+            if resolved is not None and resolved["url_path"] != url_path:
+                pre_resolved_from = url_path
                 url_path = resolved["url_path"]
-                pre_resolved_from = original_url_path
-                pre_fetched_dashboards = dashboards
                 logger.info(
                     "ha_config_set_dashboard pre-resolver mapped %r -> %r",
-                    original_url_path,
+                    pre_resolved_from,
                     url_path,
                 )
-
-        # Validate url_path contains hyphen for new dashboards
-        # The built-in "lovelace" dashboard is exempt since it already exists
-        if "-" not in url_path and url_path != "lovelace":
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    "url_path must contain a hyphen (-)",
-                    suggestions=[
-                        f"Try '{url_path.replace('_', '-')}' instead",
-                        "Use format like 'my-dashboard' or 'mobile-view'",
-                        "Use 'lovelace' or 'default' to edit the default dashboard",
-                    ],
-                    context={"action": "set", "url_path": url_path},
-                )
-            )
 
         return url_path, pre_resolved_from, pre_fetched_dashboards
 
     async def _fetch_and_verify_dashboard_hash(
-        self, url_path: str, config_hash: str
+        self, url_path: str, config_hash: str, *, action: str = "python_transform"
     ) -> dict[str, Any]:
         """Fetch current dashboard config and verify ``config_hash`` (optimistic locking).
 
         Re-wraps the shared fetch helper's generic error with
-        python_transform-specific UX suggestions, and raises on a hash
+        edit-specific UX suggestions, and raises on a hash
         mismatch (concurrent edit since the caller's last read).
         """
         try:
@@ -2989,30 +2760,15 @@ class DashboardConfigTools:
                 self._client, url_path
             )
         except ToolError as e:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
-                    f"Dashboard not found or inaccessible: {extract_tool_error_message(e)}",
-                    suggestions=[
-                        "python_transform requires an existing dashboard",
-                        "Use 'config' parameter to create a new dashboard",
-                        "Verify dashboard exists with ha_config_get_dashboard(list_only=True)",
-                    ],
-                    context={"action": "python_transform", "url_path": url_path},
-                )
-            )
+            raise_dashboard_edit_fetch_error(e, url_path, action)
 
         if current_hash != config_hash:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
-                    "Dashboard modified since last read (conflict)",
-                    suggestions=[
-                        "Call ha_config_get_dashboard() again",
-                        "Use the fresh config_hash from that response",
-                    ],
-                    context={"action": "python_transform", "url_path": url_path},
-                )
+            raise_dashboard_edit_error(
+                url_path,
+                "conflict",
+                "Dashboard modified since last read (conflict)",
+                False,
+                action,
             )
         return current_config
 
@@ -3021,6 +2777,7 @@ class DashboardConfigTools:
         url_path: str, python_transform: str, current_config: dict[str, Any]
     ) -> dict[str, Any]:
         """Run ``python_transform`` against ``current_config`` in the sandbox."""
+        was_strategy_dashboard = "strategy" in current_config
         try:
             transformed_config = safe_execute(python_transform, current_config)
         except PythonSandboxError as e:
@@ -3046,36 +2803,26 @@ class DashboardConfigTools:
                     context={"action": "python_transform", "url_path": url_path},
                 )
             )
+        DashboardConfigTools._validate_strategy_dashboard_replacement(
+            url_path,
+            was_strategy_dashboard=was_strategy_dashboard,
+            replacement_config=transformed_config,
+            action="python_transform",
+        )
+        reject_malformed_dashboard_lists(
+            transformed_config, url_path, source="python_transform"
+        )
         return transformed_config
 
     async def _save_dashboard_python_transform(
-        self, url_path: str, transformed_config: dict[str, Any]
+        self,
+        url_path: str,
+        transformed_config: dict[str, Any],
+        *,
+        action: str = "python_transform",
     ) -> tuple[dict[str, Any], str | None, str | None]:
         """Save transformed config and best-effort reload its authoritative form."""
-        save_data: dict[str, Any] = {
-            "type": "lovelace/config/save",
-            "config": transformed_config,
-        }
-        if url_path:
-            save_data["url_path"] = url_path
-
-        save_result = await self._client.send_websocket_message(save_data)
-
-        if isinstance(save_result, dict) and not save_result.get("success", True):
-            error_msg = save_result.get("error", {})
-            if isinstance(error_msg, dict):
-                error_msg = error_msg.get("message", str(error_msg))
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
-                    f"Failed to save transformed config: {error_msg}",
-                    suggestions=[
-                        "Expression may have produced invalid dashboard structure",
-                        "Verify config format is valid Lovelace JSON",
-                    ],
-                    context={"action": "python_transform", "url_path": url_path},
-                )
-            )
+        await self._save_dashboard_config(url_path, transformed_config, action=action)
 
         # HA may normalize after save, so prefer an authoritative re-fetch. The
         # mutation has already committed at this point: a follow-up read failure
@@ -3092,8 +2839,9 @@ class DashboardConfigTools:
             return transformed_config, None, warning
         except Exception as exc:
             logger.warning(
-                "Could not reload dashboard %s after Python transform: %s",
+                "Could not reload dashboard %s after %s: %s",
                 url_path,
+                action,
                 exc,
                 exc_info=True,
             )
@@ -3113,8 +2861,8 @@ class DashboardConfigTools:
         MandatoryBPS: bool,
         *,
         return_screenshot: bool,
-        screenshot_options: _DashboardScreenshotOptions,
-    ) -> "dict[str, Any] | ToolResult":
+        screenshot_options: DashboardScreenshotOptions,
+    ) -> dict[str, Any] | ToolResult:
         """Execute python_transform mode and return the tool response."""
         if config_hash is None:
             raise_tool_error(
@@ -3135,35 +2883,183 @@ class DashboardConfigTools:
         transformed_config = self._apply_dashboard_python_transform(
             url_path, python_transform, current_config
         )
-        (
-            post_save_config,
-            new_config_hash,
-            post_save_warning,
-        ) = await self._save_dashboard_python_transform(url_path, transformed_config)
+        native_result = await edit_dashboard_via_component(
+            self._client,
+            url_path,
+            expected_hash=config_hash,
+            config=transformed_config,
+            action="python_transform",
+        )
+        if native_result is None:
+            native_result = await self._save_dashboard_edit_legacy(
+                url_path, transformed_config
+            )
+        return await self._finish_dashboard_edit(
+            url_path,
+            native_result,
+            "python_transform",
+            pre_resolved_from,
+            MandatoryBPS,
+            python_transform=python_transform,
+            return_screenshot=return_screenshot,
+            screenshot_options=screenshot_options,
+        )
 
-        transform_result: dict[str, Any] = {
-            "success": True,
-            "action": "python_transform",
-            "url_path": url_path,
-            "config_hash": new_config_hash,
+    async def _save_dashboard_edit_legacy(
+        self,
+        url_path: str,
+        config: dict[str, Any],
+        *,
+        action: str = "python_transform",
+    ) -> dict[str, Any]:
+        """Adapt the existing save/readback path to the shared result contract."""
+        post_config, config_hash, warning = await self._save_dashboard_python_transform(
+            url_path, config, action=action
+        )
+        return {
+            "config": post_config,
+            "config_hash": config_hash,
             "write_committed": True,
-            "post_write_verified": post_save_warning is None,
-            "python_expression": python_transform,
-            "message": f"Dashboard {url_path} updated via Python transform",
+            "post_write_verified": warning is None,
+            "warnings": [warning] if warning else [],
         }
+
+    async def _reject_malformed_patched_dashboard(
+        self, url_path: str, patch: list[dict[str, Any]]
+    ) -> None:
+        """Check the patched config when an edit lands inside a card."""
+        current, _ = await _get_dashboard_config_internal(self._client, url_path)
+        try:
+            candidate = apply_dashboard_patch(current, patch)
+        except ValueError:
+            return  # An unapplicable patch is rejected by the edit itself.
+        reject_malformed_dashboard_lists(candidate, url_path, source="patch")
+
+    async def _run_dashboard_patch(
+        self,
+        url_path: str,
+        config_hash: str | None,
+        patch: list[dict[str, Any]] | str,
+        pre_resolved_from: str | None,
+        MandatoryBPS: bool,
+        *,
+        return_screenshot: bool,
+        screenshot_options: DashboardScreenshotOptions,
+    ) -> dict[str, Any] | ToolResult:
+        """Apply structured edits in Core, or use the existing legacy save path."""
+        if config_hash is None:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "config_hash is required for patch",
+                    suggestions=["Read the dashboard first and use its config_hash"],
+                    context={"action": "patch", "url_path": url_path},
+                )
+            )
+        try:
+            parsed_patch = parse_json_param(patch, "patch")
+            if not isinstance(parsed_patch, list):
+                raise ValueError("patch must be a list of operations")
+        except ValueError as exc:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    str(exc),
+                    context={"action": "patch", "url_path": url_path},
+                )
+            )
+        reject_malformed_dashboard_patch(parsed_patch, url_path)
+        if patch_writes_inside_card(parsed_patch):
+            await self._reject_malformed_patched_dashboard(url_path, parsed_patch)
+        result = await edit_dashboard_via_component(
+            self._client,
+            url_path,
+            expected_hash=config_hash,
+            patch=parsed_patch,
+            action="patch",
+        )
+        if result is None:
+            current = await self._fetch_and_verify_dashboard_hash(
+                url_path, config_hash, action="patch"
+            )
+
+            try:
+                updated = apply_dashboard_patch(current, parsed_patch)
+            except ValueError as exc:
+                raise_dashboard_edit_error(
+                    url_path, "validation_failed", str(exc), False, "patch"
+                )
+            self._validate_strategy_dashboard_replacement(
+                url_path,
+                was_strategy_dashboard="strategy" in current,
+                replacement_config=updated,
+                action="patch",
+            )
+            # Compare JSON hashes rather than Python equality: true and 1 are
+            # different dashboard values even though Python considers them equal.
+            if compute_config_hash(updated) == config_hash:
+                result = {
+                    "config": current,
+                    "config_hash": config_hash,
+                    "write_committed": False,
+                    "post_write_verified": True,
+                    "unchanged": True,
+                }
+            else:
+                result = await self._save_dashboard_edit_legacy(
+                    url_path, updated, action="patch"
+                )
+        return await self._finish_dashboard_edit(
+            url_path,
+            result,
+            "patch",
+            pre_resolved_from,
+            MandatoryBPS,
+            return_screenshot=return_screenshot,
+            screenshot_options=screenshot_options,
+        )
+
+    async def _finish_dashboard_edit(
+        self,
+        url_path: str,
+        edit: dict[str, Any],
+        action: str,
+        pre_resolved_from: str | None,
+        MandatoryBPS: bool,
+        *,
+        return_screenshot: bool,
+        screenshot_options: DashboardScreenshotOptions,
+        python_transform: str | None = None,
+    ) -> dict[str, Any] | ToolResult:
+        """Preserve public edit fields, authoritative paths, BPS and screenshots."""
+        result: dict[str, Any] = {
+            "success": True,
+            "action": action,
+            "url_path": url_path,
+            "config_hash": edit["config_hash"],
+            "write_committed": edit["write_committed"],
+            "post_write_verified": edit["post_write_verified"],
+            "message": f"Dashboard {url_path} updated via "
+            + ("Python transform" if action == "python_transform" else "patch"),
+        }
+        if python_transform is not None:
+            result["python_expression"] = python_transform
         if pre_resolved_from is not None:
-            transform_result["resolved_from"] = pre_resolved_from
-        if post_save_warning is not None:
-            transform_result["warnings"] = [post_save_warning]
-        if post_save_warning is None:
-            _attach_dashboard_render_paths(transform_result, url_path, post_save_config)
-        _attach_dashboard_skill(transform_result, MandatoryBPS)
-        return await _maybe_attach_screenshot(
-            transform_result,
+            result["resolved_from"] = pre_resolved_from
+        if edit.get("warnings"):
+            result["warnings"] = list(edit["warnings"])
+        if edit.get("unchanged"):
+            result["unchanged"] = True
+            result["message"] = f"Dashboard {url_path} unchanged"
+        if edit["post_write_verified"]:
+            _attach_dashboard_render_paths(result, url_path, edit["config"])
+        await _attach_dashboard_skill(result, MandatoryBPS, self._client)
+        return await maybe_attach_screenshot(
+            result,
             url_path,
             return_screenshot,
             client=self._client,
-            config=post_save_config,
+            config=edit["config"],
             options=screenshot_options,
         )
 
@@ -3174,7 +3070,10 @@ class DashboardConfigTools:
         if pre_fetched_dashboards is not None:
             existing_dashboards = pre_fetched_dashboards
         else:
-            existing_dashboards = await fetch_dashboards_list(self._client) or []
+            fetched_dashboards = await fetch_dashboards_list(self._client)
+            if fetched_dashboards is None:
+                raise_registry_read_error(action="set", url_path=url_path)
+            existing_dashboards = fetched_dashboards
         dashboard_exists = any(
             d.get("url_path") == url_path for d in existing_dashboards
         )
@@ -3194,26 +3093,34 @@ class DashboardConfigTools:
         show_in_sidebar: bool | None,
     ) -> str | None:
         """Create a new storage-mode dashboard and return its dashboard_id."""
-        dashboard_title = title or url_path.replace("-", " ").title()
+        # Core requires the title and defaults require_admin/show_in_sidebar.
         create_data: dict[str, Any] = {
             "type": "lovelace/dashboards/create",
             "url_path": url_path,
-            "title": dashboard_title,
-            "require_admin": require_admin if require_admin is not None else False,
-            "show_in_sidebar": show_in_sidebar if show_in_sidebar is not None else True,
+            **{
+                key: value
+                for key, value in {
+                    "title": title,
+                    "icon": icon or None,
+                    "require_admin": require_admin,
+                    "show_in_sidebar": show_in_sidebar,
+                }.items()
+                if value is not None
+            },
         }
-        if icon:
-            create_data["icon"] = icon
         create_result = await self._client.send_websocket_message(create_data)
 
         if isinstance(create_result, dict) and not create_result.get("success", True):
             error_msg = create_result.get("error", {})
             if isinstance(error_msg, dict):
                 error_msg = error_msg.get("message", str(error_msg))
+            hyphenated = hyphenated_url_path(str(error_msg), url_path)
+            suggestions = [f"Try '{hyphenated}' instead"] if hyphenated else None
             raise_tool_error(
                 create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
+                    ws_failure_code(create_result),
                     str(error_msg),
+                    suggestions=suggestions,
                     context={"action": "create", "url_path": url_path},
                 )
             )
@@ -3241,12 +3148,8 @@ class DashboardConfigTools:
                 error_msg = error_msg.get("message", str(error_msg))
             raise_tool_error(
                 create_error_response(
-                    code=ErrorCode.SERVICE_CALL_FAILED,
+                    code=ws_failure_code(meta_result),
                     message=f"Failed to update dashboard metadata: {error_msg}",
-                    suggestions=[
-                        "Check that you have admin permissions",
-                        "Verify dashboard is in storage mode (not YAML mode)",
-                    ],
                     context={"action": "update", "url_path": url_path},
                 )
             )
@@ -3263,7 +3166,7 @@ class DashboardConfigTools:
     ) -> tuple[str | None, bool, str | None]:
         """Update metadata for an existing dashboard if any metadata params were provided.
 
-        Returns ``(dashboard_id, metadata_updated, hint)``.
+        Returns ``(dashboard_id, metadata_updated, warning)``.
         """
         dashboard_id = None
         for dashboard in existing_dashboards:
@@ -3275,12 +3178,14 @@ class DashboardConfigTools:
             k: v
             for k, v in {
                 "title": title,
-                "icon": icon,
                 "require_admin": require_admin,
                 "show_in_sidebar": show_in_sidebar,
             }.items()
             if v is not None
         }
+        if icon is not None:
+            # Core's update schema accepts None and then drops the stored icon.
+            metadata_update_fields["icon"] = icon or None
         if metadata_update_fields and dashboard_id is not None:
             await self._send_dashboard_metadata_update(
                 dashboard_id, metadata_update_fields, url_path
@@ -3289,13 +3194,13 @@ class DashboardConfigTools:
         if metadata_update_fields and dashboard_id is None:
             # Dashboard ID not found in storage list (e.g. default lovelace on
             # fresh installs). Metadata update via lovelace/dashboards/update
-            # is not possible without a storage ID — config update still proceeds.
-            hint = (
+            # is not possible without a storage ID. The caller either proceeds
+            # with a requested config write or rejects the resulting no-op.
+            warning = (
                 "Metadata fields were provided but could not be applied: "
-                "dashboard has no storage ID (likely the built-in default dashboard). "
-                "Config changes were still saved."
+                "dashboard has no storage ID (likely the built-in default dashboard)."
             )
-            return dashboard_id, False, hint
+            return dashboard_id, False, warning
         return dashboard_id, False, None
 
     async def _ensure_dashboard_exists(
@@ -3310,7 +3215,7 @@ class DashboardConfigTools:
     ) -> tuple[bool, str | None, bool, str | None]:
         """Create the dashboard if missing, else update its metadata if requested.
 
-        Returns ``(dashboard_exists, dashboard_id, metadata_updated, hint)`` —
+        Returns ``(dashboard_exists, dashboard_id, metadata_updated, warning)`` —
         ``dashboard_exists`` reflects state *before* this call, so the caller
         can distinguish create vs update for the response's
         ``action``/``dashboard_created`` fields.
@@ -3328,7 +3233,7 @@ class DashboardConfigTools:
             )
             return dashboard_exists, dashboard_id, False, None
 
-        dashboard_id, metadata_updated, hint = await self._update_dashboard_metadata(
+        dashboard_id, metadata_updated, warning = await self._update_dashboard_metadata(
             url_path,
             existing_dashboards,
             title=title,
@@ -3336,77 +3241,164 @@ class DashboardConfigTools:
             require_admin=require_admin,
             show_in_sidebar=show_in_sidebar,
         )
-        return dashboard_exists, dashboard_id, metadata_updated, hint
+        return dashboard_exists, dashboard_id, metadata_updated, warning
 
-    async def _check_dashboard_replace_hash(
-        self, url_path: str, config_hash: str | None
+    async def check_dashboard_replace_hash(
+        self,
+        url_path: str,
+        config_hash: str | None,
+        replacement_config: dict[str, Any],
     ) -> str | None:
-        """Optionally validate config_hash and warn on large full-config replacement.
+        """Validate replacement safety/hash and warn on large full-config replacement.
 
-        Tolerates fetch failures — full replacement still proceeds even if the
-        pre-read can't load the current state (force-replace path).
+        Omitting ``config_hash`` remains the force-replace path, but the current
+        config must still be readable so strategy-dashboard protection can be
+        evaluated before any replacement write. The one exception is an existing
+        storage dashboard with no config yet and no supplied ``config_hash``:
+        there is no strategy state to protect, so its first full config may be
+        written. A supplied hash still conflicts with the now-absent config.
         """
         try:
             existing_config, existing_hash = await _get_dashboard_config_internal(
                 self._client, url_path
             )
-        except ToolError:
-            # Pre-read failure is non-fatal on the force-replace path: skip
-            # the optimistic-lock check and large-config warning and proceed
-            # with the replacement.
-            return None
-
-        if not isinstance(existing_config, dict):
-            return None
-
-        existing_config_size = len(json.dumps(existing_config))
-        if config_hash is not None and existing_hash != config_hash:
+        except ToolError as exc:
+            if is_no_stored_config_error(exc):
+                if config_hash is None:
+                    return None
+                self._raise_dashboard_hash_conflict(
+                    url_path, message="Dashboard has no saved config"
+                )
             raise_tool_error(
                 create_error_response(
                     ErrorCode.SERVICE_CALL_FAILED,
-                    "Dashboard modified since last read (conflict)",
+                    "Cannot verify the current dashboard config before full replacement",
+                    details=extract_tool_error_message(exc),
                     suggestions=[
-                        "Call ha_config_get_dashboard() again",
-                        "Use the fresh config_hash, or omit config_hash to force replace",
+                        "Retry the operation",
+                        "Read the dashboard with ha_config_get_dashboard first",
                     ],
-                    context={"action": "set", "url_path": url_path},
+                    context={
+                        "action": "set",
+                        "url_path": url_path,
+                        "reason": "load_failed",
+                        "write_committed": False,
+                        "post_write_verified": False,
+                    },
                 )
             )
 
-        if existing_config_size >= 10000:
-            return (
-                f"Replaced large config ({existing_config_size:,} bytes). "
-                "Consider python_transform for targeted edits."
-            )
-        return None
+        existing_config_size = len(json.dumps(existing_config))
+        if config_hash is not None and existing_hash != config_hash:
+            self._raise_dashboard_hash_conflict(url_path)
+
+        self._validate_strategy_dashboard_replacement(
+            url_path,
+            was_strategy_dashboard="strategy" in existing_config,
+            replacement_config=replacement_config,
+            action="set",
+        )
+
+        return _large_dashboard_replacement_warning(existing_config_size)
+
+    @staticmethod
+    def _raise_dashboard_hash_conflict(
+        url_path: str, *, message: str = "Dashboard modified since last read (conflict)"
+    ) -> NoReturn:
+        """Raise the shared optimistic-lock conflict for a full replacement."""
+        raise_dashboard_edit_error(
+            url_path,
+            "conflict",
+            message,
+            False,
+            "set",
+            hash_supplied=True,
+        )
+
+    @staticmethod
+    def _validate_strategy_dashboard_replacement(
+        url_path: str,
+        *,
+        was_strategy_dashboard: bool,
+        replacement_config: dict[str, Any],
+        action: str,
+    ) -> None:
+        """Prevent this tool from taking control of a strategy dashboard."""
+        if not was_strategy_dashboard or "strategy" in replacement_config:
+            return
+        raise_dashboard_edit_error(
+            url_path,
+            "strategy_conversion",
+            "Strategy dashboards cannot be converted to custom dashboards via this tool",
+            False,
+            action,
+        )
 
     async def _save_dashboard_config(
-        self, url_path: str, config_dict: dict[str, Any]
+        self,
+        url_path: str,
+        config_dict: dict[str, Any],
+        *,
+        action: str = "set",
     ) -> None:
-        """Save ``config_dict`` as the full dashboard config replacement."""
+        """Save through the legacy API with a consistent outcome for every edit mode."""
         config_save_data: dict[str, Any] = {
             "type": "lovelace/config/save",
             "config": config_dict,
         }
-        if url_path:
+        if url_path and url_path != "lovelace":  # as _get_dashboard_config_internal
             config_save_data["url_path"] = url_path
-        save_result = await self._client.send_websocket_message(config_save_data)
-
-        if isinstance(save_result, dict) and not save_result.get("success", True):
-            error_msg = save_result.get("error", {})
-            if isinstance(error_msg, dict):
-                error_msg = error_msg.get("message", str(error_msg))
+        try:
+            save_result = await self._client.send_websocket_message(config_save_data)
+        except ToolError:
+            raise
+        except asyncio.CancelledError:
             raise_tool_error(
                 create_error_response(
                     ErrorCode.SERVICE_CALL_FAILED,
-                    f"Failed to save dashboard config: {error_msg}",
+                    "Dashboard write outcome unknown: save request was cancelled",
                     suggestions=[
-                        "Verify config format is valid Lovelace JSON",
-                        "Check that you have admin permissions",
-                        "Ensure all entity IDs in config exist",
+                        "Read the dashboard before retrying to check whether the save applied"
                     ],
-                    context={"action": "set", "url_path": url_path},
+                    context={
+                        "action": action,
+                        "url_path": url_path,
+                        "reason": "write_outcome_unknown",
+                        "write_committed": None,
+                        "post_write_verified": False,
+                    },
                 )
+            )
+        except HomeAssistantCommandNotSent as exc:
+            raise_dashboard_edit_unsent(exc, url_path, action, "write_not_sent")
+        except Exception as exc:  # noqa: BLE001
+            exception_to_structured_error(
+                exc,
+                context={
+                    "action": action,
+                    "url_path": url_path,
+                    "write_committed": None,
+                    "reason": "write_outcome_unknown",
+                    "post_write_verified": False,
+                },
+                suggestions=[
+                    "Read the dashboard before retrying to check whether the save applied",
+                ],
+            )
+
+        if isinstance(save_result, dict) and not save_result.get("success", True):
+            raise_known_dashboard_save_rejection(save_result, url_path, action)
+            error_msg = save_result.get("error", {})
+            if isinstance(error_msg, dict):
+                error_msg = error_msg.get("message", str(error_msg))
+            # Core may update the live config before persistence raises. An
+            # unrecognized error response cannot establish an unwritten edit.
+            raise_dashboard_edit_error(
+                url_path,
+                "write_outcome_unknown",
+                f"Failed to save {'transformed' if action == 'python_transform' else 'dashboard'} config: {error_msg}",
+                None,
+                action,
             )
 
     async def _apply_dashboard_config(
@@ -3415,11 +3407,60 @@ class DashboardConfigTools:
         config: dict[str, Any] | str,
         config_hash: str | None,
         dashboard_exists: bool,
-    ) -> tuple[bool, str | None, dict[str, Any]]:
-        """Parse + validate ``config`` and save it as a full replacement.
+        *,
+        metadata_updated: bool = False,
+    ) -> tuple[bool, str | None, dict[str, Any], dict[str, Any] | None]:
+        """Preserve prior registry writes on any configuration-update failure."""
+        try:
+            return await self._prepare_and_save_dashboard_config(
+                url_path, config, config_hash, dashboard_exists
+            )
+        except (asyncio.CancelledError, Exception) as exc:
+            if dashboard_exists and not metadata_updated:
+                raise
+            # Native and legacy outcomes describe only the config command. A
+            # preceding create/metadata call already succeeded in either case.
+            if isinstance(exc, asyncio.CancelledError):
+                error = create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    "Configuration update cancelled before saving",
+                    context={"action": "set", "url_path": url_path},
+                    suggestions=["Read the dashboard before deciding whether to retry"],
+                )
+            elif isinstance(exc, ToolError):
+                error = json.loads(str(exc))
+            else:
+                error = exception_to_structured_error(
+                    exc,
+                    context={"action": "set", "url_path": url_path},
+                    raise_error=False,
+                )
+            # Validation/read failures precede saving. Save helpers attach an
+            # explicit None when they cannot determine the configuration outcome.
+            error["config_write_committed"] = error.get("write_committed", False)
+            error["write_committed"] = True
+            error["dashboard_created"] = not dashboard_exists
+            error["metadata_updated"] = metadata_updated
+            prior_change = (
+                "Dashboard metadata was updated"
+                if dashboard_exists
+                else "Dashboard was created"
+            )
+            error["error"]["message"] = (
+                f"{prior_change}; configuration update: {error['error']['message']}"
+            )
+            raise_tool_error(error)
+        # CodeQL does not infer the shared helper's NoReturn contract.
+        raise AssertionError("unreachable: raise_tool_error always raises")
 
-        Returns ``(config_updated, hint, saved_config)``.
-        """
+    async def _prepare_and_save_dashboard_config(
+        self,
+        url_path: str,
+        config: dict[str, Any] | str,
+        config_hash: str | None,
+        dashboard_exists: bool,
+    ) -> tuple[bool, str | None, dict[str, Any], dict[str, Any] | None]:
+        """Return (updated, warning, saved config, native result) for either backend."""
         parsed_config = parse_json_param(config, "config")
         if parsed_config is None or not isinstance(parsed_config, dict):
             raise_tool_error(
@@ -3433,13 +3474,48 @@ class DashboardConfigTools:
                 )
             )
         config_dict = cast(dict[str, Any], parsed_config)
+        # Creation has no previous config to compare. Match the legacy create
+        # path, which ignores a supplied hash; existing entries retain the guard.
+        native_result = await edit_dashboard_via_component(
+            self._client,
+            url_path,
+            expected_hash=config_hash if dashboard_exists else None,
+            config=config_dict,
+        )
+        if native_result is not None:
+            native_warning = _large_dashboard_replacement_warning(
+                native_result["previous_config_size"]
+            )
+            return True, native_warning, native_result["config"], native_result
 
-        hint: str | None = None
+        warning: str | None = None
         if dashboard_exists:
-            hint = await self._check_dashboard_replace_hash(url_path, config_hash)
+            warning = await self.check_dashboard_replace_hash(
+                url_path, config_hash, config_dict
+            )
 
         await self._save_dashboard_config(url_path, config_dict)
-        return True, hint, config_dict
+        return True, warning, config_dict, None
+
+    async def _attach_dashboard_write_result(
+        self,
+        result: dict[str, Any],
+        url_path: str,
+        render_config: dict[str, Any] | None,
+        native_result: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Reuse native verification without another dashboard fetch."""
+        if native_result is None:
+            return await attach_dashboard_render_paths_after_write(
+                self._client, result, url_path, render_config
+            )
+        for key in ("config_hash", "write_committed", "post_write_verified"):
+            result[key] = native_result[key]
+        if native_result.get("warnings"):
+            result.setdefault("warnings", []).extend(native_result["warnings"])
+        if native_result["post_write_verified"]:
+            _attach_dashboard_render_paths(result, url_path, native_result["config"])
+        return cast(dict[str, Any], native_result["config"])
 
     async def _run_dashboard_config_update(
         self,
@@ -3454,15 +3530,16 @@ class DashboardConfigTools:
         pre_resolved_from: str | None,
         pre_fetched_dashboards: list[dict[str, Any]] | None,
         return_screenshot: bool,
-        screenshot_options: _DashboardScreenshotOptions,
+        screenshot_options: DashboardScreenshotOptions,
         MandatoryBPS: bool,
-    ) -> "dict[str, Any] | ToolResult":
+    ) -> dict[str, Any] | ToolResult:
         """Execute config-replacement mode (create-or-update) and return the tool response."""
+        reject_malformed_dashboard_config(config, url_path)
         (
             dashboard_exists,
             dashboard_id,
             metadata_updated,
-            hint,
+            metadata_warning,
         ) = await self._ensure_dashboard_exists(
             url_path,
             title=title,
@@ -3473,17 +3550,56 @@ class DashboardConfigTools:
         )
 
         config_updated = False
+        native_result: dict[str, Any] | None = None
         render_config: dict[str, Any] | None = None
+        warnings: list[str] = []
         if config is not None:
             (
                 config_updated,
-                config_hint,
+                config_warning,
                 render_config,
+                native_result,
             ) = await self._apply_dashboard_config(
-                url_path, config, config_hash, dashboard_exists
+                url_path,
+                config,
+                config_hash,
+                dashboard_exists,
+                metadata_updated=metadata_updated,
             )
-            if config_hint:
-                hint = config_hint
+            if config_warning:
+                warnings.append(config_warning)
+
+        if dashboard_exists and not config_updated and not metadata_updated:
+            if metadata_warning is not None:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        "No dashboard changes were applied",
+                        details=metadata_warning,
+                        suggestions=[
+                            "Use a storage-mode dashboard when changing metadata",
+                            "Provide config to replace the dashboard configuration",
+                        ],
+                        context={"action": "set", "url_path": url_path},
+                    )
+                )
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "No dashboard changes were requested",
+                    suggestions=[
+                        "Provide config, patch or python_transform to change dashboard content",
+                        "Provide a metadata field such as title or icon",
+                        "Use ha_config_get_dashboard to read a dashboard without changing it",
+                    ],
+                    context={"action": "set", "url_path": url_path},
+                )
+            )
+
+        if metadata_warning:
+            if config_updated:
+                metadata_warning = f"{metadata_warning} Dashboard config was saved."
+            warnings.insert(0, metadata_warning)
 
         result_dict: dict[str, Any] = {
             "success": True,
@@ -3496,20 +3612,19 @@ class DashboardConfigTools:
             "message": f"Dashboard {url_path} {'created' if not dashboard_exists else 'updated'} successfully",
         }
 
-        if hint:
-            result_dict["hint"] = hint
+        if warnings:
+            result_dict["warnings"] = warnings
         if pre_resolved_from is not None:
-            # Caller passed an internal id; pre-resolver mapped it to
-            # the canonical url_path. Surface the original so a caller
-            # who *intended* to create a new dashboard can detect that
-            # an existing dashboard was updated instead.
+            # This marks identifier canonicalization only. Exact url_path
+            # matches deliberately omit it; callers use ``action`` to tell
+            # whether the create-or-update operation updated an existing target.
             result_dict["resolved_from"] = pre_resolved_from
 
-        render_config = await _attach_dashboard_render_paths_after_write(
-            self._client, result_dict, url_path, render_config
+        render_config = await self._attach_dashboard_write_result(
+            result_dict, url_path, render_config, native_result
         )
-        _attach_dashboard_skill(result_dict, MandatoryBPS)
-        return await _maybe_attach_screenshot(
+        await _attach_dashboard_skill(result_dict, MandatoryBPS, self._client)
+        return await maybe_attach_screenshot(
             result_dict,
             url_path,
             return_screenshot,
@@ -3521,11 +3636,9 @@ class DashboardConfigTools:
     @tool(
         name="ha_config_delete_dashboard",
         tags={"Dashboards"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "title": "Delete Dashboard",
-        },
+        annotations=write_hints(
+            "Delete Dashboard", destructive=True, idempotent=True, open_world=False
+        ),
     )
     @with_auto_backup(domain="dashboard", id_param="url_path")
     @log_tool_usage
@@ -3542,17 +3655,16 @@ class DashboardConfigTools:
         """
         Delete a storage-mode dashboard completely.
 
-        WARNING: This permanently deletes the dashboard and all its configuration.
-        Cannot be undone. Does not work on YAML-mode dashboards.
+        WARNING: This deletes the dashboard and all its configuration; with auto-backup
+        on, ha_manage_backup(scope='edits', action='restore') re-creates it. YAML-mode
+        dashboards are defined in configuration.yaml and cannot be deleted via the API.
 
-        Accepts either the URL path or the internal dashboard ID. HA internal IDs
-        may differ from url_path (e.g. hyphens → underscores); the tool resolves
-        either form to the actual registry ID before deletion.
+        HA internal IDs may differ from url_path (e.g. hyphens → underscores); the tool resolves
+        either form to the actual registry ID before deletion. 'default' is an
+        alias for 'lovelace'.
 
         EXAMPLES:
         - Delete dashboard: ha_config_delete_dashboard("mobile-dashboard")
-
-        Note: The default dashboard cannot be deleted via this method.
         """
         try:
             # ``url_path`` is required. Reject empty/whitespace up-front so
@@ -3569,71 +3681,37 @@ class DashboardConfigTools:
                 ],
                 context={"action": "delete"},
             )
+            if url_path == "default":
+                url_path = "lovelace"
             resolved, dashboards = await _resolve_dashboard(self._client, url_path)
+            if dashboards is None:
+                raise_registry_read_error(action="delete", url_path=url_path)
             if resolved is None:
-                available_ids = [
-                    d.get("url_path")
-                    for d in (dashboards or [])[:10]
-                    if d.get("url_path")
-                ]
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.RESOURCE_NOT_FOUND,
-                        f"Dashboard '{url_path}' not found",
-                        details=f"No dashboard found with URL path or internal ID '{url_path}'.",
-                        suggestions=[
-                            "Use ha_config_get_dashboard(list_only=True) to see available dashboards",
-                            "YAML-mode and default dashboards are not deletable via this tool",
-                        ],
-                        context={
-                            "action": "delete",
-                            "url_path": url_path,
-                            "available_dashboard_ids": available_ids,
-                        },
-                    )
-                )
+                raise_unresolved_delete(url_path, dashboards)
             resolved_id = resolved["id"]
 
             response = await self._client.send_websocket_message(
                 {"type": "lovelace/dashboards/delete", "dashboard_id": resolved_id}
             )
 
-            # Check response for error indication
             if isinstance(response, dict) and not response.get("success", True):
-                error_msg = response.get("error", {})
-                if isinstance(error_msg, dict):
-                    error_str = error_msg.get("message", str(error_msg))
-                else:
-                    error_str = str(error_msg)
-
-                # If the error is "not found" / "doesn't exist", treat as success (idempotent)
-                if (
-                    "unable to find" in error_str.lower()
-                    or "not found" in error_str.lower()
-                ):
+                # Core's collection answers not_found when the item is already gone.
+                if response.get("error_code") == "not_found":
                     return {
                         "success": True,
                         "action": "delete",
                         "url_path": url_path,
                         "message": "Dashboard already deleted or does not exist",
                     }
-
-                # For other errors, raise
                 raise_tool_error(
                     create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        f"Failed to delete dashboard: {error_str}",
-                        suggestions=[
-                            "Verify dashboard exists and is storage-mode",
-                            "Check that you have admin permissions",
-                            "Use ha_config_get_dashboard(list_only=True) to see available dashboards",
-                            "Cannot delete YAML-mode or default dashboard",
-                        ],
+                        ws_failure_code(response),
+                        f"Failed to delete dashboard: {response.get('error')}",
+                        suggestions=[DASHBOARD_LIST_SUGGESTION],
                         context={"action": "delete", "url_path": url_path},
                     )
                 )
 
-            # Delete successful
             result: dict[str, Any] = {
                 "success": True,
                 "action": "delete",
@@ -3642,19 +3720,19 @@ class DashboardConfigTools:
             }
             if resolved_id != url_path:
                 result["resolved_id"] = resolved_id
+            if url_path == "lovelace":
+                result["note"] = (
+                    "Home Assistant re-registers its auto-generated default "
+                    "dashboard at /lovelace."
+                )
             return result
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             exception_to_structured_error(
                 e,
                 context={"action": "delete", "url_path": url_path},
-                suggestions=[
-                    "Verify dashboard exists and is storage-mode",
-                    "Check that you have admin permissions",
-                    "Use ha_config_get_dashboard(list_only=True) to see available dashboards",
-                    "Cannot delete YAML-mode or default dashboard",
-                ],
+                suggestions=[DASHBOARD_LIST_SUGGESTION],
             )
         return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
 

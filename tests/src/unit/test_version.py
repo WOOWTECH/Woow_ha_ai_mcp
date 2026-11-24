@@ -1,103 +1,208 @@
-"""Unit tests for ha_mcp._version and the __main__ startup log helper."""
+"""Unit tests for the version ``ha-mcp`` reports and its startup banners."""
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import logging
+import os
+import sys
+from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
-from ha_mcp._version import get_version, is_dev_version, is_running_in_addon
+from ha_mcp import update_check
+
+from ._main_web import start_main_web
+from ._tools_addons_core import Supervisor
+from ._tools_addons_core import supervisor as supervisor
+from ._tools_addons_core import target_app as target_app
+from ._update_check_sources import PyPI, app_store
+from ._update_check_sources import pypi as pypi
+
+
+@pytest.fixture
+def reported_version(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> Callable[[], str]:
+    """Read the version ``ha-mcp --version`` prints."""
+    from ha_mcp.__main__ import main
+
+    def read() -> str:
+        monkeypatch.setattr(sys, "argv", ["ha-mcp", "--version"])
+        with pytest.raises(SystemExit) as exited:
+            main()
+        assert exited.value.code == 0
+        printed = capsys.readouterr().out.strip()
+        assert printed.startswith("ha-mcp ")
+        return printed.removeprefix("ha-mcp ")
+
+    return read
+
+
+def _startup_records(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    version: str,
+    supervisor_token: str | None,
+) -> list[logging.LogRecord]:
+    """What an ``ha-mcp-web`` start of ``version`` logs, loopback-bound so the
+    default-path warning stays out of the way."""
+    with caplog.at_level(logging.INFO, logger="ha_mcp.__main__"):
+        start_main_web(
+            monkeypatch,
+            HA_MCP_BUILD_VERSION=version,
+            SUPERVISOR_TOKEN=supervisor_token,
+            MCP_HOST="127.0.0.1",
+        )
+    return [r for r in caplog.records if r.name == "ha_mcp.__main__"]
+
+
+async def _checked_start(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    version: str,
+    supervisor_token: str | None,
+) -> list[logging.LogRecord]:
+    """``_startup_records`` in a thread, so this loop serves what the start's
+    update check asks."""
+    return await asyncio.to_thread(
+        _startup_records, monkeypatch, caplog, version, supervisor_token
+    )
+
+
+def _warnings(records: list[logging.LogRecord]) -> list[str]:
+    return [r.getMessage() for r in records if r.levelno == logging.WARNING]
+
+
+class _FakeDist:
+    def __init__(self, top_level: str | None, files: list[str]) -> None:
+        self._top_level = top_level
+        self.files = [importlib.metadata.PackagePath(f) for f in files]
+
+    def read_text(self, name: str) -> str | None:
+        return self._top_level if name == "top_level.txt" else None
+
+
+@pytest.fixture
+def installed(monkeypatch: pytest.MonkeyPatch):
+    """Replace the installed distributions with the given fakes.
+
+    Each value is ``(version, top_level_txt_or_None, files)``. Reading any
+    other distribution, or scanning all of them, fails the test: the tests
+    must not depend on the developer's environment.
+    """
+    monkeypatch.delenv("HA_MCP_BUILD_VERSION", raising=False)
+
+    def use(dists: dict[str, tuple[str, str | None, list[str]]]) -> None:
+        def lookup(name: str) -> tuple[str, str | None, list[str]]:
+            if name not in dists:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return dists[name]
+
+        def scan_everything() -> None:
+            raise AssertionError("scanned every installed distribution")
+
+        monkeypatch.setattr(importlib.metadata, "version", lambda n: lookup(n)[0])
+        monkeypatch.setattr(
+            importlib.metadata,
+            "distribution",
+            lambda n: _FakeDist(lookup(n)[1], lookup(n)[2]),
+        )
+        monkeypatch.setattr(
+            importlib.metadata, "packages_distributions", scan_everything
+        )
+
+    return use
+
+
+_WHEEL_FILES = ["ha_mcp/__init__.py", "ha_mcp/server.py"]
 
 
 class TestGetVersion:
     """Tests for the version resolution helper."""
 
     def test_env_override_wins_over_package_metadata(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, reported_version: Callable[[], str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """HA_MCP_BUILD_VERSION must take priority so Docker/add-on dev builds
         can surface their dev suffix even though pyproject.toml isn't rewritten."""
         monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.3.0.dev999")
-        assert get_version() == "7.3.0.dev999"
+        assert reported_version() == "7.3.0.dev999"
 
-    def test_falls_back_to_ha_mcp_metadata(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_reads_the_installed_stable_package(
+        self, reported_version: Callable[[], str], installed
     ) -> None:
-        """Without the env var, resolve via installed package metadata."""
-        monkeypatch.delenv("HA_MCP_BUILD_VERSION", raising=False)
-        expected = importlib.metadata.version("ha-mcp")
-        assert get_version() == expected
+        """Without the env var, the version comes from the package metadata."""
+        installed({"ha-mcp": ("8.6.0", None, _WHEEL_FILES)})
+        assert reported_version() == "8.6.0"
 
-    def test_falls_back_to_ha_mcp_dev_when_ha_mcp_missing(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_reads_the_dev_channel_package_when_stable_is_absent(
+        self, reported_version: Callable[[], str], installed
     ) -> None:
-        """PyPI dev channel installs register as ``ha-mcp-dev`` (renamed package).
-
-        Simulate ``ha-mcp`` not being installed so the fallback loop must try
-        ``ha-mcp-dev`` next.
-        """
-        monkeypatch.delenv("HA_MCP_BUILD_VERSION", raising=False)
-
-        real_version = importlib.metadata.version
-
-        def fake_version(pkg_name: str) -> str:
-            if pkg_name == "ha-mcp":
-                raise importlib.metadata.PackageNotFoundError(pkg_name)
-            if pkg_name == "ha-mcp-dev":
-                return "7.3.0.dev42"
-            return real_version(pkg_name)
-
-        monkeypatch.setattr(importlib.metadata, "version", fake_version)
-        assert get_version() == "7.3.0.dev42"
+        """PyPI dev channel installs register as ``ha-mcp-dev``."""
+        installed({"ha-mcp-dev": ("7.3.0.dev42", None, _WHEEL_FILES)})
+        assert reported_version() == "7.3.0.dev42"
 
     def test_returns_unknown_when_not_installed(
         self,
-        monkeypatch: pytest.MonkeyPatch,
+        reported_version: Callable[[], str],
+        installed,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """When neither env var nor package metadata resolves, return 'unknown'
         rather than raising — a missing version shouldn't crash startup — but
         emit a WARNING so the broken install is visible in logs."""
-        monkeypatch.delenv("HA_MCP_BUILD_VERSION", raising=False)
-
-        def always_missing(pkg_name: str) -> str:
-            raise importlib.metadata.PackageNotFoundError(pkg_name)
-
-        monkeypatch.setattr(importlib.metadata, "version", always_missing)
+        installed({})
         with caplog.at_level(logging.WARNING, logger="ha_mcp._version"):
-            result = get_version()
+            result = reported_version()
         assert result == "unknown"
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert "metadata not found" in warnings[0].getMessage()
 
     def test_empty_env_var_falls_through_to_metadata(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        reported_version: Callable[[], str],
+        installed,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """An empty HA_MCP_BUILD_VERSION (stable Docker default from ARG="")
         must not override — otherwise stable builds would report '' as version."""
+        installed({"ha-mcp": ("8.6.0", None, _WHEEL_FILES)})
         monkeypatch.setenv("HA_MCP_BUILD_VERSION", "")
-        expected = importlib.metadata.version("ha-mcp")
-        assert get_version() == expected
+        assert reported_version() == "8.6.0"
 
 
 class TestIsDevVersion:
-    """Tests for PEP 440 dev-suffix detection."""
+    """PEP 440 dev-suffix detection, seen as the dev-channel startup banner."""
 
     @pytest.mark.parametrize(
         "version",
         ["7.3.0.dev390", "7.3.0.dev0", "8.0.0.dev1", "1.2.3.dev100+abc123"],
     )
-    def test_detects_dev_suffix(self, version: str) -> None:
-        assert is_dev_version(version) is True
+    def test_detects_dev_suffix(
+        self,
+        version: str,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        warnings = _warnings(_startup_records(monkeypatch, caplog, version, None))
+        assert any("dev channel" in m for m in warnings), warnings
 
     @pytest.mark.parametrize(
         "version",
         ["7.3.0", "7.3.1", "8.0.0", "1.2.3rc1", "1.2.3a1", "1.2.3b1", "unknown"],
     )
-    def test_stable_and_pre_release_versions_are_not_dev(self, version: str) -> None:
-        assert is_dev_version(version) is False
+    def test_stable_and_pre_release_versions_are_not_dev(
+        self,
+        version: str,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        warnings = _warnings(_startup_records(monkeypatch, caplog, version, None))
+        assert not any("dev channel" in m for m in warnings), warnings
 
 
 class TestAddonStartLogsVersionBanner:
@@ -124,54 +229,33 @@ class TestAddonStartLogsVersionBanner:
 
 
 class TestIsRunningInAddon:
-    """Tests for HA add-on environment detection."""
-
-    def test_detects_supervisor_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SUPERVISOR_TOKEN", "hassio-token-abc")
-        assert is_running_in_addon() is True
-
-    def test_absent_when_no_supervisor_token(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
-        assert is_running_in_addon() is False
+    """HA add-on detection, seen as the dev banner it suppresses."""
 
     def test_empty_supervisor_token_treated_as_absent(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Guard against a spurious empty-string env var masquerading as the addon."""
-        monkeypatch.setenv("SUPERVISOR_TOKEN", "")
-        assert is_running_in_addon() is False
+        warnings = _warnings(_startup_records(monkeypatch, caplog, "7.3.0.dev42", ""))
+        assert any("dev channel" in m for m in warnings), warnings
 
 
 class TestLogStartupVersion:
-    """Tests for _log_startup_version() — the behavioral payload of the PR.
+    """The version line and banners an ``ha-mcp-web`` start logs.
 
     Covers the log emission plus the dev-banner gating logic: banner must fire
     on standalone dev installs and must be suppressed under HA Supervisor so
     add-on users don't get noise (they already see the channel in the HAOS UI).
+    The self-update check is off in every unit test (``conftest.py``) unless a
+    test turns it on.
     """
-
-    def _call(self, caplog: pytest.LogCaptureFixture) -> None:
-        from ha_mcp.__main__ import _log_startup_version
-
-        # _log_startup_version uses the module-level ``logger`` in __main__.
-        with caplog.at_level(logging.INFO, logger="ha_mcp.__main__"):
-            _log_startup_version()
 
     def test_logs_version_at_info(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.3.0")
-        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
-        # Disable the self-update check so this dev-banner test stays offline.
-        monkeypatch.setenv("HA_MCP_DISABLE_UPDATE_CHECK", "1")
-        self._call(caplog)
-        info_messages = [
-            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
-        ]
+        records = _startup_records(monkeypatch, caplog, "7.3.0", None)
+        info_messages = [r.getMessage() for r in records if r.levelno == logging.INFO]
         assert any("ha-mcp 7.3.0" in msg for msg in info_messages), info_messages
 
     def test_dev_version_emits_stable_banner_warning(
@@ -179,14 +263,10 @@ class TestLogStartupVersion:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.3.0.dev42")
-        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
-        self._call(caplog)
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1, [r.getMessage() for r in warnings]
-        msg = warnings[0].getMessage()
-        assert ":stable" in msg
-        assert "dev channel" in msg
+        warnings = _warnings(_startup_records(monkeypatch, caplog, "7.3.0.dev42", None))
+        assert len(warnings) == 1, warnings
+        assert ":stable" in warnings[0]
+        assert "dev channel" in warnings[0]
 
     def test_dev_banner_suppressed_under_supervisor_token(
         self,
@@ -194,14 +274,9 @@ class TestLogStartupVersion:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The banner must NOT fire inside an HA add-on (noisy, redundant with HAOS UI)."""
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.3.0.dev42")
-        monkeypatch.setenv("SUPERVISOR_TOKEN", "hassio-abc")
-        self._call(caplog)
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings == []
-        info_messages = [
-            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
-        ]
+        records = _startup_records(monkeypatch, caplog, "7.3.0.dev42", "hassio-abc")
+        assert _warnings(records) == []
+        info_messages = [r.getMessage() for r in records if r.levelno == logging.INFO]
         # Version line still fires — add-on users should still see what they're running.
         assert any("7.3.0.dev42" in msg for msg in info_messages), info_messages
 
@@ -210,83 +285,94 @@ class TestLogStartupVersion:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Guard against an inverted is_dev_version check leaking the dev-channel
-        banner to stable users. The self-update check is disabled here so this
-        stays focused on the dev banner (the update banner has its own tests)."""
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.3.0")
-        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
-        monkeypatch.setenv("HA_MCP_DISABLE_UPDATE_CHECK", "1")
-        self._call(caplog)
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings == []
+        """Guard against an inverted dev check leaking the dev-channel banner to
+        stable users."""
+        assert _warnings(_startup_records(monkeypatch, caplog, "7.3.0", None)) == []
 
-    def test_stable_emits_update_banner_when_newer_available(
+    async def test_stable_emits_update_banner_when_newer_available(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
+        pypi: PyPI,
     ) -> None:
         """A standalone stable install with a newer PyPI release gets an
         update banner (the dev-channel banner stays silent)."""
-        from ha_mcp import update_check
-
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.8.0")
-        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
-        monkeypatch.setattr(
-            update_check,
-            "get_update_info",
-            lambda: update_check.UpdateInfo("7.8.0", "7.9.0", True),
-        )
-        self._call(caplog)
-        warnings = [
-            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-        ]
+        monkeypatch.delenv(update_check.DISABLE_ENV)
+        pypi.publish("ha-mcp", "7.9.0")
+        warnings = _warnings(await _checked_start(monkeypatch, caplog, "7.8.0", None))
         assert any("available: 7.9.0" in m for m in warnings), warnings
         assert not any("dev channel" in m for m in warnings), warnings
 
-    def test_stable_no_update_banner_when_current(
+    async def test_update_banner_names_the_python_the_release_needs(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
+        pypi: PyPI,
     ) -> None:
-        """No banner when already on the latest stable."""
-        from ha_mcp import update_check
-
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.9.0")
-        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        """The banner passes the release's requires_python on: a pip hint
+        would reinstall the old version on a Python the release excludes."""
         monkeypatch.setattr(
             update_check,
-            "get_update_info",
-            lambda: update_check.UpdateInfo("7.9.0", "7.9.0", False),
+            "os",
+            # No container marker files: a bare-metal install.
+            SimpleNamespace(
+                **{
+                    **vars(os),
+                    "path": SimpleNamespace(
+                        **{**vars(os.path), "exists": lambda path: False}
+                    ),
+                }
+            ),
         )
-        self._call(caplog)
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings == []
+        monkeypatch.setattr(
+            update_check,
+            "sys",
+            SimpleNamespace(**{**vars(sys), "version_info": (3, 13, 7, "final", 0)}),
+        )
+        monkeypatch.delenv(update_check.DISABLE_ENV)
+        monkeypatch.delenv("HA_MCP_EMBEDDED", raising=False)
+        pypi.publish("ha-mcp", "9.2.0", ">=3.14")
+        warnings = _warnings(await _checked_start(monkeypatch, caplog, "9.1.2", None))
+        assert any("uvx --python 3.14 ha-mcp@latest" in m for m in warnings), warnings
+        assert not any("pip install" in m for m in warnings), warnings
 
-    def test_update_banner_fires_under_supervisor_token(
+    async def test_stable_no_update_banner_when_current(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
+        pypi: PyPI,
+    ) -> None:
+        """No banner when already on the latest stable."""
+        monkeypatch.delenv(update_check.DISABLE_ENV)
+        pypi.publish("ha-mcp", "7.9.0")
+        assert _warnings(await _checked_start(monkeypatch, caplog, "7.9.0", None)) == []
+        assert pypi.asked == ["ha-mcp"]
+
+    async def test_update_banner_fires_under_supervisor_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        supervisor: Supervisor,
     ) -> None:
         """The update banner fires in the add-on too (copying FastMCP, which
         announces on every startup regardless of deployment) — an add-on user who
         ignored the Supervisor prompt still sees it in the logs. The add-on
         upgrade hint points at the Supervisor UI, not pip/docker."""
-        from ha_mcp import update_check
-
-        monkeypatch.setenv("HA_MCP_BUILD_VERSION", "7.8.0")
-        monkeypatch.setenv("SUPERVISOR_TOKEN", "hassio-abc")
-        monkeypatch.setattr(
-            update_check,
-            "get_update_info",
-            lambda: update_check.UpdateInfo("7.8.0", "7.9.0", True),
+        monkeypatch.delenv(update_check.DISABLE_ENV)
+        app_store(
+            monkeypatch,
+            supervisor,
+            installed="7.8.0",
+            latest="7.9.0",
+            update_available=True,
         )
-        self._call(caplog)
-        warnings = [
-            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-        ]
+        records = await _checked_start(monkeypatch, caplog, "7.8.0", "hassio-abc")
+        warnings = _warnings(records)
         assert any("available: 7.9.0" in m for m in warnings), warnings
         # add-on upgrade hint, not the dev-channel banner (suppressed in add-on)
-        assert any("Settings -> Add-ons" in m for m in warnings), warnings
+        assert any(
+            "Settings -> Apps -> Home Assistant MCP Server" in m for m in warnings
+        ), warnings
         assert not any("dev channel" in m for m in warnings), warnings
 
 
@@ -299,36 +385,37 @@ class TestGetVersionDistOwnership:
     dist's version instead of the installed one.
     """
 
-    def test_prefers_owning_distribution(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from ha_mcp import _version
+    def test_prefers_the_dist_whose_files_are_installed(
+        self, reported_version: Callable[[], str], installed
+    ) -> None:
+        installed(
+            {
+                "ha-mcp": ("1.0.0", None, ["ha_mcp-1.0.0.dist-info/METADATA"]),
+                "ha-mcp-dev": ("2.0.0.dev5", None, _WHEEL_FILES),
+            }
+        )
+        assert reported_version() == "2.0.0.dev5"
 
-        monkeypatch.delenv("HA_MCP_BUILD_VERSION", raising=False)
-        monkeypatch.setattr(
-            _version.importlib.metadata,
-            "packages_distributions",
-            lambda: {"ha_mcp": ["ha-mcp-dev"]},
+    def test_declared_top_level_decides_for_an_editable_install(
+        self, reported_version: Callable[[], str], installed
+    ) -> None:
+        """An editable install lists a .pth file, not ha_mcp/, and names the
+        package in top_level.txt instead."""
+        installed(
+            {
+                "ha-mcp": ("1.0.0", "tests\n", ["__editable__.ha_mcp.pth"]),
+                "ha-mcp-dev": ("2.0.0.dev5", "ha_mcp\n", ["__editable__.pth"]),
+            }
         )
-        monkeypatch.setattr(
-            _version.importlib.metadata,
-            "version",
-            lambda dist: {"ha-mcp": "1.0.0", "ha-mcp-dev": "2.0.0.dev5"}[dist],
-        )
-        assert get_version() == "2.0.0.dev5"
+        assert reported_version() == "2.0.0.dev5"
 
     def test_ambiguous_owners_fall_back_to_name_order(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, reported_version: Callable[[], str], installed
     ) -> None:
-        from ha_mcp import _version
-
-        monkeypatch.delenv("HA_MCP_BUILD_VERSION", raising=False)
-        monkeypatch.setattr(
-            _version.importlib.metadata,
-            "packages_distributions",
-            lambda: {"ha_mcp": ["ha-mcp", "ha-mcp-dev"]},
+        installed(
+            {
+                "ha-mcp": ("1.0.0", None, _WHEEL_FILES),
+                "ha-mcp-dev": ("2.0.0.dev5", None, _WHEEL_FILES),
+            }
         )
-        monkeypatch.setattr(
-            _version.importlib.metadata,
-            "version",
-            lambda dist: {"ha-mcp": "1.0.0", "ha-mcp-dev": "2.0.0.dev5"}[dist],
-        )
-        assert get_version() == "1.0.0"
+        assert reported_version() == "1.0.0"

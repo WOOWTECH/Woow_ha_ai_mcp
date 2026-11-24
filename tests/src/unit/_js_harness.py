@@ -13,11 +13,16 @@ syntax errors; this harness adds behavioural assertions.
 
 from __future__ import annotations
 
+import atexit
+import errno
 import json
+import math
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,7 +31,7 @@ import pytest
 
 # Path to the harness — repo-relative, resolved once at import time.
 HARNESS_PATH = Path(__file__).resolve().parents[2] / "js" / "harness.mjs"
-EXTRACT_ASTRO_VARS_PATH = HARNESS_PATH.parent / "extract_astro_vars.mjs"
+BUNDLE_SCRIPT_PATH = HARNESS_PATH.parent / "bundle_script.mjs"
 JS_DEPS_DIR = HARNESS_PATH.parent
 
 
@@ -36,6 +41,22 @@ def _node_binary() -> str:
     that pin a specific path.
     """
     return os.environ.get("NODE_BINARY", "node")
+
+
+def _default_timeout_s() -> float:
+    """Per-run node timeout, overridable via ``HA_MCP_JS_HARNESS_TIMEOUT``.
+
+    15s suits CI, where node + jsdom start up in about a second. The first
+    run on each pytest worker also pays that start-up, which on slower
+    hardware can approach the limit; the override is for that case. An
+    unparseable or non-positive override falls back to the default rather
+    than failing collection.
+    """
+    try:
+        override = float(os.environ.get("HA_MCP_JS_HARNESS_TIMEOUT", ""))
+    except ValueError:
+        return 15.0
+    return override if math.isfinite(override) and override > 0 else 15.0
 
 
 def _esbuild_binary() -> Path:
@@ -111,6 +132,24 @@ class HarnessResult:
         return out
 
 
+def _assert_clean_init(result: HarnessResult) -> None:
+    """Fail loud on a script-init, transpile, invoke or jsdom error.
+
+    A JS behaviour test asserts on side effects (fetches, broadcasts,
+    reloads, alerts). When the script throws at init time the side
+    effects come back empty, the side-effect assertion fires with a
+    misleading message ("expected 1 POST, got 0"), and the actual root
+    cause sits in ``result.errors``. Calling this at the top of every
+    test surfaces the real error first.
+    """
+    init_errors = [
+        e
+        for e in result.errors
+        if e.startswith(("script init:", "transpile failure", "invoke:", "jsdom error"))
+    ]
+    assert not init_errors, f"script failed to initialise: {init_errors}"
+
+
 def run_script(
     script: str,
     *,
@@ -120,7 +159,7 @@ def run_script(
     broadcast_events: list[dict[str, Any]] | None = None,
     initial_html: str | None = None,
     settle_ms: int = 120000,
-    timeout_s: float = 15.0,
+    timeout_s: float | None = None,
     language: str = "js",
     broadcast_channel_unavailable: bool = False,
 ) -> HarnessResult:
@@ -129,10 +168,17 @@ def run_script(
     Parameters mirror the JSON contract in ``tests/js/harness.mjs``.
 
     ``fetch_map`` keys are URL substrings; values are
-    ``{"status": int, "body"?: str, "json"?: any, "throw"?: str,
-    "responses"?: [...]}``. ``responses`` sequences per-call overrides;
-    the last entry sticks after exhaustion. Missing routes default to
-    404.
+    ``{"status": int, "body"?: str, "json"?: any, "headers"?: {...},
+    "throw"?: str, "responses"?: [...], "byMethod"?: {...}}``. ``responses`` sequences
+    per-call overrides; the last entry sticks after exhaustion. Missing
+    routes default to 404.
+
+    ``byMethod`` keys a route by HTTP verb --
+    ``{"byMethod": {"GET": ..., "POST": ...}}`` -- each verb getting its
+    own independent ``responses`` counter (``default`` covers the rest).
+    Use it whenever GET and POST share a URL, so a test targeting the
+    POST does not have to hand-count the init GETs and hope that count
+    never changes.
 
     ``invoke`` runs after the script body — use it to call a function
     the script exposes on ``window`` (e.g. ``"await window.restartAddon();"``)
@@ -161,79 +207,243 @@ def run_script(
         "broadcastChannelUnavailable": broadcast_channel_unavailable,
     }
 
-    # encoding pinned: node emits UTF-8; without it, text=True decodes with
-    # the locale codepage (cp1252 on Windows), the reader thread crashes on
-    # the first non-cp1252 char and stdout comes back None. errors="replace"
-    # keeps malformed bytes from killing the reader the same way — they
-    # degrade to U+FFFD and surface in the harness's own error reporting.
+    timeout = _default_timeout_s() if timeout_s is None else timeout_s
+    with _worker_lock:
+        return HarnessResult(**_harness_worker().run(request, timeout))
+
+
+class _HarnessWorker:
+    """One node process running ``harness.mjs`` for many runs.
+
+    Requests and replies are single JSON lines. Threads drain stdout and
+    stderr, so a run's timeout can be enforced and a full stderr pipe never
+    blocks node. A run that times out, kills node or garbles the stream
+    closes the worker; the next run starts a new one. Each failure shows the
+    stderr no earlier failure has shown, so output from a crash between runs
+    is not lost.
+    """
+
+    def __init__(self) -> None:
+        self._cmd = [_node_binary(), str(HARNESS_PATH)]
+        # encoding pinned: node emits UTF-8; without it, text=True decodes with
+        # the locale codepage (cp1252 on Windows) and the reader thread crashes
+        # on the first non-cp1252 char. errors="replace" keeps malformed bytes
+        # from killing the reader the same way; they degrade to U+FFFD and
+        # surface in the harness's own error reporting.
+        self._proc = subprocess.Popen(
+            self._cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.closed = False
+        self._replies: queue.Queue[str | None] = queue.Queue()
+        self._stderr: list[str] = []
+        self._reported = 0
+        self._stdout_reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stdout_reader.start()
+        self._stderr_reader.start()
+
+    def _read_stdout(self) -> None:
+        assert self._proc.stdout is not None
+        try:
+            for line in self._proc.stdout:
+                self._replies.put(line)
+        finally:
+            # A reader that dies must not look like a slow run.
+            self._replies.put(None)
+
+    def _read_stderr(self) -> None:
+        assert self._proc.stderr is not None
+        for line in self._proc.stderr:
+            self._stderr.append(line)
+
+    @property
+    def died(self) -> bool:
+        """Whether node exited without this worker closing it."""
+        return not self.closed and self._proc.poll() is not None
+
+    def run(self, request: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        assert self._proc.stdin is not None
+        try:
+            self._proc.stdin.write(json.dumps(request) + "\n")
+            self._proc.stdin.flush()
+            line = self._replies.get(timeout=timeout_s)
+        except queue.Empty:
+            self.close(kill=True)
+            timeout = subprocess.TimeoutExpired(self._cmd, timeout_s)
+            timeout.add_note(f"stderr: {self._unreported_stderr()}")
+            raise timeout from None
+        except OSError as e:
+            # node already exited: BrokenPipeError, or EINVAL on Windows.
+            if not (isinstance(e, BrokenPipeError) or e.errno == errno.EINVAL):
+                self.close(kill=True)
+                raise
+            line = None
+        except BaseException:
+            # The reply may still arrive and would answer the next request.
+            self.close(kill=True)
+            raise
+        if line is None:
+            self.close()
+            raise AssertionError(
+                f"JS harness exited {self._proc.returncode}\n"
+                f"stderr: {self._unreported_stderr()}"
+            )
+        try:
+            reply = json.loads(line)
+        except json.JSONDecodeError:
+            reply = None
+        if isinstance(reply, dict) and "result" in reply:
+            self._reported = len(self._stderr)
+            return reply["result"]
+        if isinstance(reply, dict) and "error" in reply:
+            raise AssertionError(
+                f"JS harness failed: {reply['error']}\n"
+                f"stderr: {self._unreported_stderr()}"
+            )
+        self.close(kill=True)
+        raise AssertionError(
+            f"JS harness reply is neither a result nor an error: {line[:2000]}\n"
+            f"stderr: {self._unreported_stderr()}"
+        )
+
+    def _unreported_stderr(self) -> str:
+        if self._proc.poll() is not None:
+            self._stderr_reader.join(timeout=5)
+        end = len(self._stderr)
+        text = "".join(self._stderr[self._reported : end])
+        self._reported = end
+        return text
+
+    def close(self, *, kill: bool = False) -> None:
+        self.closed = True
+        if kill:
+            self._proc.kill()
+        elif self._proc.stdin is not None and not self._proc.stdin.closed:
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                pass  # node already exited
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+        # The readers end at EOF once node exits; join them so Core's
+        # leftover-thread check sees none.
+        self._stdout_reader.join(timeout=5)
+        self._stderr_reader.join(timeout=5)
+
+    def death_report(self) -> str:
+        """Why node exited between runs, for the run that finds it dead."""
+        self.close()
+        return (
+            f"JS harness exited {self._proc.returncode} between runs\n"
+            f"stderr: {self._unreported_stderr()}"
+        )
+
+
+_worker: _HarnessWorker | None = None
+_worker_lock = threading.Lock()
+
+
+def _harness_worker() -> _HarnessWorker:
+    """The pytest process's harness worker, started on first use.
+
+    A worker whose node exited between runs fails the run that finds it,
+    with node's stderr, rather than being replaced silently.
+    """
+    global _worker
+    if _worker is not None and _worker.died:
+        dead, _worker = _worker, None
+        raise AssertionError(dead.death_report())
+    if _worker is None or _worker.closed:
+        _worker = _HarnessWorker()
+    return _worker
+
+
+def start_worker() -> None:
+    """Start the process's harness worker now, if it is not already running."""
+    with _worker_lock:
+        _harness_worker()
+
+
+def current_worker() -> _HarnessWorker | None:
+    """The process's harness worker, if one is running."""
+    return _worker
+
+
+def stop_worker() -> None:
+    global _worker
+    if _worker is not None:
+        _worker.close()
+        _worker = None
+
+
+atexit.register(stop_worker)
+
+
+def _run_bundle_script(request: dict[str, Any], label: str) -> str:
+    skip_if_unsupported()
     proc = subprocess.run(
-        [_node_binary(), str(HARNESS_PATH)],
+        [_node_binary(), str(BUNDLE_SCRIPT_PATH)],
         input=json.dumps(request),
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout_s,
         check=False,
+        timeout=30,
     )
     if proc.returncode != 0:
         raise AssertionError(
-            f"JS harness exited {proc.returncode}\n"
-            f"stderr: {proc.stderr}\n"
-            f"stdout: {proc.stdout[:2000]}",
-        )
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise AssertionError(
-            f"JS harness returned non-JSON stdout: {e}\n"
-            f"stdout: {proc.stdout[:2000]}\n"
-            f"stderr: {proc.stderr}",
-        ) from e
-    return HarnessResult(**payload)
-
-
-def extract_astro_frontmatter_vars(
-    astro_path: Path, names: list[str]
-) -> dict[str, Any]:
-    """Return ``{name: value}`` for each Astro frontmatter const requested.
-
-    Spawns ``tests/js/extract_astro_vars.mjs``, which evaluates the
-    frontmatter (TypeScript stripped via esbuild) with ``import`` lines
-    removed and ``base = ""`` stubbed for ``import.meta.env.BASE_URL``.
-    Use to feed the wizard's data arrays into the JS behaviour harness
-    so tests see the real production set, not a hand-maintained mock.
-    """
-    skip_if_unsupported()
-    proc = subprocess.run(
-        [_node_binary(), str(EXTRACT_ASTRO_VARS_PATH)],
-        input=json.dumps({"path": str(astro_path), "names": names}),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        timeout=15,
-    )
-    if proc.returncode != 0:
-        raise AssertionError(
-            f"extract_astro_vars failed for {astro_path.name}: "
+            f"bundle_script failed for {label}: "
             f"stderr={proc.stderr}\nstdout={proc.stdout[:1000]}",
         )
-    return json.loads(proc.stdout)
+    return proc.stdout
 
 
-def astro_vars_prelude(vars_: dict[str, Any]) -> str:
-    """Render a JS prelude that assigns each var as a const.
+def bundle_inline_script(
+    contents: str, resolve_dir: Path, *, define: dict[str, str] | None = None
+) -> str:
+    """Bundle an Astro page's ``<script>`` body into one classic script.
 
-    Used as the ``prelude`` argument to :func:`run_script` so the rest
-    of the Astro page script sees the same names Astro would have
-    injected via ``<script define:vars={...}>``.
+    Astro bundles a plain ``<script>`` with the modules it imports, so a page
+    can keep its behaviour in ``site/src/scripts/`` and ship a two-line entry.
+    The harness runs classic scripts only, so this resolves the entry's
+    relative imports from ``resolve_dir`` (the page's own directory) with
+    esbuild and returns a single IIFE for :func:`run_script`. ``define``
+    maps build-time constants such as ``import.meta.env.BASE_URL`` to literal
+    values, as Astro does at build.
     """
-    parts = []
-    for name, value in vars_.items():
-        parts.append(f"const {name} = {json.dumps(value)};")
-    return "\n".join(parts)
+    request: dict[str, Any] = {"contents": contents, "resolveDir": str(resolve_dir)}
+    if define:
+        request["define"] = define
+    return _run_bundle_script(request, label=str(resolve_dir))
+
+
+def module_exports(module_path: Path, names: list[str]) -> dict[str, Any]:
+    """Return ``{name: value}`` for the named exports of an ES module.
+
+    Bundles ``module_path`` with esbuild and evaluates it, so a test can read
+    production data (the setup wizard's ``data.ts`` arrays) instead of
+    keeping a copy that drifts. Values must be JSON-serialisable.
+    """
+    if not names:
+        return {}
+    contents = f"import {{ {', '.join(names)} }} from './{module_path.name}';\n"
+    contents += "".join(f"globalThis.{name} = {name};\n" for name in names)
+    request = {
+        "contents": contents,
+        "resolveDir": str(module_path.parent),
+        "names": names,
+    }
+    return json.loads(_run_bundle_script(request, label=str(module_path)))
 
 
 def _strip_astro_frontmatter(source: str, *, source_label: str = "<source>") -> str:
@@ -262,7 +472,7 @@ def _strip_astro_frontmatter(source: str, *, source_label: str = "<source>") -> 
 def extract_script_body(source: str, *, source_label: str = "<source>") -> str:
     """Return the first non-external inline ``<script>`` body in ``source``.
 
-    Handles both the bare ``<script>`` form used by ``_SETTINGS_HTML``
+    Handles both the bare ``<script>`` form used by the settings page
     and attributed forms like Astro's ``<script define:vars={...}>``.
     The body is everything between the opening tag's ``>`` and the next
     ``</script>``. External scripts (``<script src=...></script>``) are
@@ -305,7 +515,7 @@ def extract_style_body(source: str, *, source_label: str = "<source>") -> str:
 
     The CSS analogue of :func:`extract_script_body`: the body is everything
     between the bare ``<style>`` opening tag's ``>`` and the next
-    ``</style>``. ``_SETTINGS_HTML`` carries a single inline ``<style>``
+    ``</style>``. The settings page carries a single inline ``<style>``
     block (no ``<link rel="stylesheet">`` external form to skip), so this
     deliberately stays simpler than the script extractor.
 
@@ -386,6 +596,8 @@ def discover_script_surfaces() -> list[ScriptSurface]:
             raise RuntimeError(
                 f"discover_script_surfaces: cannot import {module_name}: {exc}",
             ) from exc
+        assert module.__file__ is not None, module_name
+        source_path = Path(module.__file__)
         html = render()
         # Extract the main script body (data-purpose scripts are skipped
         # by extract_script_body, as documented in that function).
@@ -393,7 +605,7 @@ def discover_script_surfaces() -> list[ScriptSurface]:
         surfaces.append(
             ScriptSurface(
                 surface_id=surface_id,
-                source_path=Path(module.__file__),
+                source_path=source_path,
                 script=body,
                 language="js",
             ),
@@ -410,7 +622,7 @@ def discover_script_surfaces() -> list[ScriptSurface]:
             surfaces.append(
                 ScriptSurface(
                     surface_id=f"{surface_id}_data-purpose-{purpose}",
-                    source_path=Path(module.__file__),
+                    source_path=source_path,
                     script=script_body,
                     language="js",
                 ),
@@ -468,9 +680,9 @@ def discover_script_surfaces() -> list[ScriptSurface]:
 # function invoked with placeholder args). Add a new entry to register
 # a new Python-rendered UI for parse coverage.
 def _render_settings_html() -> str:
-    from ha_mcp.settings_ui import _SETTINGS_HTML
+    from ha_mcp.settings_ui import render_settings_html
 
-    return _SETTINGS_HTML
+    return render_settings_html()
 
 
 def _render_consent_html() -> str:

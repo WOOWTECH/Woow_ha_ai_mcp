@@ -32,10 +32,13 @@ import asyncio
 import functools
 import logging
 import os
+import sys
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from pathlib import Path
+from typing import Any, NotRequired, TypedDict
 
 import httpx
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 from ._version import (
@@ -50,7 +53,7 @@ from .stdio_settings_sidecar import _TRUTHY  # shared HA_MCP_DISABLE_* truthy se
 logger = logging.getLogger(__name__)
 
 DISABLE_ENV = "HA_MCP_DISABLE_UPDATE_CHECK"
-_PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
+PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
 _STABLE_PACKAGE = "ha-mcp"
 _DEV_PACKAGE = "ha-mcp-dev"
 # Tight timeout so the once-per-process check can never add more than a blip of
@@ -69,6 +72,17 @@ class UpdateInfo:
     current: str
     latest: str
     update_available: bool
+    # PyPI's ``requires_python`` for ``latest``; None where PyPI is not the
+    # reference (the add-on) or the release does not declare one.
+    requires_python: str | None = None
+
+
+@dataclass(frozen=True)
+class PyPIRelease:
+    """A package's latest version on PyPI and the Python it requires."""
+
+    version: str
+    requires_python: str | None = None
 
 
 def _is_disabled() -> bool:
@@ -77,6 +91,16 @@ def _is_disabled() -> bool:
     # value disables; 0/false/no/off/blank (and anything unrecognized) keep the
     # check enabled, so a user who sets =0 to "keep it on" isn't surprised.
     return os.environ.get(DISABLE_ENV, "").strip().lower() in _TRUTHY
+
+
+def is_update_check_disabled() -> bool:
+    """Public accessor for the HA_MCP_DISABLE_UPDATE_CHECK opt-out.
+
+    The Marketplace auto-refresh nudge gates on the same switch: an operator who
+    opted out of update phone-home should not get update-driven side
+    effects either.
+    """
+    return _is_disabled()
 
 
 def _is_newer(latest: str, current: str) -> bool:
@@ -93,19 +117,25 @@ def _is_newer(latest: str, current: str) -> bool:
         return False
 
 
-def _fetch_latest_from_pypi(package: str) -> str | None:
-    """Fetch ``package``'s latest published version from PyPI, or None on failure."""
+def _fetch_latest_from_pypi(package: str) -> PyPIRelease | None:
+    """Fetch ``package``'s latest release from PyPI, or None on failure."""
     try:
         # follow_redirects=True mirrors the sibling fetch in tools_updates.py and
         # survives any future PyPI redirect (the JSON API serves 200 directly today).
         resp = httpx.get(
-            _PYPI_JSON_URL.format(package=package),
+            PYPI_JSON_URL.format(package=package),
             timeout=_HTTP_TIMEOUT_SECONDS,
             follow_redirects=True,
         )
         resp.raise_for_status()
-        version = resp.json()["info"]["version"]
-        return version if isinstance(version, str) else None
+        info = resp.json()["info"]
+        version = info["version"]
+        if not isinstance(version, str):
+            return None
+        requires_python = info.get("requires_python")
+        if not isinstance(requires_python, str) or not requires_python:
+            requires_python = None
+        return PyPIRelease(version=version, requires_python=requires_python)
     except (httpx.HTTPError, KeyError, ValueError, TypeError) as err:
         logger.debug("ha-mcp update check skipped (PyPI fetch failed: %s)", err)
         return None
@@ -172,14 +202,14 @@ def _resolve_update_info() -> UpdateInfo | None:
         return None
     # A dev install (``.dev`` version) tracks the renamed ``ha-mcp-dev`` package;
     # a stable install tracks ``ha-mcp``.
-    package = _DEV_PACKAGE if is_dev_version(current) else _STABLE_PACKAGE
-    latest = _fetch_latest_from_pypi(package)
-    if latest is None:
+    release = _fetch_latest_from_pypi(_package_for(current))
+    if release is None:
         return None
     return UpdateInfo(
         current=current,
-        latest=latest,
-        update_available=_is_newer(latest, current),
+        latest=release.version,
+        update_available=_is_newer(release.version, current),
+        requires_python=release.requires_python,
     )
 
 
@@ -197,7 +227,7 @@ def get_update_info() -> UpdateInfo | None:
     """
     try:
         return _resolve_update_info()
-    except Exception as err:  # pragma: no cover - contract backstop
+    except Exception as err:  # pragma: no cover - contract backstop  # noqa: BLE001
         logger.debug("ha-mcp update check skipped (unexpected error: %s)", err)
         return None
 
@@ -208,6 +238,96 @@ class UpdateField(TypedDict):
     current: str
     latest: str
     update_available: bool
+    # Set when the update cannot install on the running Python (see
+    # ``required_python``): the lowest Python the release admits and the uvx
+    # command that runs it.
+    python_required: NotRequired[str]
+    upgrade_command: NotRequired[str]
+
+
+def _python_floor(requires_python: str) -> str | None:
+    """The lowest Python a ``requires_python`` spec admits, at the spec's precision.
+
+    ``>=3.14`` gives ``3.14`` and ``>=3.14.2`` gives ``3.14.2``: rounding the
+    latter to ``3.14`` would name a Python the release still excludes.
+    """
+    try:
+        specifiers = SpecifierSet(requires_python)
+    except InvalidSpecifier:
+        return None
+    floors = []
+    for spec in specifiers:
+        if spec.operator in (">=", "~=", "=="):
+            try:
+                release = Version(spec.version.rstrip(".*")).release
+            except InvalidVersion:
+                continue
+            floors.append(release if len(release) > 1 else (release[0], 0))
+    if not floors:
+        return None
+    return ".".join(map(str, max(floors)))
+
+
+def _running_python() -> str:
+    # From sys.version_info, not platform.python_version(): a CPython built
+    # from an untagged checkout reports "3.14.0+", which is not a PEP 440
+    # version, and packaging then reads it as outside every specifier.
+    return "{}.{}.{}".format(*sys.version_info[:3])
+
+
+def required_python(info: UpdateInfo) -> str | None:
+    """The lowest Python the update admits when this interpreter can't run it.
+
+    Only a pip / uvx install is stuck on its interpreter: pip and uv skip a
+    release whose ``requires_python`` excludes the running Python without an
+    error, so a plain upgrade command would reinstall the old version. Docker,
+    app (add-on) and in-process installs get their Python from the image or
+    from Home Assistant, so their usual update path still applies.
+    """
+    if (
+        not info.update_available
+        or info.requires_python is None
+        or is_embedded()
+        or is_running_in_addon()
+        or _running_in_docker()
+    ):
+        return None
+    try:
+        if SpecifierSet(info.requires_python).contains(
+            _running_python(), prereleases=True
+        ):
+            return None
+    except InvalidSpecifier:
+        return None
+    return _python_floor(info.requires_python)
+
+
+def _package_for(current: str) -> str:
+    """The PyPI package that tracks ``current``'s channel; also its uvx command."""
+    return _DEV_PACKAGE if is_dev_version(current) else _STABLE_PACKAGE
+
+
+# The console scripts both packages ship (ha-mcp-dev adds its own).
+_ENTRY_POINTS = frozenset(
+    {"ha-mcp", "ha-mcp-web", "ha-mcp-oauth", "ha-mcp-oidc", "ha-mcp-dev"}
+)
+
+
+def _entry_point() -> str | None:
+    """The console script this process was started as, if it was one."""
+    name = Path(sys.argv[0]).stem if sys.argv else ""
+    return name if name in _ENTRY_POINTS else None
+
+
+def _uvx_command(python: str, current: str) -> str:
+    # uvx downloads a uv-managed interpreter for --python when none is installed.
+    # uvx runs the script named like the package, so any other entry point
+    # (ha-mcp-web, ha-mcp-oauth, ...) is kept with --from.
+    package = _package_for(current)
+    entry = _entry_point()
+    if entry is None or entry == package:
+        return f"uvx --python {python} {package}@latest"
+    return f"uvx --python {python} --from {package}@latest {entry}"
 
 
 async def get_update_field() -> UpdateField | None:
@@ -229,35 +349,48 @@ async def get_update_field() -> UpdateField | None:
             info = get_update_info()
         else:
             info = await asyncio.to_thread(get_update_info)
-    except Exception as err:  # pragma: no cover - defensive
+    except Exception as err:  # pragma: no cover - defensive  # noqa: BLE001
         logger.debug("ha-mcp self-update check skipped: %s", err)
         return None
     if info is None:
         return None
-    return {
+    field: UpdateField = {
         "current": info.current,
         "latest": info.latest,
         "update_available": info.update_available,
     }
+    if python := required_python(info):
+        field["python_required"] = python
+        field["upgrade_command"] = _uvx_command(python, info.current)
+    return field
 
 
 def _running_in_docker() -> bool:
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
-def update_command_hint(current: str) -> str:
-    """Return a deployment- and channel-aware one-liner for how to upgrade."""
-    if is_embedded():
-        # In-process (custom component) server: the component's update
-        # entity / auto-update installs new builds; the entry reload (or
-        # the settings UI's Restart button) applies them.
+def update_command_hint(current: str, info: UpdateInfo | None = None) -> str:
+    """Return a deployment- and channel-aware one-liner for how to upgrade.
+
+    With ``info``, a release the running Python cannot install gets the
+    Python it needs and the command that runs it instead of a pip hint.
+    """
+    if info is not None and (python := required_python(info)):
         return (
-            "Update via the HA-MCP Server update entity (Settings -> "
-            "Devices & Services -> HA-MCP), or reload the integration."
+            f"This release needs Python {python}; you are on "
+            f"{_running_python()}. Run it with: {_uvx_command(python, info.current)} "
+            f'(in the MCP client config: "--python", "{python}").'
+        )
+    if is_embedded():
+        # In-process (custom component) server: each component release
+        # installs its own server build when Home Assistant restarts.
+        return (
+            "Update the HA-MCP integration in the Marketplace, then restart "
+            "Home Assistant."
         )
     if is_running_in_addon():
         # Add-on users update through the Supervisor UI, not pip/docker.
-        return "Update from Settings -> Add-ons -> Home Assistant MCP Server."
+        return "Update from Settings -> Apps -> Home Assistant MCP Server."
     dev = is_dev_version(current)
     if _running_in_docker():
         # Dev images are tagged :dev (rolling); :stable is the stable channel.
@@ -266,5 +399,4 @@ def update_command_hint(current: str) -> str:
             f"Pull the new image: docker pull "
             f"ghcr.io/homeassistant-ai/ha-mcp:{tag} (then restart)."
         )
-    package = _DEV_PACKAGE if dev else _STABLE_PACKAGE
-    return f"Upgrade with: pip install -U {package}."
+    return f"Upgrade with: pip install -U {_package_for(current)}."

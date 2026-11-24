@@ -13,7 +13,8 @@ registered; default is tool-search only):
 
 * **tool search** — the agent gets a tiny catalog: the server's pinned tools
   mirrored directly, plus two meta-tools synthesized here: ``ha_search_tools``
-  (find tools by task) and ``ha_call_tool`` (execute a discovered tool). This
+  (find tools by task, then fetch one's full schema by name; see
+  :mod:`llm_api_search`) and ``ha_call_tool`` (execute a discovered tool). This
   keeps per-turn context small — the shape context-limited models need.
 * **full** — every exposed tool is mirrored directly into the agent's tool
   list, one schema each.
@@ -33,33 +34,38 @@ read-only middleware exactly like any MCP client's call.
 The server runs on its own worker thread behind a loopback HTTP listener, and
 ``ha_mcp`` must never be imported in the HA main process (see
 :mod:`embedded_server`), so this module talks real MCP to the server over
-loopback streamable HTTP. The ``mcp`` client SDK arrives with the
-runtime-installed ha-mcp package (a fastmcp dependency), so every SDK import
-here is lazy and the first one runs on the executor.
+loopback streamable HTTP with Home Assistant's shared ``mcp`` SDK (the manifest
+requires ``mcp>=1.24.0``, so 1.x or 2.x), never ha-mcp's vendored copy. Every SDK import here
+is lazy and the first one runs on the executor.
 
-The tool list is fetched fresh on every ``async_get_api_instance`` call (once
-per conversation turn): exposure toggles and runtime-registered custom tools
-apply on the agent's next message, and two loopback round-trips per turn are
-noise next to the LLM call itself. Tool calls likewise open a short-lived
-stateless session each — the in-process server serves ``stateless_http=True``.
+The tool list is fetched on every ``async_get_api_instance`` call. Before Home
+Assistant 2026.11 that is every conversation turn; from 2026.11 Core keeps the
+instance for the whole conversation, so a newly exposed or registered tool
+shows up in the next conversation. Each tool call opens a short-lived
+stateless session (the in-process server serves ``stateless_http=True``) and
+checks the tool is still exposed before calling it, so hiding a tool takes
+effect on the very next call either way.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib
 import logging
-from collections.abc import AsyncIterator, Iterable
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+import math
+import sys
+from collections import Counter
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field
+from functools import cache
 from typing import TYPE_CHECKING, Any, cast
 
 import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import llm
-from homeassistant.helpers.httpx_client import get_async_client
-from voluptuous_openapi import convert_to_voluptuous
 
 from .const import (
     DATA_LLM_API_UNSUB,
@@ -70,8 +76,14 @@ from .const import (
     EXPOSURE_TOOL_SEARCH,
     OPT_LLM_API_EXPOSURE,
 )
+from .llm_api_search import CALL_TOOL_NAME as _CALL_TOOL_NAME
+from .llm_api_search import SEARCH_TOOL_NAME as _SEARCH_TOOL_NAME
+from .llm_api_search import HaMcpSearchTool
+from .llm_tool_exposure import META_PARAMS_KEY, _tool_meta_namespace, partition_tools
+from .llm_tool_metadata import declare_metadata, tool_hints, tool_result, tool_title
 
 if TYPE_CHECKING:
+    import httpx
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.util.json import JsonObjectType
     from mcp import types as mcp_types
@@ -81,52 +93,249 @@ _LOGGER = logging.getLogger(__name__)
 
 # Listing tools is two loopback round-trips (initialize + tools/list); a slow
 # answer means the server thread is wedged, not that the network is slow.
-_LIST_TOOLS_TIMEOUT_SECONDS = 10.0
+LIST_TOOLS_TIMEOUT_SECONDS = 10.0
 
 # Tool calls run real work — WebSocket-verified device control, dashboard
 # screenshots, config writes that poll for completion — well beyond the 10s a
 # remote-server integration would allow. The conversation agent shows a spinner
 # for the duration, so err generous rather than kill a legitimate slow tool.
-_CALL_TOOL_TIMEOUT_SECONDS = 300.0
+CALL_TOOL_TIMEOUT_SECONDS = 300.0
 
-# The server-side stamp this module filters on (mirrors
-# src/ha_mcp/llm_exposure.py — keep the names in sync).
-_META_NAMESPACE = "ha_mcp"
-_META_EXPOSED_KEY = "llm_api_exposed"
-_META_PINNED_KEY = "pinned"
 
-# Fallback exposure policy for servers that predate the stamp: hide the
-# operational-hazard names and the known beta/developer tools. Imperfect by
-# construction (a newer beta tool on an old server can't be known here) but
-# strictly safer than exposing everything, and logged once per instance
-# build. The real policy lives server-side.
-_FALLBACK_DENY_PREFIXES = ("ha_dev_",)
-_FALLBACK_DENY_TOOLS = frozenset(
+@cache
+def _schema_converter() -> Callable[[Any], Any]:
+    """Resolve the Core-provided schema converter once, off the event loop."""
+    try:
+        legacy = importlib.import_module("voluptuous_openapi")
+    except ModuleNotFoundError as err:
+        if err.name != "voluptuous_openapi":
+            raise
+        probatio = importlib.import_module("probatio")
+        _LOGGER.warning(
+            "voluptuous-openapi is not importable; converting tool schemas "
+            "with probatio instead. The manifest declares it, so this is "
+            "Home Assistant running with skip_pip, or a deps tree that lost "
+            "the package after setup. A requirement that genuinely failed to "
+            "install never reaches this line -- Home Assistant reports that "
+            "itself and abandons the integration before importing it. "
+            "Probatio's OpenAPI codec cannot express the node it builds for "
+            "an integer, so a numeric parameter can reach the conversation "
+            "agent as a string, an empty schema or a plain number."
+        )
+        return cast(Callable[[Any], Any], probatio.from_openapi)
+    return cast(Callable[[Any], Any], legacy.convert_to_voluptuous)
+
+
+def reset_schema_converter() -> None:
+    """Resolve the converter again on the next conversion; tests use it to
+    switch codecs within one process."""
+    _schema_converter.cache_clear()
+
+
+def convert_to_voluptuous(schema: Any) -> vol.Schema:
+    """Convert an OpenAPI schema on stable and Probatio-based HA Core."""
+    return cast(vol.Schema, _schema_converter()(schema))
+
+
+# Keywords whose value is a mapping keyed by author-chosen names — property
+# names, definition names, regexes — rather than by JSON Schema keywords. A key
+# spelled like a bound is one of those names and must not be rewritten.
+SCHEMA_MAPS: frozenset[str] = frozenset(
     {
-        "ha_restart",
-        "ha_reload_core",
-        "ha_manage_backup",
-        # Beta-tagged tools as of the stamp's introduction (server-side the
-        # gate is tag-based and future-proof; this list is only the legacy
-        # fallback).
-        "ha_config_set_yaml",
-        "ha_manage_custom_tool",
-        "ha_get_dashboard_screenshot",
-        "ha_install_mcp_tools",
-        "ha_list_files",
-        "ha_read_file",
-        "ha_write_file",
-        "ha_delete_file",
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependentRequired",
+        # Draft-7's predecessor of the two above; still emitted by some servers.
+        "dependencies",
     }
 )
+# Keywords whose value is instance data rather than a subschema. A key spelled
+# like a bound inside one of these is a value in someone's default, not a bound.
+# ``example`` is OpenAPI's singular spelling of ``examples``.
+INSTANCE_VALUES: frozenset[str] = frozenset(
+    {"default", "const", "enum", "examples", "example"}
+)
+# Keywords whose value is neither a subschema nor a map of subschemas.
+# OpenAPI's ``discriminator`` holds a ``propertyName`` and a ``mapping`` of
+# author-chosen tags to ``$ref`` strings; a tag spelled like a bound is one of
+# those names, and its ``$ref`` value would read as a non-numeric bound and be
+# dropped, corrupting a valid discriminated union. OpenAPI ``x-`` specification
+# extensions carry arbitrary vendor objects the same way and are matched by
+# prefix in ``is_opaque_key``.
+_OPAQUE_KEYWORDS: frozenset[str] = frozenset({"discriminator"})
 
-# Names of the meta-tools synthesized for the tool-search mode. ha_search_tools
-# deliberately matches the server's own tool-search terminology; if the server
-# itself runs ENABLE_TOOL_SEARCH its identically-named tool is excluded from
-# mirroring/search results to avoid duplicates.
-_SEARCH_TOOL_NAME = "ha_search_tools"
-_CALL_TOOL_NAME = "ha_call_tool"
-_SEARCH_RESULT_LIMIT = 8
+
+def is_opaque_key(key: str) -> bool:
+    """True for a keyword whose value must be copied through untouched."""
+    return key in _OPAQUE_KEYWORDS or key.startswith("x-")
+
+
+# Each exclusive keyword, the inclusive twin it folds into, the picker that
+# keeps the tighter of the two when both are present, and the step to the
+# nearest integer the bound still admits.
+EXCLUSIVE_BOUNDS: tuple[
+    tuple[str, str, Callable[[Any, Any], Any], Callable[[Any], int]], ...
+] = (
+    ("exclusiveMinimum", "minimum", max, lambda bound: math.floor(bound) + 1),
+    ("exclusiveMaximum", "maximum", min, lambda bound: math.ceil(bound) - 1),
+)
+
+
+@dataclass
+class _Rewrite:
+    """What one schema normalisation changed, so a caller can log it once.
+
+    The walk is recursive and knows no tool name; collecting here lets the
+    entry point say what happened to which tool in a single line, rather than
+    once per node or not at all.
+    """
+
+    folded: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+
+
+def _to_inclusive_bounds(schema: Any, rewrite: _Rewrite | None = None) -> Any:
+    """Return the schema with every exclusive numeric bound made inclusive.
+
+    Home Assistant re-emits the converted schema through Probatio's OpenAPI
+    codec, which defaults to OpenAPI 3.0 and writes an exclusive bound the
+    Draft-4 way: ``minimum`` beside ``exclusiveMinimum: true``. The Anthropic
+    API validates ``input_schema`` as JSON Schema draft 2020-12, where
+    ``exclusiveMinimum`` must be a number, and rejects the entire request — so
+    one such bound anywhere in the mirrored toolset fails every conversation
+    turn, not just calls to the tool carrying it.
+
+    On an integer-only node the fold is exact -- ``exclusiveMinimum: 1``
+    becomes ``minimum: 2``, the smallest integer the bound admits. Elsewhere
+    the advertised edge widens by one representable point; the server still
+    enforces the real bound when the call arrives, so nothing becomes callable
+    that was not callable before. A boolean is the Draft-4 flag rather than a
+    bound and is dropped outright.
+
+    Normalising here rather than only at the source covers the server versions
+    this component does not control: the ha-mcp package installs and updates
+    independently of the component, and an explicit pip-spec pins it outright.
+    """
+    if isinstance(schema, list):
+        return [_to_inclusive_bounds(item, rewrite) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    result: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in INSTANCE_VALUES or is_opaque_key(key):
+            # Copied, not aliased: the result is handed to Core and kept in
+            # the search catalog, and neither may reach back into the MCP
+            # result object this schema came from.
+            result[key] = copy.deepcopy(value)
+        elif key in SCHEMA_MAPS and isinstance(value, dict):
+            result[key] = {
+                name: _to_inclusive_bounds(sub, rewrite) for name, sub in value.items()
+            }
+        else:
+            result[key] = _to_inclusive_bounds(value, rewrite)
+
+    _fold_bounds(result, rewrite)
+    return result
+
+
+def _is_number(value: Any) -> bool:
+    """True for a JSON number. bool is an int subclass and is not one."""
+    return not isinstance(value, bool) and isinstance(value, int | float)
+
+
+def _admits_integers_only(node: dict[str, Any]) -> bool:
+    """True when the node's declared type accepts integers and nothing wider.
+
+    A union that also admits ``number`` is not tightened: the excluded edge is
+    still reachable there as a fraction.
+    """
+    declared = node.get("type")
+    if isinstance(declared, str):
+        return declared == "integer"
+    if isinstance(declared, list):
+        return "integer" in declared and "number" not in declared
+    return False
+
+
+def _fold_bounds(node: dict[str, Any], rewrite: _Rewrite | None = None) -> None:
+    """Fold each exclusive keyword into its inclusive twin, in place."""
+    for exclusive, inclusive, tighter, to_integer in EXCLUSIVE_BOUNDS:
+        if exclusive not in node:
+            continue
+        bound = node.pop(exclusive)
+        if not _is_number(bound):
+            # Nothing non-numeric is a readable bound in a subschema slot, and
+            # the slot is all this can be: the name maps, the instance-value
+            # keywords and the opaque ones above keep foreign data out of
+            # reach. Probatio refuses a string, a list and the Draft-4 boolean
+            # outright -- costing the whole tool -- and silently retypes a null
+            # number param to a string one. Dropping the key repairs all four.
+            if rewrite is not None:
+                rewrite.dropped.append(exclusive)
+            continue
+        # On an integer-only node the exact inclusive equivalent exists, so
+        # take it: folding ``exclusiveMinimum: 1`` to ``minimum: 1`` would
+        # advertise a value the server rejects.
+        if _admits_integers_only(node):
+            bound = to_integer(bound)
+        # ``tighter`` when the schema already carried an inclusive bound, so
+        # that bound is never loosened to the exclusive one.
+        current = node.get(inclusive)
+        node[inclusive] = tighter(current, bound) if _is_number(current) else bound
+        if rewrite is not None:
+            rewrite.folded.append(exclusive)
+
+
+def _tally(keywords: list[str]) -> str:
+    """Render the rewritten keywords with a count, so two nodes read as two.
+
+    One line per tool keeps the log readable, but a bare set of keyword names
+    would make a schema with several malformed bounds indistinguishable from
+    one carrying a single bad node -- and the count is the only hint left that
+    more than one place needs fixing.
+    """
+    return ", ".join(
+        keyword if seen == 1 else f"{keyword} x{seen}"
+        for keyword, seen in sorted(Counter(keywords).items())
+    )
+
+
+def _normalise_schema(schema: Any, tool_name: str) -> Any:
+    """Normalise one tool's schema and report, once, what that changed.
+
+    Both publication paths reach the model: the mirrored parameters Core
+    converts, and the tool-search catalog, which is returned verbatim and
+    passes no converter at all. Both call this, so a tool is normalised once
+    per turn and logged once per turn whichever path published it.
+    """
+    rewrite = _Rewrite()
+    result = _to_inclusive_bounds(schema, rewrite)
+    if rewrite.dropped:
+        _LOGGER.warning(
+            "Dropped %s from %s's schema: the value is not a number, so it is "
+            "either the Draft-4 boolean flag or malformed, and Home "
+            "Assistant's codec answers such a node by refusing the tool or by "
+            "retyping the parameter. The server should advertise the bound as "
+            "a number, the only form draft 2020-12 permits.",
+            _tally(rewrite.dropped),
+            tool_name,
+        )
+    if rewrite.folded:
+        _LOGGER.debug(
+            "Rewrote %s in %s's schema to the inclusive twin so Home Assistant "
+            "does not re-emit it in the Draft-4 form. On a non-integer bound "
+            "the advertised edge is now one representable point wider than the "
+            "server enforces, so a model passing that edge gets a rejection "
+            "that is otherwise unattributable from any log.",
+            _tally(rewrite.folded),
+            tool_name,
+        )
+    return result
+
 
 # Used when the server's initialize result carries no instructions (it always
 # should — ha-mcp ships server-level instructions — but never render an empty
@@ -143,10 +352,14 @@ _TOOL_SEARCH_PROMPT = (
     "This assistant uses search-based tool discovery: most tools are NOT "
     "listed directly.\n"
     f"1. Call {_SEARCH_TOOL_NAME}(query=...) to find tools for the task; "
-    "results include each tool's name, description, and input schema.\n"
-    f"2. Execute a discovered tool with {_CALL_TOOL_NAME}(name=..., "
-    "arguments={...}) — discovered tools are NOT directly callable here.\n"
-    "3. The few tools listed directly can be called as usual.\n"
+    "results are compact: each tool's name, one-line description, and params.\n"
+    f"2. Call {_SEARCH_TOOL_NAME}(tools=[...]) for the full description and "
+    "input schema of the tool you will call — required before calling: the "
+    "compact hit omits usage guidance, nested fields, defaults, and parameter "
+    "descriptions.\n"
+    f"3. Execute it with {_CALL_TOOL_NAME}(name=..., arguments={{...}}) — "
+    "discovered tools are NOT directly callable here.\n"
+    "4. The few tools listed directly can be called as usual.\n"
     "Search once per task, not per call — tool names stay valid all "
     "conversation."
 )
@@ -156,36 +369,45 @@ def _transport_error_leaves() -> tuple[type[BaseException], ...]:
     """Return the non-group exception classes a loopback exchange can raise.
 
     OSError covers a refused/dropped loopback connect; TimeoutError comes
-    from our asyncio.timeout budget. httpx errors and protocol-level McpError
-    can also escape a session call UNWRAPPED (HA core's mcp integration
-    catches both the same way), but neither class is importable at module
-    level — both arrive with the runtime-installed server package — hence a
-    function instead of a module constant.
+    from our asyncio.timeout budget. HTTP-client errors and the protocol-level
+    MCP error can also escape a session call UNWRAPPED (HA core's mcp
+    integration catches both the same way); SDK 1.x raises ``httpx`` /
+    ``McpError``, 2.x raises ``httpx2`` / ``MCPError``. Read from ``sys.modules``:
+    the SDK already imported whichever it raised from, and this runs on the
+    event loop, where an import is a blocking call.
     """
-    errors: tuple[type[BaseException], ...] = (TimeoutError, OSError)
-    try:
-        import httpx
-        from mcp import McpError
-    except ImportError:  # pragma: no cover - SDK-less builds never open a session
-        return errors
-    return (*errors, httpx.HTTPError, McpError)
+    errors: list[type[BaseException]] = [TimeoutError, OSError]
+    for module_name, attribute in (
+        ("httpx", "HTTPError"),
+        ("httpx2", "HTTPError"),
+        ("mcp", "McpError"),
+        ("mcp", "MCPError"),
+    ):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        error_class = getattr(module, attribute, None)
+        if isinstance(error_class, type) and error_class not in errors:
+            errors.append(error_class)
+    return tuple(errors)
 
 
 def _transport_errors() -> tuple[type[BaseException], ...]:
     """Return the ``except`` target for one loopback MCP exchange.
 
-    Evaluated at exception time (an ``except`` expression is), so the lazy
-    imports in :func:`_transport_error_leaves` have already succeeded by
-    then. Includes ExceptionGroup because the SDK's anyio task groups wrap
-    in-session failures — but a caught group must still pass
-    :func:`_is_transport_failure` before being mapped to a friendly error,
+    Evaluated at exception time (an ``except`` expression is), so whichever
+    HTTP/MCP module raised is already in ``sys.modules`` for
+    :func:`_transport_error_leaves` to find. Includes ExceptionGroup because
+    the SDK's anyio task groups wrap in-session failures — but a caught group
+    must still pass
+    :func:`is_transport_failure` before being mapped to a friendly error,
     or a genuine bug that happened inside the task group would be relabeled
     as a transport failure (review finding).
     """
     return (*_transport_error_leaves(), ExceptionGroup)
 
 
-def _is_transport_failure(err: BaseException) -> bool:
+def is_transport_failure(err: BaseException) -> bool:
     """Return True when ``err`` is purely a transport failure.
 
     A group counts only when EVERY leaf (nested groups included) is a
@@ -194,125 +416,168 @@ def _is_transport_failure(err: BaseException) -> bool:
     remapped to a "could not reach the server" message.
     """
     if isinstance(err, ExceptionGroup):
-        return all(_is_transport_failure(exc) for exc in err.exceptions)
+        return all(is_transport_failure(exc) for exc in err.exceptions)
     return isinstance(err, _transport_error_leaves())
 
 
 def _import_mcp_sdk() -> None:
-    """Import the mcp client SDK modules (blocking; run on the executor).
+    """Import lazy LLM dependencies (blocking; run on the executor).
 
-    Raises ImportError when the SDK is not importable — the caller decides
-    whether that skips registration (SDK missing entirely) or surfaces as a
-    conversation error.
+    Raises ImportError when the MCP SDK or Core's schema converter is not
+    importable — the caller decides whether that skips registration or
+    surfaces as a conversation error.
     """
     importlib.import_module("mcp.client.session")
     importlib.import_module("mcp.client.streamable_http")
+    # The SDK imports jsonschema on the first call that validates a tool's
+    # output, and that import reads its metaschema files: here, not on the loop.
+    importlib.import_module("jsonschema")
+    _schema_converter()
 
 
 async def async_probe_mcp_sdk(hass: HomeAssistant) -> bool:
-    """Return True when the mcp client SDK imports (first import off-loop)."""
+    """Return True when lazy LLM dependencies import (first import off-loop)."""
     try:
         await hass.async_add_executor_job(_import_mcp_sdk)
     except ImportError as err:
         _LOGGER.warning(
-            "The installed server package provides no importable 'mcp' client "
-            "SDK (%s); the conversation-agent LLM API will not be available",
+            "A required LLM dependency is not importable (%s); the "
+            "conversation-agent LLM API will not be available",
             err,
         )
         return False
     return True
 
 
+def _loopback_httpx_client_factory(
+    headers: dict[str, str] | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+) -> httpx.AsyncClient:
+    """``httpx_client_factory`` for the pre-rename SDK's ``streamablehttp_client``.
+
+    That deprecated entry point takes no ``http_client`` — it always builds
+    its own via this factory — but the factory itself IS overridable, so the
+    same ``verify=False`` / ``trust_env=False`` posture as the canonical path
+    in :func:`mcp_session` still applies: this fallback is loopback-only
+    too, so a real SSL context is pure waste and this call must never be
+    diverted through an environment proxy (which would also leak the URL's
+    embedded ``secret_path`` to it).
+
+    ``timeout`` mirrors ``create_mcp_http_client`` (the factory this
+    substitutes for): a ``None`` here means "no timeout was supplied", not
+    "disable timeouts" — the real ``streamablehttp_client`` caller always
+    passes an explicit ``httpx.Timeout``, but a bare ``None`` reaching
+    ``httpx.AsyncClient`` directly disables every timeout outright (review
+    finding), which is the wrong zero-argument default for a fallback aimed
+    at unknown old environments.
+
+    The substitute value is inlined rather than imported from
+    ``mcp.shared._httpx_utils``: this factory only ever runs on SDKs old
+    enough to lack ``streamable_http_client`` (the canonical name this
+    module tries first), and ``MCP_DEFAULT_TIMEOUT`` /
+    ``MCP_DEFAULT_SSE_READ_TIMEOUT`` don't exist before mcp 1.24 either — an
+    import would raise on every SDK version this fallback actually serves
+    (round-2 review finding: the first attempt at this fix broke the exact
+    path it was meant to harden). ``create_mcp_http_client``'s own ``None``
+    default on those older SDKs is this same flat ``httpx.Timeout(30.0)``,
+    with no separate read timeout (the ``read=300`` shape is itself a 1.24+
+    addition) — matched here rather than guessed at.
+    """
+    import httpx
+
+    if timeout is None:
+        timeout = httpx.Timeout(30.0)
+
+    return httpx.AsyncClient(
+        headers=headers, timeout=timeout, auth=auth, verify=False, trust_env=False
+    )
+
+
 @asynccontextmanager
-async def _mcp_session(
+async def mcp_session(
     url: str,
-    http_client: Any = None,
 ) -> AsyncIterator[tuple[ClientSession, mcp_types.InitializeResult]]:
     """Open an initialized MCP session against the loopback server.
 
     Imports resolve from ``sys.modules`` — :func:`async_probe_mcp_sdk` did the
     real (blocking) import on the executor before the API was registered.
 
-    ``http_client`` is Home Assistant's shared httpx client
-    (``helpers.httpx_client.get_async_client``). Passing it is what keeps
-    this loop-safe: without it the SDK constructs its own httpx client per
-    session, whose SSL setup loads the CA bundle SYNCHRONOUSLY inside HA's
-    event loop (live-found — HA's blocking-call monitor flagged this exact
-    line). HA's shared client is built against the process-cached SSL
-    context, and the SDK does not close caller-owned clients (HA core's mcp
-    integration relies on the same contract).
+    Builds a throwaway httpx client scoped to this one session rather than
+    reusing Home Assistant's shared one (``helpers.httpx_client.
+    get_async_client`` — the prior approach): the SDK applies NO timeout of
+    its own when a caller-provided client is passed, so whatever timeout
+    THAT client happens to carry becomes the real wire-level ceiling. HA's
+    shared client is built with no explicit ``timeout=``, so it silently
+    carries httpx's own hardcoded 5-second default — capping every tool call
+    at 5 seconds of read-idle no matter how generous
+    ``CALL_TOOL_TIMEOUT_SECONDS`` / ``LIST_TOOLS_TIMEOUT_SECONDS`` looked
+    (live-found investigating a ~60s Assist-pipeline hang: a real tool doing
+    real work never got anywhere near its own asyncio budget).
+
+    ``verify=False`` is not a security relaxation: ``url`` is always
+    ``http://127.0.0.1:<port>...`` (see ``async_register_llm_api``) — a
+    plain-HTTP loopback call that never negotiates TLS — so building a real
+    SSL context would be pure waste. It also keeps this loop-safe the same
+    way the shared client did: an SSL context built with ``verify=True``
+    loads the system CA bundle SYNCHRONOUSLY (live-found — HA's
+    blocking-call monitor flagged this exact line when the SDK built its own
+    default client), and skipping verification skips that load entirely.
+
+    ``trust_env=False`` for the same "this is loopback, not the network"
+    reason: httpx defaults to reading ``HTTP_PROXY``/``NO_PROXY`` from the
+    environment, and ``127.0.0.1`` is not exempt unless ``NO_PROXY``
+    explicitly lists it. Under an ``HTTP_PROXY`` that doesn't, this call
+    would leave the loopback listener entirely and go out through the
+    configured proxy instead — which also hands the proxy ``url``'s
+    embedded ``secret_path`` (the private endpoint credential). Disabling
+    env trust removes both failure modes; nothing here should ever consult
+    a proxy.
+
+    The client is entered on the exit stack so it closes with the rest of
+    the session.
     """
     from mcp.client.session import ClientSession
 
-    try:
-        from mcp.client.streamable_http import streamable_http_client
+    sdk_transport = importlib.import_module("mcp.client.streamable_http")
 
-        transport = (
-            streamable_http_client(url=url, http_client=http_client)
-            if http_client is not None
-            else streamable_http_client(url=url)
+    async with AsyncExitStack() as stack:
+        streamable_http_client = getattr(sdk_transport, "streamable_http_client", None)
+        if streamable_http_client is None:
+            # Pre-1.24 SDK (a third-party pin forcing the shared mcp below the
+            # manifest's floor): same call shape, deprecated name,
+            # and no http_client kwarg — but it does accept a factory for the
+            # client it builds internally, so _loopback_httpx_client_factory
+            # keeps this fallback on the same verify=False/trust_env=False
+            # posture as the canonical path below.
+            transport = sdk_transport.streamablehttp_client(
+                url=url, httpx_client_factory=_loopback_httpx_client_factory
+            )
+        else:
+            # SDK 1.x takes an httpx client, 2.x an httpx2 one: use the library
+            # the transport module itself imported.
+            http_lib = getattr(sdk_transport, "httpx2", None) or getattr(
+                sdk_transport, "httpx", None
+            )
+            if http_lib is None:
+                http_lib = importlib.import_module("httpx")
+            http_client = await stack.enter_async_context(
+                http_lib.AsyncClient(
+                    verify=False,
+                    trust_env=False,
+                    timeout=http_lib.Timeout(CALL_TOOL_TIMEOUT_SECONDS),
+                )
+            )
+            transport = streamable_http_client(url=url, http_client=http_client)
+
+        # 1.x yields (read, write, get_session_id); 2.x yields (read, write).
+        streams = await stack.enter_async_context(transport)
+        read_stream, write_stream = streams[0], streams[1]
+        session = await stack.enter_async_context(
+            ClientSession(read_stream, write_stream)
         )
-    except ImportError:
-        # Pre-rename SDK (an older ha-mcp resolved by a pip-spec override
-        # pins an older fastmcp/mcp): same call shape, deprecated name, but
-        # no http_client kwarg — it builds its own client, so on those old
-        # SDKs the blocking-SSL-setup warning is the accepted cost.
-        from mcp.client.streamable_http import (
-            streamablehttp_client,
-        )
-
-        transport = streamablehttp_client(url=url)
-
-    async with (
-        transport as (read_stream, write_stream, _),
-        ClientSession(read_stream, write_stream) as session,
-    ):
         init_result = await session.initialize()
         yield session, init_result
-
-
-def _tool_meta_namespace(tool: Any) -> dict[str, Any] | None:
-    """Return the tool's ``_meta.ha_mcp`` namespace, or None when absent."""
-    meta = getattr(tool, "meta", None)
-    if not isinstance(meta, dict):
-        return None
-    namespace = meta.get(_META_NAMESPACE)
-    return namespace if isinstance(namespace, dict) else None
-
-
-def _fallback_exposed(name: str) -> bool:
-    """Legacy exposure policy for servers that predate the meta stamp."""
-    if name.startswith(_FALLBACK_DENY_PREFIXES):
-        return False
-    return name not in _FALLBACK_DENY_TOOLS
-
-
-def _partition_tools(tools: Iterable[Any]) -> tuple[list[Any], set[str], bool]:
-    """Split a raw tools/list into (exposed tools, pinned names, stamped).
-
-    ``stamped`` is False when NO tool carried the server's exposure stamp —
-    an older server package — in which case the conservative component-side
-    fallback policy was applied instead.
-    """
-    stamped = False
-    exposed: list[Any] = []
-    pinned: set[str] = set()
-    for tool in tools:
-        namespace = _tool_meta_namespace(tool)
-        if namespace is not None and _META_EXPOSED_KEY in namespace:
-            stamped = True
-            if namespace.get(_META_PINNED_KEY):
-                pinned.add(tool.name)
-            if namespace.get(_META_EXPOSED_KEY):
-                exposed.append(tool)
-        elif _fallback_exposed(tool.name):
-            exposed.append(tool)
-    if not stamped:
-        # The fallback path already filtered; recompute pinned as empty (an
-        # unstamped server gives no pinned signal — the tool-search mode then
-        # simply mirrors nothing directly).
-        pinned = set()
-    return exposed, pinned, stamped
 
 
 class HaMcpTool(llm.Tool):
@@ -324,37 +589,65 @@ class HaMcpTool(llm.Tool):
         description: str | None,
         parameters: vol.Schema,
         server_url: str,
+        *,
+        title: str | None = None,
+        hints: dict[str, Any] | None = None,
     ) -> None:
-        """Store the converted schema and the loopback endpoint."""
+        """Store the converted schema, the server's metadata and the endpoint."""
         self.name = name
         self.description = description
         self.parameters = parameters
         self._server_url = server_url
+        declare_metadata(self, title=title, hints=hints)
 
     async def async_call(
         self,
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> JsonObjectType:
+    ) -> llm.ToolResult:
         """Call the tool on the in-process server and return its result."""
-        return await _forward_tool_call(
+        dumped = await _forward_tool_call(
             hass, self._server_url, self.name, tool_input.tool_args
         )
+        if dumped is None:
+            return _unknown_tool(self.name)
+        return tool_result(dumped, error=dumped.get("isError") is True)
+
+
+def _unknown_tool(name: str) -> llm.ToolResult:
+    """The answer for a tool that does not exist or is not exposed."""
+    return tool_result(
+        {
+            "error": f"Unknown tool '{name}'.",
+            "suggestion": f"Use {_SEARCH_TOOL_NAME} to discover available tools.",
+        },
+        error=True,
+    )
 
 
 async def _forward_tool_call(
     hass: HomeAssistant, server_url: str, name: str, arguments: dict[str, Any]
-) -> JsonObjectType:
-    """Forward one tool call over loopback and dump the result for the agent."""
+) -> JsonObjectType | None:
+    """Forward one tool call over loopback and dump the result for the agent.
+
+    The tool list the agent holds can be a conversation old (Core 2026.11+
+    keeps the API instance), so exposure is read again here: None means the
+    tool is no longer exposed.
+    """
     try:
         async with (
-            asyncio.timeout(_CALL_TOOL_TIMEOUT_SECONDS),
-            _mcp_session(server_url, get_async_client(hass)) as (session, _init),
+            asyncio.timeout(CALL_TOOL_TIMEOUT_SECONDS),
+            mcp_session(server_url) as (session, _init),
         ):
+            exposed, _pinned, _stamped = partition_tools(
+                (await session.list_tools()).tools
+            )
+            if name not in {tool.name for tool in exposed}:
+                return None
             result = await session.call_tool(name, arguments)
     except _transport_errors() as err:
-        if not _is_transport_failure(err):
+        if not is_transport_failure(err):
             raise
         raise HomeAssistantError(
             f"Error calling the HA-MCP tool {name}: {err}"
@@ -362,70 +655,30 @@ async def _forward_tool_call(
     # Full CallToolResult (content blocks, structuredContent, isError) —
     # the same shape HA core's mcp integration hands to agents; ha-mcp
     # signals tool failure via isError + structured error JSON, which the
-    # agent reads and reacts to like any tool output.
-    return result.model_dump(exclude_unset=True, exclude_none=True)
+    # agent reads and reacts to like any tool output. Dumped by alias (2.x
+    # fields are snake_case) with ``meta`` kept at its 1.x key, so both SDK
+    # lines hand agents the same keys.
+    dumped = result.model_dump(exclude_unset=True, exclude_none=True, by_alias=True)
+    return cast("JsonObjectType", _meta_as_field_name(dumped))
 
 
-def _search_score(query_words: list[str], name: str, description: str) -> int:
-    """Score a tool against the query (simple word overlap + substring)."""
-    haystack = f"{name} {description}".lower()
-    name_lower = name.lower()
-    score = 0
-    for word in query_words:
-        if word in name_lower:
-            score += 3
-        elif word in haystack:
-            score += 1
-    return score
+def _meta_as_field_name(dumped: dict[str, Any]) -> dict[str, Any]:
+    """Rename ``_meta`` to ``meta`` on the SDK models only, never in tool payloads."""
+    models: list[Any] = [dumped]
+    for block in dumped.get("content", []):
+        models += [block, block.get("resource") if isinstance(block, dict) else None]
+    for model in models:
+        if isinstance(model, dict) and "_meta" in model:
+            model["meta"] = model.pop("_meta")
+    return dumped
 
 
-class HaMcpSearchTool(llm.Tool):
-    """Meta-tool: find ha-mcp tools relevant to a task (tool-search mode).
-
-    Searches only the EXPOSED catalog snapshot taken at instance build, so a
-    hidden tool can never appear in results.
-    """
-
-    name = _SEARCH_TOOL_NAME
-    description = (
-        "Search the Home Assistant MCP toolset for tools relevant to a task. "
-        "Returns each match's name, description, and input schema. Execute "
-        f"matches with {_CALL_TOOL_NAME}."
-    )
-    parameters = vol.Schema({vol.Required("query"): str})
-
-    def __init__(self, catalog: list[dict[str, Any]]) -> None:
-        """Hold the exposed-catalog snapshot (name/description/schema dicts)."""
-        self._catalog = catalog
-
-    async def async_call(
-        self,
-        hass: HomeAssistant,
-        tool_input: llm.ToolInput,
-        llm_context: llm.LLMContext,
-    ) -> JsonObjectType:
-        """Return the top-scoring exposed tools for the query."""
-        query_words = [
-            w for w in str(tool_input.tool_args.get("query", "")).lower().split() if w
-        ]
-        scored = sorted(
-            (
-                (_search_score(query_words, t["name"], t["description"]), t)
-                for t in self._catalog
-            ),
-            key=lambda pair: pair[0],
-            reverse=True,
-        )
-        results = [t for score, t in scored[:_SEARCH_RESULT_LIMIT] if score > 0]
-        if not results:
-            return {
-                "results": [],
-                "message": (
-                    "No matching tools. Try different task words (e.g. "
-                    "'automation', 'light', 'history', 'dashboard')."
-                ),
-            }
-        return {"results": results}
+def _tool_input_schema(tool: Any) -> Any:
+    """``input_schema`` on SDK 2.x, ``inputSchema`` on 1.x."""
+    schema = getattr(tool, "input_schema", None)
+    if schema is None:
+        schema = getattr(tool, "inputSchema", None)
+    return schema
 
 
 class HaMcpCallTool(llm.Tool):
@@ -454,22 +707,24 @@ class HaMcpCallTool(llm.Tool):
         """Hold the loopback endpoint and the exposed-name allowlist."""
         self._server_url = server_url
         self._exposed_names = exposed_names
+        # Dispatches any exposed tool, so no hints: Core's least-safe defaults.
+        declare_metadata(self, title="Call HA-MCP Tool", hints=None)
 
     async def async_call(
         self,
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> JsonObjectType:
+    ) -> llm.ToolResult:
         """Forward the call when the target is exposed; unknown-tool otherwise."""
         name = str(tool_input.tool_args.get("name", ""))
         arguments = tool_input.tool_args.get("arguments") or {}
         if name not in self._exposed_names:
-            return {
-                "error": f"Unknown tool '{name}'.",
-                "suggestion": (f"Use {_SEARCH_TOOL_NAME} to discover available tools."),
-            }
-        return await _forward_tool_call(hass, self._server_url, name, arguments)
+            return _unknown_tool(name)
+        dumped = await _forward_tool_call(hass, self._server_url, name, arguments)
+        if dumped is None:
+            return _unknown_tool(name)
+        return tool_result(dumped, error=dumped.get("isError") is True)
 
 
 @dataclass(kw_only=True)
@@ -489,27 +744,28 @@ class HaMcpLlmApi(llm.API):
     ) -> llm.APIInstance:
         """Fetch the current tool list and return an API instance.
 
-        Fetched fresh each conversation turn (see the module docstring); the
-        server's own initialize ``instructions`` become the API prompt, so the
-        agent gets the same guidance every MCP client gets.
+        Core asks once per turn, or from 2026.11 once per conversation (see
+        the module docstring); the server's own initialize ``instructions``
+        become the API prompt, so the agent gets the same guidance every MCP
+        client gets.
         """
         try:
             async with (
-                asyncio.timeout(_LIST_TOOLS_TIMEOUT_SECONDS),
-                _mcp_session(self.server_url, get_async_client(self.hass)) as (
+                asyncio.timeout(LIST_TOOLS_TIMEOUT_SECONDS),
+                mcp_session(self.server_url) as (
                     session,
                     init_result,
                 ),
             ):
                 list_result = await session.list_tools()
         except _transport_errors() as err:
-            if not _is_transport_failure(err):
+            if not is_transport_failure(err):
                 raise
             raise HomeAssistantError(
                 f"Could not reach the in-process HA-MCP server: {err}"
             ) from err
 
-        exposed, pinned, stamped = _partition_tools(list_result.tools)
+        exposed, pinned, stamped = partition_tools(list_result.tools)
         # Never mirror or search a server-side tool that shares a synthesized
         # meta-tool's name (the server's own tool-search mode registers an
         # ha_search_tools) — one name, one behavior.
@@ -535,12 +791,14 @@ class HaMcpLlmApi(llm.API):
 
         return llm.APIInstance(self, prompt, llm_context, tools)
 
-    def _convert_parameters(self, tool: Any) -> vol.Schema | None:
-        """Convert one tool's JSON schema, or None (logged) when it fails."""
+    def _convert_parameters(self, tool: Any, schema: Any) -> vol.Schema | None:
+        """Convert one tool's normalised schema, or None (logged) when it fails.
+
+        The schema is normalised by the caller rather than here, so that a tool
+        the catalog also lists is rewritten and logged once rather than twice.
+        """
         try:
-            # cast: voluptuous_openapi is an untyped (ignored) import, so the
-            # call returns Any; its documented return type is vol.Schema.
-            return cast(vol.Schema, convert_to_voluptuous(tool.inputSchema))
+            return convert_to_voluptuous(schema)
         except Exception:
             # One unconvertible schema must not take down the whole
             # toolset for the conversation — skip that tool, loudly.
@@ -551,16 +809,26 @@ class HaMcpLlmApi(llm.API):
             )
             return None
 
+    def _mirror(self, tool: Any, parameters: vol.Schema) -> HaMcpTool:
+        """Mirror one server tool with its title and safety hints."""
+        return HaMcpTool(
+            tool.name,
+            tool.description,
+            parameters,
+            self.server_url,
+            title=tool_title(tool),
+            hints=tool_hints(tool),
+        )
+
     def _build_full_tools(self, exposed: list[Any]) -> list[llm.Tool]:
         """Mirror every exposed tool directly (full-catalog mode)."""
         tools: list[llm.Tool] = []
         for tool in exposed:
-            parameters = self._convert_parameters(tool)
+            schema = _normalise_schema(_tool_input_schema(tool), tool.name)
+            parameters = self._convert_parameters(tool, schema)
             if parameters is None:
                 continue
-            tools.append(
-                HaMcpTool(tool.name, tool.description, parameters, self.server_url)
-            )
+            tools.append(self._mirror(tool, parameters))
         return tools
 
     def _build_tool_search_tools(
@@ -569,25 +837,41 @@ class HaMcpLlmApi(llm.API):
         """Build the compact catalog: mirrored pinned tools + meta-tools."""
         tools: list[llm.Tool] = []
         exposed_names: set[str] = set()
+        mirrored: set[str] = set()
         catalog: list[dict[str, Any]] = []
         for tool in exposed:
             exposed_names.add(tool.name)
-            catalog.append(
-                {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema,
-                }
-            )
+            # One normalisation feeds both surfaces, so a search result never
+            # shows a bound the mirrored tool does not advertise. Sharing the
+            # object rests on the converter not writing into its input. Both
+            # backends this component can reach were read for that: every
+            # write in voluptuous-openapi 0.4.1's convert_to_voluptuous and in
+            # probatio 0.11.4's JSON-Schema codec lands in a dict the
+            # converter built itself, and instrumenting probatio's inputs
+            # recorded no mutating call at all. A
+            # converter that wrote back would corrupt the catalog entry, so
+            # re-check this before pointing the component at a third one.
+            schema = _normalise_schema(_tool_input_schema(tool), tool.name)
+            entry = {
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": schema,
+            }
+            # The server renders the compact params line (#2633); a server
+            # that predates the stamp leaves the hit without one.
+            params = (_tool_meta_namespace(tool) or {}).get(META_PARAMS_KEY)
+            if isinstance(params, str):
+                entry["params"] = params
+            catalog.append(entry)
             if tool.name in pinned:
-                parameters = self._convert_parameters(tool)
+                parameters = self._convert_parameters(tool, schema)
                 if parameters is not None:
-                    tools.append(
-                        HaMcpTool(
-                            tool.name, tool.description, parameters, self.server_url
-                        )
-                    )
-        tools.append(HaMcpSearchTool(catalog))
+                    tools.append(self._mirror(tool, parameters))
+                    mirrored.add(tool.name)
+        # Only a tool actually mirrored is in the agent's list; a pinned one
+        # whose schema failed to convert stays a full search entry, reachable
+        # through ha_call_tool.
+        tools.append(HaMcpSearchTool(catalog, mirrored))
         tools.append(HaMcpCallTool(self.server_url, exposed_names))
         return tools
 
@@ -661,7 +945,9 @@ async def async_register_llm_api(
             exc_info=True,
         )
         return
-    # The embedded e2e (test_llm_api_registered_inside_ha) asserts on this
+    # The embedded e2e (test_llm_api_registered_inside_ha) and the in-HA
+    # probe tests (tests/src/e2e/workflows/embedded/test_llm_api_in_ha.py)
+    # assert on this
     # message to prove the registration ran inside a real HA — keep the
     # "Registered the HA-MCP toolset as LLM API" prefix stable.
     _LOGGER.info(

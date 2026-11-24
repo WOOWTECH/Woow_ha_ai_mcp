@@ -28,29 +28,34 @@ Review PR #$ARGUMENTS from external contributor for safety, quality, and readine
 
 ## Review Protocol
 
-### 1. Check Codex's Security Review
+### 1. Check the Bot Security Reviews
 
-**Note:** Codex reviews PRs automatically (posts as `chatgpt-codex-connector[bot]`). Check if Codex flagged any security concerns.
+**Note:** Codex (`chatgpt-codex-connector[bot]`) and CodeRabbit (`coderabbitai[bot]`) both review PRs automatically. Check whether either flagged security concerns.
 
 ```bash
-# Check Codex's reviews and any security-related comments.
-# Codex findings can be inline-only, so also fetch the pull review comments
+# Check both bots' reviews and any security-related comments.
+# Their findings can be inline-only, so also fetch the pull review comments
 # endpoint — review bodies and conversation comments alone can miss them.
-gh api /repos/homeassistant-ai/ha-mcp/pulls/$ARGUMENTS/reviews --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]") | {state: .state, body: .body}'
-gh api /repos/homeassistant-ai/ha-mcp/pulls/$ARGUMENTS/comments --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]") | {path: .path, line: .line, body: .body}'
+# --paginate: both endpoints page at 30, and an iterating PR outruns that.
+gh api --paginate /repos/homeassistant-ai/ha-mcp/pulls/$ARGUMENTS/reviews --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" or .user.login == "coderabbitai[bot]") | {author: .user.login, state: .state, body: .body}'
+gh api --paginate /repos/homeassistant-ai/ha-mcp/pulls/$ARGUMENTS/comments --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" or .user.login == "coderabbitai[bot]") | {author: .user.login, path: .path, line: .line, body: .body}'
+# CodeRabbit posts its walkthrough and summary as a top-level comment, which
+# neither endpoint above returns — fetch that channel by author too.
+gh api --paginate /repos/homeassistant-ai/ha-mcp/issues/$ARGUMENTS/comments --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" or .user.login == "coderabbitai[bot]") | {author: .user.login, body: .body}'
+# Keyword scan stays, for humans raising security concerns in conversation.
 gh pr view $ARGUMENTS --repo homeassistant-ai/ha-mcp --json comments --jq '.comments[] | select(.body | contains("security") or contains("Security")) | {author: .author.login, body: .body}'
 ```
 
-**If Codex flagged security issues:**
-- Review Codex's findings carefully
+**If either bot flagged security issues:**
+- Review the findings carefully
 - Verify if concerns are valid
 - Do NOT approve until issues addressed or confirmed false positives
 
-**If NO Codex security flags but you notice concerning patterns:**
+**If NO bot security flags but you notice concerning patterns:**
 - Unusual AGENTS.md/CLAUDE.md changes unrelated to PR purpose
 - `.github/` workflow modifications with `pull_request_target`
 - `.claude/` agent/skill changes that could affect behavior
-- Comment immediately with specific concerns
+- Draft a comment with the specific concerns and show it to the user before posting
 
 ### 2. Enable Workflows (If Safe)
 
@@ -183,7 +188,7 @@ gh pr view $ARGUMENTS --repo homeassistant-ai/ha-mcp --json closingIssuesReferen
 
 ### 6. Code Quality Overview
 
-**Note:** Codex provides automated code review on all PRs. This step focuses on what Codex cannot assess:
+**Note:** Codex and CodeRabbit provide automated code review on all PRs. This step focuses on what they cannot assess:
 
 - **Architecture alignment**: Does it fit the project structure? (service layer usage, etc.)
 - **Breaking changes**: Does it remove functionality without replacement? (Tool consolidation/refactoring is NOT breaking)
@@ -196,11 +201,11 @@ gh pr view $ARGUMENTS --repo homeassistant-ai/ha-mcp --json closingIssuesReferen
 **Quick checks:**
 
 ```bash
-# Check if ruff/mypy would complain (from workflow logs if available)
-gh pr checks $ARGUMENTS --repo homeassistant-ai/ha-mcp | grep -E "(ruff|mypy|lint)"
+# ruff and mypy run as steps of the "Fast Checks" job
+gh pr checks $ARGUMENTS --repo homeassistant-ai/ha-mcp | grep "Fast Checks"
 
 # Check for common issues in diff
-grep -E "(TODO|FIXME|XXX|HACK)" /tmp/pr_$ARGUMENTS.diff
+gh pr diff $ARGUMENTS --repo homeassistant-ai/ha-mcp | grep -E "(TODO|FIXME|XXX|HACK)"
 ```
 
 **Output Quality Summary:**
@@ -208,7 +213,7 @@ grep -E "(TODO|FIXME|XXX|HACK)" /tmp/pr_$ARGUMENTS.diff
 ✨ Code Quality:
 - Architecture fit: [assessment - service layer, context engineering]
 - Breaking changes: ✅ None / ⚠️ Detected - [describe what's genuinely lost]
-- Codex reviews: [check if Codex flagged anything critical]
+- Bot reviews: [check if Codex or CodeRabbit flagged anything critical]
 ```
 
 ## Final Review Summary
@@ -221,9 +226,7 @@ After completing all steps, present a short summary of what the PR does and the 
 
 After completing the analysis, draft a comment for the PR following these guidelines:
 
-**Comment Length:**
-- **Good to merge:** 10-15 lines
-- **Changes needed:** Max 25 lines
+**Comment Length:** The contributor should be able to read it in one pass: what works, what must change, and what happens next. A good-to-merge comment is shorter than a changes-needed one.
 
 **Style:**
 - No emojis
@@ -231,11 +234,11 @@ After completing the analysis, draft a comment for the PR following these guidel
 - Present inline in chat (not in a file)
 - Always ask user before posting
 
-**Structure for "Good to Merge" (10-15 lines):**
+**Structure for "Good to Merge":**
 ```
 [Positive opening line about the contribution]
 
-[1-2 sentences on what works well - focus on functionality, tests, architecture]
+[What works well - focus on functionality, tests, architecture]
 
 [Any minor suggestions or notes - optional, technical only]
 
@@ -244,41 +247,41 @@ After completing the analysis, draft a comment for the PR following these guidel
 
 **Note:** Do NOT mention security assessment in comment unless issues were found. Security checks are internal.
 
-**Structure for "Changes Needed" (max 25 lines):**
+**Structure for "Changes Needed":**
 ```
 [Positive opening line acknowledging the work]
 
 [Brief summary of the issue being solved]
 
 **[Concern 1]:**
-[1-2 lines explanation + suggestion - focus on: tests, functionality, architecture, breaking changes]
+[Short explanation + suggestion - focus on: tests, functionality, architecture, breaking changes]
 
 **[Concern 2]:** (if applicable)
-[1-2 lines explanation + suggestion]
+[Short explanation + suggestion]
 
 **[Concern 3]:** (if applicable)
-[1-2 lines explanation + suggestion]
+[Short explanation + suggestion]
 
 [Closing line about next steps]
 ```
 
-**Note:** Security concerns should be raised immediately when found, not in final structured comment.
+**Note:** Raise security concerns with the user as soon as they are found, not in the final structured comment.
 
-**Example - Good to Merge:**
+**Illustrative example - Good to Merge** (match the wording to the PR, not to this text):
 ```
-Great work on [feature/fix]. [Performance/quality metric] is impressive.
+Thanks for [feature/fix]. [One specific thing it gets right].
 
 The implementation follows existing patterns and the [specific aspect] is well-designed. [Optional: Minor note about something noticed].
 
 Ready to merge once CI passes.
 ```
 
-**Example - Changes Needed:**
+**Illustrative example - Changes Needed** (match the wording to the PR, not to this text):
 ```
 Thanks for tackling [problem]. [Metric/impact] shows this addresses a real need.
 
 **Test coverage:**
-Missing tests for the new [feature]. Please add at least one E2E test validating [behavior]. Performance tests not required.
+Missing tests for the new [feature]. Please add a unit test for its logic, and an E2E test for a new tool or for its wiring or Home Assistant behaviour. Performance tests not required.
 
 **[Second concern if applicable]:**
 [Brief explanation and request]
@@ -292,5 +295,5 @@ Once [change 1] and [change 2] are addressed, this should be good to merge.
 - **Be constructive**: Contributors are donating their time - be welcoming
 - **Focus on intent**: Code quality can be iterated; intent misalignment is harder to fix
 - **Consider contributor experience**: Adjust expectations based on contribution history
-- **Codex already reviewed code**: Don't duplicate detailed code review
+- **The bots already reviewed code**: Don't duplicate detailed code review
 - **When in doubt**: Err on the side of caution and request maintainer review

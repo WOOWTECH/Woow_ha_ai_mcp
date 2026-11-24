@@ -8,7 +8,10 @@ See SECURITY.md § "MCP clients are trusted principals" for the rationale.
 """
 
 import ast
-from typing import Any, cast
+import json
+from typing import Any
+
+from ..error_wording import line_continuation, single_target_unpack
 
 
 class PythonSandboxError(Exception):
@@ -41,11 +44,12 @@ class PythonSandboxExecutionError(PythonSandboxError):
 # can carry tokens / passwords / device addresses, and Python's default
 # repr happily embeds dict and list values into KeyError/TypeError text.
 # 240 chars is enough to identify the failure (exception type + a short
-# snippet) without pasting the input config back to the caller.
-_EXECUTION_ERROR_TEXT_LIMIT = 240
+# snippet) without pasting the input config back to the caller. Public so
+# tests can check the cap.
+EXECUTION_ERROR_TEXT_LIMIT = 240
 
 
-def _truncate_for_error(text: str, limit: int = _EXECUTION_ERROR_TEXT_LIMIT) -> str:
+def _truncate_for_error(text: str, limit: int = EXECUTION_ERROR_TEXT_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
@@ -137,6 +141,7 @@ SAFE_NODES = {
 # evaluable on any Python. Unmapped keys fall through to the generic
 # "Forbidden node type: X" message in `_validate_node`.
 _NODE_SUGGESTIONS: dict[str, str] = {
+    "Assert": "to require one match or a value, unpack a filtered list: [a] = [x for x in items if ...]",
     "Try": "validate inputs with isinstance/in/.get() instead of try/except",
     "TryStar": "validate inputs with isinstance/in/.get() instead of try/except",
     "ExceptHandler": "validate inputs with isinstance/in/.get() instead of try/except",
@@ -168,7 +173,9 @@ _NODE_SUGGESTIONS: dict[str, str] = {
 
 _INTERPRETER_INTERNAL_NAMES = frozenset({"__builtins__", "__name__", "__doc__"})
 
-# Whitelist of safe methods that can be called
+# Whitelist of safe methods that can be called. Calls are matched by
+# attribute name only, whatever the receiver's type, so each entry must be
+# safe on every built-in type that has a method of that name.
 SAFE_METHODS = {
     # List methods
     "append",
@@ -188,12 +195,16 @@ SAFE_METHODS = {
     "keys",
     "values",
     "items",
-    # String methods (for entity filtering)
+    # String methods
     "startswith",
     "endswith",
     "lower",
     "upper",
     "strip",
+    "lstrip",
+    "rstrip",
+    "removeprefix",
+    "removesuffix",
     "split",
     "join",
     "replace",
@@ -226,8 +237,9 @@ BLOCKED_FUNCTIONS = {
 # transforms — type checks, length, numeric/string coercion, simple
 # collection helpers. Expanding this list is fine if another pure builtin
 # is genuinely needed; adding anything that touches the filesystem, network,
-# or interpreter state is not.
-_SAFE_BUILTINS: dict[str, Any] = {
+# or interpreter state is not. Public, like SAFE_METHODS, so tests can check
+# the security documentation against it.
+SAFE_BUILTINS: dict[str, Any] = {
     "isinstance": isinstance,
     "len": len,
     "range": range,
@@ -376,7 +388,7 @@ def safe_execute_expression(
         )
 
     safe_globals: dict[str, Any] = {
-        "__builtins__": dict(_SAFE_BUILTINS),
+        "__builtins__": dict(SAFE_BUILTINS),
         "__name__": "__main__",
         "__doc__": None,
     }
@@ -384,7 +396,7 @@ def safe_execute_expression(
 
     try:
         exec(expr, safe_globals, safe_locals)
-    except (MemoryError, RecursionError):
+    except MemoryError, RecursionError:
         # Resource exhaustion — let the host decide. Reframing
         # "ran out of memory" as "your transform was bad" would
         # mislead the agent into rewriting an expression that
@@ -421,7 +433,7 @@ def safe_execute(expr: str, config: dict[str, Any]) -> dict[str, Any]:
     Returns:
         The value bound to ``config`` after execution — typically the same
         dict mutated in place, but also supports expressions that reassign
-        ``config`` to a new object.
+        ``config`` to a new dict.
 
     Raises:
         PythonSandboxError: If expression validation fails or execution errors
@@ -431,13 +443,21 @@ def safe_execute(expr: str, config: dict[str, Any]) -> dict[str, Any]:
         >>> safe_execute("config['views'][0]['cards'][0]['icon'] = 'new'", config)
         {'views': [{'cards': [{'icon': 'new'}]}]}
     """
-    # safe_execute_expression returns Any (generic over result_key); at this
-    # call site the result is always the dict bound to `config`, so narrow
-    # for mypy and existing callers that depend on the dict interface.
-    return cast(
-        dict[str, Any],
-        safe_execute_expression(expr, {"config": config}, "config"),
-    )
+    result = safe_execute_expression(expr, {"config": config}, "config")
+    # The callers send the result to Home Assistant as a JSON object, so a
+    # result that is not one is the expression's mistake, reported as such.
+    if not isinstance(result, dict):
+        raise PythonSandboxExecutionError(
+            f"the expression left `config` as {type(result).__name__}; "
+            "it must stay a dict"
+        )
+    try:
+        json.dumps(result, allow_nan=False)
+    except (TypeError, ValueError) as err:
+        raise PythonSandboxExecutionError(
+            f"the expression left a value that cannot be sent as JSON: {err}"
+        ) from err
+    return result
 
 
 def format_sandbox_error(
@@ -472,6 +492,13 @@ def format_sandbox_error(
             "Use .get(key, default) to handle missing keys",
             f"Expression: {preview}",
         ]
+        if single_target_unpack(error):
+            suggestions.insert(
+                0,
+                "A single-target unpack needs exactly one item. If this is a "
+                "`[a] = [...]` guard, it matched no item or several: re-read the "
+                "input and correct the filter or the expected value.",
+            )
     else:
         message = f"Expression validation failed: {error}"
         suggestions = [
@@ -485,7 +512,7 @@ def format_sandbox_error(
         # line-continuation token followed by an unexpected character.
         # Pinpoint the actual mistake so the agent fixes it on the first
         # retry instead of guessing at "syntax".
-        if "line continuation character" in str(error):
+        if line_continuation(error):
             suggestions.insert(
                 0,
                 'Remove the leading backslash before quotes — write "foo" '
@@ -513,8 +540,9 @@ PYTHON TRANSFORM SECURITY:
 - Slicing: config['views'][0]['cards'][1:3]
 - Assignment: config['key'] = 'value'
 - Deletion: del config['key'] or config.pop('key')
-- List methods: append, insert, pop, remove, clear, extend
-- Dict methods: update, get, setdefault, keys, values, items
+- List methods: append, insert, pop, remove, clear, extend, index, count, sort,
+  reverse
+- Dict methods: update, get, setdefault, keys, values, items, pop, clear
 - Loops: for, if/else, pass, break, continue
 - Comprehensions: [x for x in ...], {k: v for ...}, (x for x in ...)
 - Ternary: x if condition else y
@@ -522,7 +550,11 @@ PYTHON TRANSFORM SECURITY:
 - Dict unpacking (**) in calls and dict literals: {**d, 'k': v}
 - Keyword arguments: func(key=value)
 - Lambdas (e.g. for `key=`): sorted(items, key=lambda x: x['score'])
-- String methods: startswith, endswith, lower, upper, strip, split, join, replace
+- Guards (a failed guard raises and the config is not changed):
+  one match: [a] = [a for a in config['actions'] if a.get('alias') == 'Y']
+  a value: [a] = [a for a in [config['actions'][2]] if a['data']['v'] == 1]
+- String methods: startswith, endswith, lower, upper, strip, lstrip, rstrip,
+  removeprefix, removesuffix, split, join, replace, count, index
 - Safe builtins: isinstance, len, range, enumerate, zip, sorted, reversed,
   min, max, sum, abs, any, all, round, str, int, float, bool, list, dict,
   tuple, set
@@ -535,13 +567,4 @@ PYTHON TRANSFORM SECURITY:
 - Function definitions: def, class
 - Exception handling: try/except (validate with isinstance/in/.get() instead)
 - While loops: use bounded for loops or comprehensions instead
-
-🎯 PATTERNS:
-- Filter cards: cards = [c for c in cards if keep(c)]
-- Skip in a loop: prefer `continue` over an empty `pass` branch (clearer)
-- Conditionally include: build a new list and `.append(x)` only the
-  cards you want, instead of iterating the original and using if/pass
-  branches to drop entries
-- Modify in place when possible (single pass, fewer surprises) over
-  reconstructing the entire list
 """.strip()

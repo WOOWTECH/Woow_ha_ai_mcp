@@ -1,19 +1,29 @@
 """Multi-layer smoke tests for backend dispatch correctness.
 
-The three e2e CI lanes set env vars that ``conftest.ha_container_with_fresh_config``
-reads to choose a backend:
+The e2e CI lanes set env vars that ``conftest.ha_container_with_fresh_config``
+reads to choose a backend. The HAOS lanes below are jobs of
+``haos-e2e-tests.yml``, except the manual ``haos-e2e-stdio.yml`` (the beta
+lanes are jobs of ``haos-e2e-beta-tests.yml``):
 
 | Lane                          | HAOS_TEST_IMAGE_PATH | HAOS_TEST_MODE | expected backend |
 | ----------------------------- | -------------------- | -------------- | ---------------- |
 | e2e-tests.yml (testcontainer) | unset                | unset          | ``container``    |
-| haos-e2e-tests.yml (external) | set                  | unset          | ``haos``         |
-| haos-e2e-inaddon-tests.yml    | set                  | ``inaddon``    | ``haos_inaddon`` |
-| haos-e2e-embedded-tests.yml   | set                  | ``embedded``   | ``haos_embedded``|
+| ``haos-e2e`` (external)       | set                  | unset          | ``haos``         |
+| ``haos-e2e-stdio``            | set                  | ``stdio``      | ``haos_stdio``   |
+| ``haos-e2e-inaddon``          | set                  | ``inaddon``    | ``haos_inaddon`` |
+| ``haos-e2e-embedded``         | set                  | ``embedded``   | ``haos_embedded``|
 
 The testcontainer ``embedded`` backend (#1527) is a fourth variant selected by a
 separate axis, ``E2E_BACKEND=embedded`` (not ``HAOS_TEST_MODE``): same container
 HA, but the server-under-test is the in-process MCP server entry inside
 the container.
+
+``E2E_NO_TOOLS_ENTRY=1`` (#2292) is a third, orthogonal axis: the backend is
+unchanged, but the "File & YAML Tools" entry is absent, so a completely
+different set of tests is marker-skipped. Only the skip ceiling below cares —
+it keys those lanes separately, as ``<backend>_no_tools``. Combined lanes
+(``E2E_COMBINE_TOPOLOGIES=1``) run both states in one session and keep the
+base key, because they still run every component-present test.
 
 Three layers of guard, each catching a different silent-failure mode:
 
@@ -22,7 +32,7 @@ Three layers of guard, each catching a different silent-failure mode:
    Catches dispatch falling through to the wrong code path.
 
 2. ``test_supervisor_addon_tool_behavior_matches_backend`` — calls
-   ``ha_get_addon`` (which only works when a real Supervisor is present)
+   ``ha_get_app`` (which only works when a real Supervisor is present)
    and asserts success-vs-failure matches the claimed backend. Catches
    the case where conftest reports ``backend=X`` but actually a different
    HA instance is running (e.g. mock Supervisor on testcontainer making
@@ -39,7 +49,7 @@ Three layers of guard, each catching a different silent-failure mode:
    tests transition pass→skip silently because a marker was applied
    too broadly. The conftest documents a prior incident of this kind
    (PR #1375 audit, 14 ``supervisor_mock`` tests silently skipping on
-   every testcontainer run — see the PR #1375 audit comment in ``tests/src/e2e/conftest.py``).
+   every testcontainer run — see the PR #1375 audit comment in ``tests/src/e2e/_conftest_collection.py``).
 
 This file is placed under ``basic/`` (NOT ``haos_only/``) on purpose: the
 auto-applied ``haos_only`` marker would skip these whenever
@@ -50,10 +60,15 @@ markers so the tests run unconditionally on every lane.
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ..utilities.assertions import safe_call_tool
+from ..utilities.topology import combined_topologies, item_topology, tools_entry_absent
 
 # Floor for total collected tests across all lanes. As of 2026-05-22
 # container lanes collect 912 and HAOS lanes collect 915 (small per-mode
@@ -69,7 +84,7 @@ _COLLECTION_FLOOR = 850
 # and are bumped when new marker-gated tests intentionally consume that
 # historical buffer. This still catches a mass-skip incident like PR #1375
 # (14 tests started skipping silently because a marker was applied too broadly).
-_SKIP_CEILING_PER_LANE = {
+_SKIP_CEILING_BASELINE = {
     # The 6 dashboard-screenshot E2E tests
     # (tests/src/e2e/haos_only/test_dashboard_screenshot_addon.py) are marked
     # haos_only + inaddon_only: they RUN only on the haos_inaddon lane (the
@@ -82,11 +97,58 @@ _SKIP_CEILING_PER_LANE = {
     # container_only: they RUN only on the container lane (in-process server +
     # fake engine) and SKIP on both HAOS lanes. So haos and haos_inaddon each
     # gain 10; container is unchanged because the tests run there.
-    # Entries below are CI-observed item counts, bumped only for intentional
-    # marker-gated additions rather than runtime skips.
-    "container": 72,  # was 71; +1 Puppet-management test (haos_only + inaddon_only)
-    "haos": 45,  # was 39; +1 Puppet-management test and +5 screenshot sidecar tests
-    "haos_inaddon": 72,  # was 67; +5 screenshot sidecar tests (container_only)
+    # Established-lane entries are CI-observed item counts, bumped only for
+    # intentional marker-gated additions rather than runtime skips. A new lane
+    # starts at its observed count plus the five-item buffer described above;
+    # subsequent additions consume that buffer explicitly.
+    # #2241's final same-VM Core-TLS scenario runs only on haos_embedded and
+    # deliberately adds one collection-time skip on every other lane — via
+    # haos_tls on the HAOS lanes, and via haos_only on container/embedded,
+    # which already skip its directory.
+    # #2239's dependency-conflict scenario
+    # (tests/src/e2e/workflows/embedded/test_embedded_dependency_conflict.py)
+    # is ``container_only``: its 3 tests RUN on the container and embedded
+    # lanes and SKIP on all four HAOS lanes, so those four each gain 3.
+    # #2245 converted the 3 embedded-lane-only tests (2 no-stomp + 1
+    # dependency-audit-clean) from runtime skips to the ``embedded_only``
+    # marker, so every lane EXCEPT embedded gains 3 collection-time skips
+    # the runtime form never counted. The same sweep converted the backup
+    # age-floor happy-path test's runtime skip to ``external_only``, adding
+    # one more on the four out-of-process lanes.
+    # #2270 adds one ``beta_haos_only`` version-attestation item. It runs in
+    # the two beta HAOS lanes and adds one collection-time skip elsewhere.
+    # Beta variants share backend keys, so they inherit the ceiling increase
+    # while running the attestation instead of skipping it. Its in-app-only
+    # self-update guard adds a second skip outside the in-app lanes.
+    # #2292's ``no_tools_only`` module
+    # (tests/src/e2e/workflows/filesystem/test_tools_entry_absent.py) contributes
+    # 8 items that RUN only on the no-tools lanes (E2E_NO_TOOLS_ENTRY=1) and
+    # therefore add collection-time skips on every component-present lane; each
+    # entry below is re-pinned to what round-1 CI observed with them in place.
+    # The beta HAOS variants share these backend keys
+    # and observed slightly LOWER counts than their stable siblings
+    # (haos_embedded beta 125, haos_inaddon beta 93), so the stable-lane numbers
+    # here cover both.
+    # #2361 adds tests/src/e2e/workflows/embedded/test_llm_api_in_ha.py: one
+    # ``embedded_only`` item and one ``haos_embedded_only`` item. Each lane
+    # gains a collection-time skip for every one of the two it does not run —
+    # two on every lane except embedded and haos_embedded (and their no-tools
+    # variants), which run one and skip the other.
+    "container": 90,  # was 79; +8 #2292 no_tools_only; +1 #2357 haos_embedded_only; +2 #2361 in-HA LLM-API probe
+    "haos": 69,  # was 58; +8 #2292 no_tools_only; +1 #2357 haos_embedded_only; +2 #2361 in-HA LLM-API probe
+    # HAOS stdio is the external HAOS set plus ``external_only`` tests, whose
+    # test-process monkeypatches cannot reach the subprocess server. The first
+    # full lane run on 2026-08-18 observed 103 collection-time marker skips
+    # (plus 9 runtime skips); keep the same five-item buffer as established
+    # lanes (108), +1 #2241 haos_tls scenario, +3 #2239 dependency conflict,
+    # +3 embedded_only conversion, +1 backup external_only conversion, and the
+    # #2292 no_tools_only module. Set from the round-1 CI observation, which is
+    # what this dict records; the other lanes' observations moved by 8 there.
+    # This entry moved 117 -> 119 rather than by that 8: the 117 was a ceiling
+    # carrying headroom above its own observed count, so part of the +8 landed
+    # inside that headroom and 119 is what round-1 CI actually observed.
+    "haos_stdio": 122,  # +1 #2357 haos_embedded_only; +2 #2361 in-HA LLM-API probe
+    "haos_inaddon": 97,  # was 86; +8 #2292 no_tools_only; +1 #2357 haos_embedded_only; +2 #2361 in-HA LLM-API probe
     # Embedded backend (#1527, E2E_BACKEND=embedded). Skips exactly the container
     # lane's marker-skips PLUS two embedded-specific additions:
     #   - haos_only + inaddon_only tests skip on embedded just like on container
@@ -95,12 +157,14 @@ _SKIP_CEILING_PER_LANE = {
     #     by test-process env/monkeypatch — same reason as inaddon), plus the
     #     workflows/embedded smoke test (not_on_embedded).
     # Static def-level derivation (Docker-less, so parametrize item-inflation isn't
-    # visible locally): haos_only 52 + inaddon_only-outside-haos 11 + external_only
-    # 35 (auto_backup 18, supervisor_mock 15, self_update_notice 1, file_operations
-    # 1) + not_on_embedded 2 = 100. Initially set to 115 as a buffer for
-    # parametrize item-inflation; round 6 (run 28709196071) observed the exact
-    # item count and the entry below is pinned to it.
-    "embedded": 128,  # was 127; +1 Puppet-management test (haos_only + inaddon_only)
+    # visible locally): haos_only 53 + inaddon_only-outside-haos 11 + external_only
+    # 36 (auto_backup 19, supervisor_mock 15, self_update_notice 1, file_operations
+    # 1) + not_on_embedded 2 = 102. Parametrize inflates that to the CI-observed
+    # count of 133 in the 2026-08-18 CI run (132 before the self-restart e2e);
+    # +1 visibility e2e (haos_stdio_only) and +1 #2241 haos_tls scenario
+    # (haos_only) bridge 133 -> 135.
+    # Read future changes from CI instead of deriving them.
+    "embedded": 147,  # was 137; +8 #2292 no_tools_only; +1 #2357 haos_embedded_only; +1 #2361 (its haos_embedded_only half)
     # HAOS embedded backend (#1527, HAOS_TEST_MODE=embedded). A HAOS lane, so it
     # skips the SAME set as the external HAOS lane (container_only + inaddon_only)
     # PLUS two haos_embedded-specific additions:
@@ -108,18 +172,86 @@ _SKIP_CEILING_PER_LANE = {
     #     HAOS core container, unreachable by test-process env/monkeypatch — same
     #     reason as inaddon/container-embedded; alternative coverage on the external
     #     HAOS lane, where the in-process FastMCP server IS in the test process), and
-    #   - the 3 haos_only embedded smoke tests skip (not_on_haos_embedded) because
+    #   - the haos_only embedded smoke tests skip (not_on_haos_embedded) because
     #     the session backend already enables the entry + drives the server.
     # Static def-level derivation (Docker/HAOS-less locally, so parametrize
     # item-inflation isn't visible): container_only 16 + inaddon_only 20 +
-    # external_only 39 + smoke 3 = 78 (no overlaps: no external_only test is also
+    # external_only 40 + smoke 4 = 80 (no overlaps: no external_only test is also
     # container_only/inaddon_only, and the 2 not_on_embedded tests are already
-    # container_only). Applying the ~1.16x parametrize inflation the other HAOS
-    # lanes show (haos def 30 → ~35 observed; haos_inaddon def 50 → ~58) gives
-    # ~84; initially set to 90 with a small buffer, and round 8 observed
-    # exactly 90 — the entry below is pinned to the observed count.
-    "haos_embedded": 102,  # was 96; +1 Puppet-management test and +5 screenshot sidecar tests
+    # container_only). Parametrize inflates that to the CI-observed count of
+    # 107 in the 2026-08-18 CI run (106 before the self-restart e2e).
+    # Read future changes from CI instead of deriving them.
+    # #2270 stable observed 118 marker skips; beta observed 117.
+    "haos_embedded": 127,  # was 118; +8 #2292 no_tools_only; +1 #2361 (its embedded_only half)
+    # No-tools topology keys (#2292). On whole-run ``E2E_NO_TOOLS_ENTRY=1``
+    # lanes (not combined lanes) the lookup key gains a ``_no_tools`` suffix, because those lanes skip a
+    # completely different — and much larger — set: every ``requires_tools_entry``
+    # module (the whole filesystem / YAML suite) skips, while the 8
+    # ``no_tools_only`` items run. Sharing the base key would force one ceiling
+    # to cover both topologies and blind the check on whichever side is lower.
+    # New-lane convention: the CI-observed count plus the five-item buffer.
+    # The haos (external) and haos_stdio backends have no no-tools lane today,
+    # so they deliberately have no key here — an unknown backend fails loudly in
+    # the test below rather than silently skipping the ceiling check.
+    "container_no_tools": 195,  # observed 187; +1 #2357 haos_embedded_only; +2 #2361 in-HA LLM-API probe
+    "embedded_no_tools": 251,  # observed 244; +1 #2357 haos_embedded_only; +1 #2361 (its haos_embedded_only half)
+    "haos_embedded_no_tools": 231,  # observed 225; +1 #2361 (its embedded_only half)
+    "haos_inaddon_no_tools": 201,  # observed 193; +1 #2357 haos_embedded_only; +2 #2361 in-HA LLM-API probe
 }
+
+# Per-PR increments live beside this file in ``skip_ceiling/pr<N>.json``, one
+# fragment per pull request, so two PRs that each add marker-gated tests no
+# longer rewrite the same lines above (that block conflicted on three
+# consecutive master merges while #2356 was in review). A fragment is
+# ``{"reason": str, "deltas": {lane: int}}``; every fragment's deltas are added
+# to the baseline. Re-pin the baseline only from a CI observation, and when
+# doing so delete the fragments the new numbers already include.
+_SKIP_CEILING_FRAGMENT_DIR = Path(__file__).with_name("skip_ceiling")
+
+
+def _load_skip_ceiling_fragments() -> dict[str, dict[str, Any]]:
+    """Every ``skip_ceiling/*.json`` fragment, keyed by filename."""
+    return {
+        path.name: json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(_SKIP_CEILING_FRAGMENT_DIR.glob("*.json"))
+    }
+
+
+def _validate_skip_ceiling_fragment(
+    name: str, fragment: Any, lanes: dict[str, int]
+) -> dict[str, int]:
+    """Return ``fragment``'s deltas, or raise ``AssertionError`` naming ``name``.
+
+    Runs at import for every real fragment (so a bad one fails the module at
+    collection, loudly) and is pinned on synthetic fragments by
+    ``test_skip_ceiling_fragment_validator_rejects`` below.
+    """
+    assert isinstance(fragment, dict) and set(fragment) == {"reason", "deltas"}, (
+        f"{name}: expected exactly the keys 'reason' and 'deltas'"
+    )
+    reason, deltas = fragment["reason"], fragment["deltas"]
+    assert isinstance(reason, str) and reason.strip(), f"{name}: empty reason"
+    assert isinstance(deltas, dict) and deltas, f"{name}: no deltas"
+    for lane, delta in deltas.items():
+        assert lane in lanes, f"{name}: unknown lane {lane!r}"
+        # ``type(...) is int``: JSON ``true`` is a bool, and bool subclasses
+        # int, so ``isinstance`` would let it add 1 to a ceiling.
+        assert type(delta) is int and delta > 0, (
+            f"{name}: delta for {lane!r} must be a positive int, got {delta!r}"
+        )
+    return deltas
+
+
+def _skip_ceilings_with_fragments() -> dict[str, int]:
+    ceilings = dict(_SKIP_CEILING_BASELINE)
+    for name, fragment in _load_skip_ceiling_fragments().items():
+        deltas = _validate_skip_ceiling_fragment(name, fragment, ceilings)
+        for lane, delta in deltas.items():
+            ceilings[lane] += delta
+    return ceilings
+
+
+SKIP_CEILING_PER_LANE = _skip_ceilings_with_fragments()
 
 
 def test_backend_dispatch_matches_workflow_env(
@@ -155,6 +287,17 @@ def test_backend_dispatch_matches_workflow_env(
         assert ha_container_with_fresh_config["container"] is None
         assert ha_container_with_fresh_config["port"] is None
         assert ha_container_with_fresh_config["config_path"] is None
+    elif image_path and mode == "stdio":
+        assert backend == "haos_stdio", (
+            "Workflow set HAOS_TEST_IMAGE_PATH + HAOS_TEST_MODE=stdio "
+            f"but dispatch picked backend={backend!r}. The installed stdio "
+            "server is NOT being exercised by this run."
+        )
+        assert ha_container_with_fresh_config["container"] is None
+        assert ha_container_with_fresh_config["port"] is None
+        assert ha_container_with_fresh_config["config_path"] is None
+        assert ha_container_with_fresh_config.get("addon_mcp_url") is None
+        assert ha_container_with_fresh_config.get("embedded_webhook_url") is None
     elif image_path and mode == "embedded":
         # haos_embedded (#1527): a HAOS backend whose server-under-test is the
         # baked in-process MCP server, driven over its ingress webhook on the
@@ -224,16 +367,16 @@ async def test_supervisor_addon_tool_behavior_matches_backend(
     mcp_client: Any,
     ha_container_with_fresh_config: dict[str, Any],
 ) -> None:
-    """Behavioral cross-check: ``ha_get_addon`` must succeed on HAOS, fail on container.
+    """Behavioral cross-check: ``ha_get_app`` must succeed on HAOS, fail on container.
 
     Stronger guarantee than the dispatch-field check: conftest could
     self-report ``backend=container`` but actually have HAOS running
     (or vice versa). A real Supervisor only exists on HAOS — the HA
     Core testcontainer has no Supervisor service running. So:
 
-    - HAOS external + inaddon: ``ha_get_addon`` returns a populated
+    - HAOS external + inaddon: ``ha_get_app`` returns a populated
       addons list (the bake installs several addons).
-    - testcontainer: ``ha_get_addon`` raises ToolError
+    - testcontainer: ``ha_get_app`` raises ToolError
       (RESOURCE_NOT_FOUND from the ``supervisor/api`` WebSocket proxy
       because no Supervisor is running); ``safe_call_tool`` catches
       and decodes the structured error to ``{"success": False, ...}``.
@@ -244,16 +387,16 @@ async def test_supervisor_addon_tool_behavior_matches_backend(
     impersonate the other while keeping this test green.
     """
     backend = ha_container_with_fresh_config["backend"]
-    result = await safe_call_tool(mcp_client, "ha_get_addon", {})
+    result = await safe_call_tool(mcp_client, "ha_get_app", {})
 
-    # All HAOS backends run against a real Supervisor, so ha_get_addon succeeds —
+    # All HAOS backends run against a real Supervisor, so ha_get_app succeeds —
     # including haos_embedded, whose in-process server reaches Supervisor through
     # HA Core's supervisor/api WS proxy (it runs standalone with HA_MCP_EMBEDDED,
     # so it does not use SUPERVISOR_TOKEN directly, but the proxy path still works
     # because HA Core itself is supervised).
-    if backend in ("haos", "haos_inaddon", "haos_embedded"):
+    if backend in ("haos", "haos_stdio", "haos_inaddon", "haos_embedded"):
         assert result.get("success") is True, (
-            f"ha_get_addon failed on {backend} backend; Supervisor must "
+            f"ha_get_app failed on {backend} backend; Supervisor must "
             f"be running. Result: {result!r}"
         )
         # list_addons returns ``{"success": True, "addons": [...], "summary": {...}}``
@@ -265,9 +408,9 @@ async def test_supervisor_addon_tool_behavior_matches_backend(
             f"{addons!r}"
         )
     else:
-        # testcontainer has no Supervisor → ha_get_addon must fail
+        # testcontainer has no Supervisor → ha_get_app must fail
         assert result.get("success") is False, (
-            f"ha_get_addon unexpectedly succeeded on {backend} backend. "
+            f"ha_get_app unexpectedly succeeded on {backend} backend. "
             f"Testcontainer has no Supervisor service; success here "
             f"means we're actually running on HAOS but conftest reported "
             f"backend={backend!r}. Result: {result!r}"
@@ -282,8 +425,17 @@ def test_session_collected_test_count_above_floor(request: Any) -> None:
     reduced coverage. Collection count varies by a handful across
     modes (parametrize/fixture-driven — currently 912 container vs
     915 HAOS lanes); the floor sits well below all three lanes' actuals.
+
+    A combined session collects each test once per phase it runs in, so the
+    count is of distinct tests across both phases: a module that only runs
+    after installation still counts, and one that runs twice counts once.
     """
-    total = len(request.session.items)
+    total = len(
+        {
+            item.nodeid.replace(item_topology(item) or "", "")
+            for item in request.session.items
+        }
+    )
     assert total >= _COLLECTION_FLOOR, (
         f"Only {total} tests collected, expected >= {_COLLECTION_FLOOR}. "
         f"A test file likely failed to import, dropping coverage. Check "
@@ -295,7 +447,7 @@ def test_session_skipped_count_below_ceiling(
     request: Any,
     ha_container_with_fresh_config: dict[str, Any],
 ) -> None:
-    """Per-lane skip-count must stay below ``_SKIP_CEILING_PER_LANE[backend]``.
+    """Per-lane skip-count must stay below ``SKIP_CEILING_PER_LANE[backend]``.
 
     Catches the inverse of the collection-floor check: the suite still
     collects the expected total, but tests transition pass→skip silently
@@ -303,34 +455,77 @@ def test_session_skipped_count_below_ceiling(
     ``pytest_collection_modifyitems`` hook.
 
     The conftest itself documents a real prior incident of this kind
-    (the PR #1375 audit comment in ``tests/src/e2e/conftest.py`` — 14
+    (the PR #1375 audit comment in ``tests/src/e2e/_conftest_collection.py`` — 14
     ``supervisor_mock`` tests silently skipping on every testcontainer
     run because an ``external_only`` skip was scoped wrong). A
     skip-count ceiling per lane catches that whole class of bug.
 
     Ceilings are updated only when a PR legitimately introduces new
     marker-gated tests; runtime skips are deliberately excluded.
+
+    The no-tools lanes (#2292) skip a different set entirely, so they get
+    their own ``<backend>_no_tools`` keys rather than sharing the backend's.
     """
     backend = ha_container_with_fresh_config["backend"]
-    ceiling = _SKIP_CEILING_PER_LANE.get(backend)
+    if tools_entry_absent() and not combined_topologies():
+        lane = f"{backend}_no_tools"
+    else:
+        lane = backend
+    ceiling = SKIP_CEILING_PER_LANE.get(lane)
     assert ceiling is not None, (
-        f"Unknown backend {backend!r} — add to _SKIP_CEILING_PER_LANE "
-        f"at the top of this file"
+        f"Unknown lane {lane!r} — add to SKIP_CEILING_PER_LANE at the top of this file"
     )
+    if combined_topologies():
+        # The base lane's ceiling counts the no_tools_only tests as skips; a
+        # combined session runs them in its absent phase instead.
+        ceiling -= sum(
+            item.get_closest_marker("no_tools_only") is not None
+            for item in request.session.items
+        )
     # Items in request.session.items already have skip markers applied
     # by pytest_collection_modifyitems (which ran before any test).
     # Under pytest-xdist with --dist loadscope, each worker collects
     # the full session, so this count is consistent per worker.
+    # A combined session still collects the component-enabled coverage, split
+    # across phases. Count both phases against that lane's existing allowance;
+    # the larger no-tools allowance would hide skipped installed-phase tests.
     skipped = sum(
-        1
+        any(m.name == "skip" for m in item.iter_markers())
         for item in request.session.items
-        if any(m.name == "skip" for m in item.iter_markers())
     )
     assert skipped <= ceiling, (
-        f"{skipped} tests have skip markers on the {backend} lane, "
+        f"{skipped} tests have skip markers on the {lane} lane, "
         f"which exceeds the ceiling of {ceiling}. A marker may be "
         f"applied too broadly in pytest_collection_modifyitems — "
-        f"check pytest_collection_modifyitems in tests/src/e2e/conftest.py for recent changes. "
+        f"check pytest_collection_modifyitems in tests/src/e2e/_conftest_collection.py for recent changes. "
         f"If the increase is intentional (legitimate new marker-gated "
-        f"tests), bump _SKIP_CEILING_PER_LANE[{backend!r}] in this file."
+        f"tests), add the per-lane increments in a "
+        f"tests/src/e2e/basic/skip_ceiling/pr<N>.json fragment (see "
+        f"_SKIP_CEILING_BASELINE in this file) rather than editing the baseline."
     )
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        pytest.param({"reason": "r", "deltas": {"contaner": 1}}, id="typo-lane"),
+        pytest.param({"reason": "r", "deltas": {"container": True}}, id="bool-delta"),
+        pytest.param({"reason": "r", "deltas": {"container": 0}}, id="zero-delta"),
+        pytest.param({"reason": "r", "deltas": {"container": "1"}}, id="string-delta"),
+        pytest.param({"reason": " ", "deltas": {"container": 1}}, id="blank-reason"),
+        pytest.param({"reason": "r", "deltas": {}}, id="no-deltas"),
+        pytest.param(
+            {"reason": "r", "deltas": {"container": 1}, "x": 1}, id="extra-key"
+        ),
+        pytest.param(["reason", "deltas"], id="not-a-mapping"),
+    ],
+)
+def test_skip_ceiling_fragment_validator_rejects(fragment: Any) -> None:
+    """A fragment that could misroute or silently inflate a ceiling is refused.
+
+    The real fragments are validated at import, so a bad one never reaches a
+    test body; the validator's rejections are pinned here on synthetic input,
+    each error naming the offending file.
+    """
+    with pytest.raises(AssertionError, match=r"bad\.json"):
+        _validate_skip_ceiling_fragment("bad.json", fragment, _SKIP_CEILING_BASELINE)

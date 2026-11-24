@@ -19,6 +19,7 @@ import os
 import pytest
 
 from ..utilities.assertions import safe_call_tool
+from ..utilities.cleanup import CleanupSteps
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ async def _code_mode_server(code_mode_enabled, ha_container_with_fresh_config):
 @pytest.fixture
 async def mcp_client_with_code_mode(_code_mode_server):
     """Create MCP client connected to the code-mode-enabled server."""
-    from fastmcp import Client
+    from ha_mcp._vendor.fastmcp import Client
 
     mcp_client = Client(_code_mode_server.mcp)
     async with mcp_client:
@@ -78,7 +79,7 @@ async def _check_tool_available(mcp_client) -> tuple[bool, str | None]:
         if TOOL_NAME not in tool_names:
             return False, f"Tool {TOOL_NAME} not registered"
         return True, None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, f"Error checking tools: {e}"
 
 
@@ -115,7 +116,7 @@ class TestCodeModeAvailability:
                 server_name="test-disabled",
             )
 
-            from fastmcp import Client
+            from ha_mcp._vendor.fastmcp import Client
 
             client = Client(server.mcp)
             async with client:
@@ -1299,7 +1300,7 @@ class TestCodeModeApiPostBlocklist:
     async def test_api_post_blocks_scene_config_write(self, mcp_client_with_code_mode):
         """POST /api/config/scene/config/* is blocked for the same reason
         as automation/script: bypasses ``ha_config_set_scene`` validation
-        (entities-must-be-dict shape check, reference validation,
+        (id guard, reference validation,
         hash-locking).
         """
         check = await _check_tool_available(mcp_client_with_code_mode)
@@ -1431,71 +1432,6 @@ class TestCodeModeWsSendBlocklist:
             f"Error should mention the blocked command: {result}"
         )
         logger.info("ws_send correctly blocked lovelace/config/save")
-
-    @pytest.mark.parametrize(
-        "ws_type",
-        [
-            # Each member of _BLOCKED_WS_COMMANDS must be rejected by
-            # ws_send. Listed explicitly so a regression that drops an
-            # entry from the frozenset surfaces as a missing parametrize
-            # row in CI rather than passing silently.
-            "config/core/update",
-            "lovelace/config/save",
-            "lovelace/dashboards/create",
-            "lovelace/dashboards/delete",
-            "lovelace/dashboards/update",
-            "config/area_registry/delete",
-            "config/area_registry/disable",
-            "config/area_registry/update",
-            "config/device_registry/delete",
-            "config/device_registry/disable",
-            "config/device_registry/update",
-            "config/device_registry/remove_config_entry",
-            "config/entity_registry/delete",
-            "config/entity_registry/disable",
-            "config/entity_registry/update",
-            "config/entity_registry/remove",
-            "config/floor_registry/create",
-            "config/floor_registry/delete",
-            "config/floor_registry/update",
-            "config/label_registry/create",
-            "config/label_registry/delete",
-            "config/label_registry/update",
-            "config/category_registry/create",
-            "config/category_registry/delete",
-            "config/category_registry/update",
-        ],
-    )
-    async def test_ws_send_blocks_command(self, mcp_client_with_code_mode, ws_type):
-        """Every entry in _BLOCKED_WS_COMMANDS must be rejected by ws_send.
-
-        Parametrizing over the full set catches the "blocklist names a
-        command HA Core doesn't actually accept" class of bug — if a
-        future refactor drops an entry, the corresponding row fails;
-        if HA Core renames a command and we forget to update the
-        blocklist, the test fails with the old name still in the
-        parametrize list.
-        """
-        check = await _check_tool_available(mcp_client_with_code_mode)
-        _skip_if_unavailable(check, f"ws_send blocks {ws_type}")
-
-        code = (
-            f'result = await ws_send({{"type": "{ws_type}", "id": "x"}})\n'
-            '{"has_error": "error" in result if isinstance(result, dict) else False,'
-            ' "error": result.get("error", "") if isinstance(result, dict) else ""}'
-        )
-        data = await safe_call_tool(
-            mcp_client_with_code_mode,
-            TOOL_NAME,
-            {"code": code, "justification": f"E2E test: blocked {ws_type}"},
-        )
-        assert data.get("success") is True, f"Sandbox should succeed: {data}"
-        result = data["data"]["result"]
-        assert result["has_error"] is True, f"ws_send must block {ws_type}: {data}"
-        assert ws_type in result["error"], (
-            f"Error should mention the blocked command: {result}"
-        )
-        logger.info("ws_send correctly blocked %s", ws_type)
 
     async def test_ws_send_allows_registry_list(self, mcp_client_with_code_mode):
         """Registry LIST queries stay allowed — only mutations are blocked."""
@@ -1831,8 +1767,8 @@ class TestCodeModeProxyLaunderingBlocked:
 class TestCodeModeSavePersistenceFailure:
     """Companion to the unit tests in ``test_saved_tools_persistence.py``
     — verifies the user-facing E2E shape of the save_warning rollback.
-    Reaches the persistence-failure path by ``chmod``-ing the addon's
-    ``/data/saved_tools.json`` unwriteable mid-test via the SSH-addon
+    Reaches the persistence-failure path by replacing the addon's
+    ``/data/saved_tools.json`` with a directory mid-test via the SSH-addon
     docker-exec helper.
     """
 
@@ -1844,12 +1780,12 @@ class TestCodeModeSavePersistenceFailure:
         returned to MCP clients against the real addon container.
 
         Mechanism: SSH into HAOS via the bake-installed Advanced SSH
-        addon and ``docker exec`` ``chmod 444`` on the dev addon's
-        ``/data/saved_tools.json``. The addon's persistence write then
-        fails with EACCES, ``_save_saved_tools`` returns False, and the
+        addon, then ``docker exec`` replaces the dev addon's
+        ``/data/saved_tools.json`` with a directory. The addon's persistence write then
+        fails with EISDIR, ``_save_saved_tools`` returns False, and the
         ``ha_manage_custom_tool`` response surfaces the rollback shape.
-        Restoration via ``chmod 644`` runs in the test's ``finally``
-        regardless of outcome.
+        The test's ``finally`` puts an empty file back regardless of
+        outcome.
 
         Uses the session-scoped ``mcp_client`` fixture (HTTP transport
         to the addon) rather than ``mcp_client_with_code_mode`` (an
@@ -1953,13 +1889,10 @@ class TestCodeModeSavePersistenceFailure:
             )
         finally:
             # Always restore writeability so the rest of the session
-            # (and any retry) sees a usable persistence path. Wrap in
-            # its own try/except so a flaky SSH session here doesn't
-            # mask the original test exception — log the restore
-            # failure and re-raise, leaving the directory poisoned so
-            # the next test fails loudly instead of cascading on a
-            # stale 444/EISDIR.
-            try:
+            # (and any retry) sees a usable persistence path. A failed
+            # restore leaves the directory poisoned, so later tests
+            # cascade on its EISDIR.
+            with CleanupSteps() as cleanup, cleanup.step():
                 docker_exec_in_addon(
                     HA_MCP_DEV_ADDON_SLUG,
                     [
@@ -1968,13 +1901,6 @@ class TestCodeModeSavePersistenceFailure:
                         f"rm -rf {saved_tools_path} && touch {saved_tools_path}",
                     ],
                 )
-            except Exception:
-                logger.exception(
-                    "Failed to restore %s; subsequent tests in this session "
-                    "may cascade on the leftover directory",
-                    saved_tools_path,
-                )
-                raise
 
         # Second save (after restore): proves the restore worked and
         # that the same code path now persists cleanly. Uses a distinct

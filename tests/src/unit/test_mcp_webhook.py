@@ -1,1238 +1,552 @@
-"""Unit tests for the in-process embedded MCP server webhook ingress (#1527).
+"""Webhook auth gate and OAuth discovery documents of the component's own webhook.
 
-Covers the forwarding handler (header stripping, SSE streaming, session-id
-propagation, content-type coercion, error mapping), the two auth postures
-(``none`` secret-URL vs ``ha_auth`` bearer), the RFC 8414 / RFC 9728 discovery
-views, and the register/unregister lifecycle.
-
-Home Assistant and aiohttp are stubbed via ``_embedded_stubs`` (imported first so
-the fakes are installed before ``mcp_webhook`` binds them).
+Who the webhook lets through in ``ha_auth`` and ``legacy`` mode (#1527), and the
+RFC 8414 / RFC 9728 discovery documents it serves (#1527, #1969). The webhook is
+registered on a real ``hass``; every request goes through Core's HTTP server.
 """
 
 from __future__ import annotations
 
-import secrets
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Any
 
 import pytest
+from homeassistant.auth.models import TOKEN_TYPE_SYSTEM, User
+from homeassistant.core import HomeAssistant
+from pytest_homeassistant.common import MockUser
+from pytest_homeassistant.typing import ClientSessionGenerator
 
-from ._embedded_stubs import FakeSession, FakeUpstream, install, make_request
-
-# Install the HA / aiohttp sys.modules stubs BEFORE importing the component
-# modules below. This statement is also an isort barrier so the component imports
-# are never reordered above it (which would import mcp_webhook before the stubs
-# exist).
-install()
-
-import custom_components.ha_mcp_tools.mcp_webhook as mw  # noqa: E402
-from custom_components.ha_mcp_tools.const import (  # noqa: E402
-    DATA_WEBHOOK,
-    DATA_WEBHOOK_ID,
-    DOMAIN,
+import custom_components.ha_mcp_tools.mcp_webhook as mw
+from custom_components.ha_mcp_tools.const import (
     OAUTH_BASE,
     WEBHOOK_AUTH_HA,
     WEBHOOK_AUTH_LEGACY,
     WEBHOOK_AUTH_NONE,
 )
-from custom_components.ha_mcp_tools.oauth_legacy import (  # noqa: E402
-    OAUTH_ROUTE_OWNER_KEY,
-    LegacyOAuthProvider,
+
+from ._mcp_webhook_core import (
+    PUBLIC_HEADERS,
+    READONLY_PATH,
+    SECRET_PATH,
+    WEBHOOK_ID,
+    WEBHOOK_PATH,
+    Register,
+    Upstream,
+    legacy_provider,
+)
+from ._mcp_webhook_core import (
+    register as register,
+)
+from ._mcp_webhook_core import (
+    upstream as upstream,
 )
 
-TARGET_URL = "http://127.0.0.1:9584/private_aaaaaaaaaaaaaaaa"
-WEBHOOK_ID = "mcp_0123456789abcdef0123456789abcdef"
+CLIENT_ID = "https://example.com/app"
+
+AS_URL = f"{OAUTH_BASE}/authorization-server"
+AS_URLS = [
+    AS_URL,
+    f"/.well-known/oauth-authorization-server{OAUTH_BASE}",
+    f"/.well-known/openid-configuration{OAUTH_BASE}",
+    f"{OAUTH_BASE}/.well-known/openid-configuration",
+    f"{OAUTH_BASE}/.well-known/oauth-authorization-server",
+]
+PUBLIC = "https://abc.ui.nabu.casa"
+AUTH_MODES = [WEBHOOK_AUTH_HA, WEBHOOK_AUTH_LEGACY, WEBHOOK_AUTH_NONE]
 
 
-def _make_hass(*, validate_result=None, validate_side_effect=None) -> MagicMock:
-    """Build a fake hass with an auth token validator and empty data."""
-    hass = MagicMock(name="hass")
-    hass.data = {}
-    if validate_side_effect is not None:
-        hass.auth.async_validate_access_token = MagicMock(
-            side_effect=validate_side_effect
-        )
-    else:
-        hass.auth.async_validate_access_token = MagicMock(return_value=validate_result)
-    return hass
+def _prm_url(webhook_id: str) -> str:
+    return f"/.well-known/oauth-protected-resource/api/webhook/{webhook_id}"
 
 
-def _store_cfg(
-    hass: MagicMock,
-    *,
-    session: FakeSession,
-    auth_mode: str = WEBHOOK_AUTH_NONE,
-    resource_server: object | None = None,
-    oauth_provider: object | None = None,
-    autoapprove_provider: object | None = None,
+async def _document(client: Any, url: str = AS_URL) -> dict[str, Any]:
+    resp = await client.get(url, headers=PUBLIC_HEADERS)
+    assert resp.status == 200
+    document: dict[str, Any] = await resp.json()
+    return document
+
+
+async def _access_token(
+    hass: HomeAssistant, user: User, client_id: str | None, token_type: str | None
+) -> str:
+    refresh = await hass.auth.async_create_refresh_token(
+        user, client_id, token_type=token_type
+    )
+    return hass.auth.async_create_access_token(refresh)
+
+
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+# -- auth gate ------------------------------------------------------------
+
+
+async def test_ha_auth_admin_bearer_is_relayed(
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_access_token: str,
 ) -> None:
-    hass.data[DOMAIN] = {
-        DATA_WEBHOOK: {
-            "webhook_id": WEBHOOK_ID,
-            "target_url": TARGET_URL,
-            "session": session,
-            "auth_mode": auth_mode,
-            "resource_server": resource_server,
-            "oauth_provider": oauth_provider,
-            mw.CFG_AUTOAPPROVE_PROVIDER: autoapprove_provider,
-        }
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH, data=b"{}", headers=_bearer(hass_access_token)
+    )
+
+    assert resp.status == 200
+    assert [seen.path for seen in upstream.requests] == [SECRET_PATH]
+
+
+async def test_ha_auth_challenge_points_the_client_at_the_discovery_document(
+    register: Register, upstream: Upstream, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH,
+        data=b"{}",
+        headers={"Host": "example.nabu.casa", "X-Forwarded-Proto": "https"},
+    )
+
+    assert resp.status == 401
+    www = resp.headers["WWW-Authenticate"]
+    assert www.startswith("Bearer realm=")
+    assert 'realm="HA-MCP"' in www
+    assert (
+        'resource_metadata="https://example.nabu.casa'
+        f'/.well-known/oauth-protected-resource/api/webhook/{WEBHOOK_ID}"' in www
+    )
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        "Bearer nope",
+        "Bearer    ",
+        "Basic abc",
+    ],
+    ids=["invalid-token", "empty-token", "not-a-bearer-scheme"],
+)
+async def test_ha_auth_rejects_a_bad_authorization_header(
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    authorization: str,
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH, data=b"{}", headers={"Authorization": authorization}
+    )
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+async def test_ha_auth_rejects_a_valid_token_sent_under_another_scheme(
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_access_token: str,
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH,
+        data=b"{}",
+        headers={"Authorization": f"Basic {hass_access_token}"},
+    )
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+async def test_ha_auth_rejects_a_household_login_that_is_not_an_administrator(
+    hass: HomeAssistant,
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_read_only_user: MockUser,
+) -> None:
+    """The server acts with its own administrator token, so accepting any valid
+    login would hand every household member admin-equivalent control."""
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+    token = await _access_token(hass, hass_read_only_user, CLIENT_ID, None)
+
+    resp = await client.post(WEBHOOK_PATH, data=b"{}", headers=_bearer(token))
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+async def test_ha_auth_rejects_a_deactivated_administrator(
+    hass: HomeAssistant,
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    hass_access_token: str,
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+    await hass.auth.async_update_user(hass_admin_user, is_active=False)
+
+    resp = await client.post(
+        WEBHOOK_PATH, data=b"{}", headers=_bearer(hass_access_token)
+    )
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+async def test_ha_auth_rejects_a_system_generated_user(
+    hass: HomeAssistant,
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+    system_user = await hass.auth.async_create_system_user(
+        "service", group_ids=["system-admin"]
+    )
+    token = await _access_token(hass, system_user, None, TOKEN_TYPE_SYSTEM)
+
+    resp = await client.post(WEBHOOK_PATH, data=b"{}", headers=_bearer(token))
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+async def test_legacy_bearer_issued_by_the_provider_is_relayed(
+    register: Register, upstream: Upstream, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_LEGACY)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH,
+        data=b"{}",
+        headers=_bearer(legacy_provider().issue_access_token()),
+    )
+
+    assert resp.status == 200
+    assert len(upstream.requests) == 1
+
+
+async def test_legacy_missing_bearer_gets_a_401_challenge(
+    register: Register, upstream: Upstream, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_LEGACY)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH, data=b"{}", headers={"Host": "example.nabu.casa"}
+    )
+
+    assert resp.status == 401
+    assert resp.headers["WWW-Authenticate"].startswith("Bearer realm=")
+    assert upstream.requests == []
+
+
+async def test_legacy_rejects_a_forged_token(
+    register: Register, upstream: Upstream, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_LEGACY)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(WEBHOOK_PATH, data=b"{}", headers=_bearer("forged.token"))
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+async def test_legacy_refresh_token_is_not_an_access_bearer(
+    register: Register, upstream: Upstream, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    """A refresh token left in a client's bearer slot must not unlock the
+    webhook."""
+    await register(WEBHOOK_AUTH_LEGACY)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        WEBHOOK_PATH,
+        data=b"{}",
+        headers=_bearer(legacy_provider().issue_refresh_token()),
+    )
+
+    assert resp.status == 401
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "authorized"),
+    [
+        (WEBHOOK_AUTH_NONE, True),
+        (WEBHOOK_AUTH_HA, False),
+        (WEBHOOK_AUTH_LEGACY, False),
+    ],
+)
+async def test_readonly_alias_is_gated_like_the_webhook(
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    auth_mode: str,
+    authorized: bool,
+) -> None:
+    """The ``/readonly`` alias must not be a way around the auth gate."""
+    await register(auth_mode)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(READONLY_PATH, data=b"{}")
+
+    assert (resp.status == 200) is authorized
+    assert [seen.path for seen in upstream.requests] == (
+        [f"{SECRET_PATH}/readonly"] if authorized else []
+    )
+
+
+async def test_readonly_alias_relays_a_valid_bearer(
+    register: Register,
+    upstream: Upstream,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_access_token: str,
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.post(
+        READONLY_PATH, data=b"{}", headers=_bearer(hass_access_token)
+    )
+
+    assert resp.status == 200
+    assert [seen.path for seen in upstream.requests] == [f"{SECRET_PATH}/readonly"]
+
+
+# -- discovery documents --------------------------------------------------
+
+
+async def test_document_urls_follow_the_forwarded_public_host(
+    register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.get(
+        AS_URL,
+        headers={
+            "Host": "internal:8123",
+            "X-Forwarded-Host": "abc.ui.nabu.casa",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+
+    assert (await resp.json())["issuer"] == f"{PUBLIC}{OAUTH_BASE}"
+
+
+async def test_document_urls_fall_back_to_the_host_the_client_called(
+    register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    resp = await client.get(AS_URL)
+
+    assert (await resp.json())["issuer"] == (
+        f"http://{client.host}:{client.port}{OAUTH_BASE}"
+    )
+
+
+async def test_ha_auth_document_advertises_what_claude_selects_a_client_by(
+    register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    doc = await _document(await hass_client_no_auth())
+
+    assert doc["issuer"] == f"{PUBLIC}{OAUTH_BASE}"
+    assert doc["authorization_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/authorize"
+    assert doc["token_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/token"
+    assert doc["registration_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/register"
+    assert doc["response_types_supported"] == ["code"]
+    assert doc["code_challenge_methods_supported"] == ["S256"]
+    assert doc["token_endpoint_auth_methods_supported"] == ["none"]
+    assert doc["client_id_metadata_document_supported"] is True
+
+
+@pytest.mark.parametrize("url", AS_URLS)
+async def test_every_location_a_client_probes_serves_the_document(
+    register: Register, hass_client_no_auth: ClientSessionGenerator, url: str
+) -> None:
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+
+    doc = await _document(client, url)
+
+    assert doc == await _document(client, AS_URL)
+
+
+async def test_legacy_document_advertises_client_secret_auth(
+    register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    """Reverting the mode dispatch to always serve the ha_auth document would
+    leave a client that needs a pasted credential with no way to sign in."""
+    await register(WEBHOOK_AUTH_LEGACY)
+    doc = await _document(await hass_client_no_auth())
+
+    assert doc["authorization_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/authorize"
+    assert doc["token_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/token"
+    assert doc["code_challenge_methods_supported"] == ["S256"]
+    assert set(doc["token_endpoint_auth_methods_supported"]) == {
+        "client_secret_basic",
+        "client_secret_post",
     }
+    assert doc["grant_types_supported"] == ["authorization_code", "refresh_token"]
+    assert doc["issuer"] == f"{PUBLIC}{OAUTH_BASE}"
+    assert "registration_endpoint" not in doc
 
 
-# ---------------------------------------------------------------------------
-# Forwarding handler — no-auth (secret URL) posture
-# ---------------------------------------------------------------------------
+async def test_none_mode_document_fixes_what_home_assistants_root_document_lacks(
+    register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    """#1969: claude.ai's discovery otherwise lands on Home Assistant's root
+    document, which omits the ``none`` auth method and a registration endpoint."""
+    await register(WEBHOOK_AUTH_NONE)
+    doc = await _document(await hass_client_no_auth())
+
+    assert doc["issuer"] == f"{PUBLIC}{OAUTH_BASE}"
+    assert doc["authorization_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/authorize"
+    assert doc["token_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/token"
+    assert doc["registration_endpoint"] == f"{PUBLIC}{OAUTH_BASE}/register"
+    assert doc["response_types_supported"] == ["code"]
+    assert doc["grant_types_supported"] == ["authorization_code"]
+    assert doc["code_challenge_methods_supported"] == ["S256"]
+    assert doc["token_endpoint_auth_methods_supported"] == ["none"]
+    assert doc["client_id_metadata_document_supported"] is True
 
 
-class TestForwardingHandler:
-    async def test_missing_config_returns_503(self):
-        hass = _make_hass()  # no DATA_WEBHOOK stored
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.status == 503
+@pytest.mark.parametrize("mode", AUTH_MODES)
+async def test_active_auth_mode_names_the_registered_mode(
+    hass: HomeAssistant, register: Register, mode: str
+) -> None:
+    assert mw.active_auth_mode(hass) is None
 
-    async def test_post_forwards_method_body_and_target(self):
-        upstream = FakeUpstream(
-            status=200, headers={"Content-Type": "application/json"}, body=b'{"ok":1}'
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
+    await register(mode)
 
-        body = b'{"jsonrpc":"2.0","method":"initialize"}'
-        request = make_request(headers={"Content-Type": "application/json"}, body=body)
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
+    assert mw.active_auth_mode(hass) == mode
 
-        assert len(session.calls) == 1
-        call = session.calls[0]
-        assert call["method"] == "POST"
-        assert call["url"] == TARGET_URL
-        assert call["data"] == body
-        assert resp.status == 200
-        assert resp.body == b'{"ok":1}'
-        # Anti-buffering / no-transform headers are always set.
-        assert resp.headers["Cache-Control"] == "no-cache, no-transform"
-        assert resp.headers["Content-Encoding"] == "identity"
 
-    async def test_empty_body_forwards_none_not_empty_bytes(self):
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
+@pytest.mark.parametrize("mode", AUTH_MODES)
+async def test_documents_stop_when_the_entry_is_unloaded(
+    hass: HomeAssistant,
+    register: Register,
+    hass_client_no_auth: ClientSessionGenerator,
+    mode: str,
+) -> None:
+    """The views stay bound until Home Assistant restarts, so they must answer
+    404 rather than advertise a webhook that no longer exists."""
+    await register(mode)
+    client = await hass_client_no_auth()
+    assert (await client.get(AS_URL, headers=PUBLIC_HEADERS)).status == 200
 
-        await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request(body=b""))
-        assert session.calls[0]["data"] is None
+    await mw.async_unregister_webhook(hass)
 
-    async def test_hop_by_hop_and_authorization_headers_stripped(self):
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
+    assert mw.active_auth_mode(hass) is None
+    assert (await client.get(AS_URL, headers=PUBLIC_HEADERS)).status == 404
+    assert (await client.get(_prm_url(WEBHOOK_ID))).status == 404
 
-        request = make_request(
-            headers={
-                "Host": "example.nabu.casa",
-                "Content-Length": "42",
-                "Transfer-Encoding": "chunked",
-                "Connection": "keep-alive",
-                "Cookie": "session=secret",
-                "Authorization": "Bearer should-not-forward",
-                "Mcp-Session-Id": "sess-42",
-                "Content-Type": "application/json",
-                "X-Custom": "keep-me",
-            }
-        )
-        await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
 
-        forwarded = {k.lower(): v for k, v in session.calls[0]["headers"].items()}
-        for stripped in (
-            "host",
-            "content-length",
-            "transfer-encoding",
-            "connection",
-            "cookie",
-            "authorization",
-        ):
-            assert stripped not in forwarded, f"{stripped} should be stripped"
-        # Non-hop-by-hop headers pass through untouched.
-        assert forwarded["mcp-session-id"] == "sess-42"
-        assert forwarded["content-type"] == "application/json"
-        assert forwarded["x-custom"] == "keep-me"
+@pytest.mark.parametrize("mode", [WEBHOOK_AUTH_HA, WEBHOOK_AUTH_NONE])
+async def test_documents_stay_off_while_remote_access_is_disabled(
+    hass: HomeAssistant,
+    register: Register,
+    hass_client_no_auth: ClientSessionGenerator,
+    mode: str,
+) -> None:
+    """Local-only mode has no webhook, so nothing may advertise one."""
+    await register(mode)
+    client = await hass_client_no_auth()
+    assert (await client.get(AS_URL, headers=PUBLIC_HEADERS)).status == 200
+    await mw.async_unregister_webhook(hass)
 
-    async def test_mcp_session_id_propagated_from_upstream(self):
-        upstream = FakeUpstream(
-            status=200,
-            headers={"Content-Type": "application/json", "Mcp-Session-Id": "srv-77"},
-            body=b"{}",
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
+    await register(mode, register_endpoint=False)
 
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.headers["Mcp-Session-Id"] == "srv-77"
+    assert mw.active_auth_mode(hass) is None
+    assert (await client.get(AS_URL, headers=PUBLIC_HEADERS)).status == 404
+    assert (await client.get(_prm_url(WEBHOOK_ID))).status == 404
 
-    async def test_content_type_whitelist_coerces_unknown_to_json(self):
-        upstream = FakeUpstream(
-            status=200,
-            headers={"Content-Type": "text/html; charset=utf-8"},
-            body=b"<script>evil()</script>",
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
 
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.headers["Content-Type"] == "application/json"
+async def test_resource_document_follows_a_recreated_entry_to_its_new_id(
+    hass: HomeAssistant, register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    """Removing and re-adding the entry mints a new webhook id in the same Home
+    Assistant session: the already-bound view must serve the new id and stop
+    answering the old one, so whoever held it never learns the new one."""
+    await register(WEBHOOK_AUTH_HA)
+    client = await hass_client_no_auth()
+    first = await client.get(_prm_url(WEBHOOK_ID), headers=PUBLIC_HEADERS)
+    assert first.status == 200
+    await mw.async_unregister_webhook(hass)
 
-    async def test_json_content_type_preserved(self):
-        upstream = FakeUpstream(
-            status=200, headers={"Content-Type": "application/json"}, body=b"{}"
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
+    await register(WEBHOOK_AUTH_HA, webhook_id="mcp_second_entry_id")
 
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.headers["Content-Type"] == "application/json"
+    new = await client.get(_prm_url("mcp_second_entry_id"), headers=PUBLIC_HEADERS)
+    assert new.status == 200
+    assert (await new.json())["resource"] == f"{PUBLIC}/api/webhook/mcp_second_entry_id"
+    assert (
+        await client.get(_prm_url(WEBHOOK_ID), headers=PUBLIC_HEADERS)
+    ).status == 404
 
-    async def test_text_plain_landing_content_type_preserved(self):
-        # The server's friendly landing page (a plain-text 405 shown to a browser
-        # that GETs the endpoint) must forward as text/plain, not be relabeled
-        # application/json — so it renders as readable text through the ingress URL.
-        # text/plain is XSS-safe; text/html (below) stays coerced.
-        upstream = FakeUpstream(
-            status=405,
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-            body=b"HA-MCP server is up and running!",
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
 
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.status == 405
-        assert resp.headers["Content-Type"] == "text/plain; charset=utf-8"
-        assert resp.body == b"HA-MCP server is up and running!"
-
-    async def test_sse_branch_streams_chunks_with_anti_buffering_headers(self):
-        chunks = [b"event: message\ndata: 1\n\n", b"data: 2\n\n"]
-        upstream = FakeUpstream(
-            status=200,
-            headers={"Content-Type": "text/event-stream"},
-            chunks=chunks,
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
-
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-
-        assert isinstance(resp, mw.web.StreamResponse)
-        assert resp.prepared is True
-        assert resp.written == chunks
-        assert resp.eof is True
-        assert resp.headers["Content-Type"] == "text/event-stream"
-        assert resp.headers["X-Accel-Buffering"] == "no"
-        assert resp.headers["Content-Encoding"] == "identity"
-        assert resp.headers["Cache-Control"] == "no-cache, no-transform"
-
-    async def test_sse_propagates_session_id(self):
-        upstream = FakeUpstream(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Mcp-Session-Id": "stream-sess",
-            },
-            chunks=[b"data: x\n\n"],
-        )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
-
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.headers["Mcp-Session-Id"] == "stream-sess"
-
-    async def test_sse_mid_stream_drop_logs_forwarded_bytes_and_ends_stream(
-        self, caplog
+async def test_switching_modes_serves_each_mode_document_without_rebinding(
+    hass: HomeAssistant, register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    """aiohttp cannot rebind a view: a none -> ha_auth -> legacy -> none cycle in
+    one Home Assistant session must reuse the bound views, and each document
+    must be the one for the mode that is live now."""
+    client = await hass_client_no_auth()
+    for mode in (
+        WEBHOOK_AUTH_NONE,
+        WEBHOOK_AUTH_HA,
+        WEBHOOK_AUTH_LEGACY,
+        WEBHOOK_AUTH_NONE,
+        WEBHOOK_AUTH_HA,
     ):
-        chunk = b"data: 1\n\n"
-        upstream = FakeUpstream(
-            status=200,
-            headers={"Content-Type": "text/event-stream"},
-            chunks=[chunk],
-            stream_exc=mw.aiohttp.ClientError("upstream reset"),
+        await register(mode)
+        doc = await _document(client)
+        assert ("refresh_token" in doc["grant_types_supported"]) == (
+            mode != WEBHOOK_AUTH_NONE
         )
-        session = FakeSession(upstream=upstream)
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
-
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-
-        # The prepared stream is ended deterministically, not remapped to 502.
-        assert isinstance(resp, mw.web.StreamResponse)
-        assert resp.written == [chunk]
-        assert resp.eof is True
-        assert f"dropped mid-stream after {len(chunk)} bytes" in caplog.text
-
-    async def test_client_error_maps_to_502(self):
-        session = FakeSession(exc=mw.aiohttp.ClientError("connection refused"))
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
-
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.status == 502
-
-    async def test_unexpected_error_maps_to_500(self):
-        session = FakeSession(exc=RuntimeError("boom"))
-        hass = _make_hass()
-        _store_cfg(hass, session=session)
-
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, make_request())
-        assert resp.status == 500
-
-    async def test_none_mode_forwards_200_and_ignores_bearer(self):
-        # #1969: none mode advertises an auto-approve authorization server, but
-        # the FORWARDER must still never 401 and never validate a bearer — the
-        # secret webhook URL is the credential and the OAuth token is cosmetic.
-        session = FakeSession(upstream=FakeUpstream(status=200, body=b"{}"))
-        hass = _make_hass()
-        _store_cfg(hass, session=session, autoapprove_provider=mw.AutoApproveProvider())
-
-        request = make_request(
-            headers={"Authorization": "Bearer whatever-cosmetic-or-forged"}
-        )
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-
-        assert resp.status == 200
-        assert len(session.calls) == 1  # forwarded upstream, not challenged
-        request.read.assert_awaited()
-
-
-# ---------------------------------------------------------------------------
-# Auth gate — ha_auth posture
-# ---------------------------------------------------------------------------
-
-
-class TestHaAuthGate:
-    def _provider(self, hass):
-        return mw.ResourceServer(hass, WEBHOOK_ID)
-
-    async def test_valid_bearer_passes_through(self):
-        hass = _make_hass(
-            validate_result=SimpleNamespace(
-                id="refresh-token",
-                user=SimpleNamespace(
-                    is_admin=True, is_active=True, system_generated=False
-                ),
-            )
-        )
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_HA,
-            resource_server=self._provider(hass),
-        )
-
-        request = make_request(headers={"Authorization": "Bearer good-token"})
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-
-        assert len(session.calls) == 1  # forwarded upstream
-        assert resp.status == 200
-        request.read.assert_awaited()
-
-    async def test_missing_bearer_returns_401_challenge(self):
-        hass = _make_hass(validate_result=None)
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_HA,
-            resource_server=self._provider(hass),
-        )
-
-        request = make_request(headers={"Host": "example.nabu.casa"})
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-
-        assert resp.status == 401
-        assert session.calls == []  # never forwarded upstream
-        request.read.assert_not_awaited()  # short-circuited before read
-        www = resp.headers["WWW-Authenticate"]
-        assert www.startswith("Bearer realm=")
-        assert 'realm="HA-MCP"' in www
         assert (
-            f'resource_metadata="https://example.nabu.casa{OAUTH_BASE}/protected-resource"'
-            in www
-        )
-
-    async def test_invalid_bearer_returns_401(self):
-        hass = _make_hass(validate_result=None)  # validator rejects
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_HA,
-            resource_server=self._provider(hass),
-        )
-
-        request = make_request(headers={"Authorization": "Bearer nope"})
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-        assert resp.status == 401
-        assert session.calls == []
-
-
-# ---------------------------------------------------------------------------
-# Auth gate — legacy OAuth posture (self-issued bearer)
-# ---------------------------------------------------------------------------
-
-
-class TestLegacyAuthGate:
-    def _provider(self) -> LegacyOAuthProvider:
-        # A real provider so the actual HMAC token codec runs inside the gate.
-        return LegacyOAuthProvider(
-            "cid", "secret", secrets.token_bytes(32), lambda: WEBHOOK_AUTH_LEGACY
-        )
-
-    async def test_valid_legacy_bearer_passes_through(self):
-        hass = _make_hass()
-        provider = self._provider()
-        token = provider.issue_access_token()
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_LEGACY,
-            oauth_provider=provider,
-        )
-
-        request = make_request(headers={"Authorization": f"Bearer {token}"})
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-
-        assert len(session.calls) == 1  # forwarded upstream
-        assert resp.status == 200
-        request.read.assert_awaited()
-
-    async def test_missing_legacy_bearer_returns_401_challenge(self):
-        hass = _make_hass()
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_LEGACY,
-            oauth_provider=self._provider(),
-        )
-
-        request = make_request(headers={"Host": "example.nabu.casa"})
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-
-        assert resp.status == 401
-        assert session.calls == []  # never forwarded upstream
-        request.read.assert_not_awaited()  # short-circuited before read
-        assert resp.headers["WWW-Authenticate"].startswith("Bearer realm=")
-
-    async def test_invalid_legacy_bearer_returns_401(self):
-        hass = _make_hass()
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_LEGACY,
-            oauth_provider=self._provider(),
-        )
-
-        request = make_request(headers={"Authorization": "Bearer forged.token"})
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-        assert resp.status == 401
-        assert session.calls == []
-
-    async def test_refresh_token_is_rejected_as_access_bearer(self):
-        # A refresh token must not authorize the webhook (wrong token kind).
-        hass = _make_hass()
-        provider = self._provider()
-        session = FakeSession(upstream=FakeUpstream(status=200))
-        _store_cfg(
-            hass,
-            session=session,
-            auth_mode=WEBHOOK_AUTH_LEGACY,
-            oauth_provider=provider,
-        )
-
-        request = make_request(
-            headers={"Authorization": f"Bearer {provider.issue_refresh_token()}"}
-        )
-        resp = await mw._async_handle_webhook(hass, WEBHOOK_ID, request)
-        assert resp.status == 401
-        assert session.calls == []
-
-
-class TestResourceServerValidation:
-    def _provider(self, **kw):
-        hass = _make_hass(**kw)
-        return mw.ResourceServer(hass, WEBHOOK_ID), hass
-
-    async def test_no_authorization_header_is_unauthorized(self):
-        provider, _ = self._provider(validate_result=object())
-        assert await provider.validate_request(make_request(headers={})) is False
-
-    async def test_non_bearer_scheme_is_unauthorized(self):
-        provider, hass = self._provider(validate_result=object())
-        request = make_request(headers={"Authorization": "Basic abc"})
-        assert await provider.validate_request(request) is False
-        hass.auth.async_validate_access_token.assert_not_called()
-
-    async def test_empty_bearer_token_is_unauthorized(self):
-        provider, hass = self._provider(validate_result=object())
-        request = make_request(headers={"Authorization": "Bearer    "})
-        assert await provider.validate_request(request) is False
-        hass.auth.async_validate_access_token.assert_not_called()
-
-    @staticmethod
-    def _token_for(*, is_admin=True, is_active=True, system_generated=False):
-        return SimpleNamespace(
-            id="rt",
-            user=SimpleNamespace(
-                is_admin=is_admin,
-                is_active=is_active,
-                system_generated=system_generated,
-            ),
-        )
-
-    async def test_valid_admin_token_authorized(self):
-        provider, _ = self._provider(validate_result=self._token_for())
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is True
-
-    async def test_non_admin_token_is_unauthorized(self):
-        # SECURITY CONTRACT (round-1 HIGH, restored after the original fix was
-        # lost in transit): the server acts with its own provisioned ADMIN
-        # token, so a non-admin household login must NOT be accepted.
-        provider, _ = self._provider(validate_result=self._token_for(is_admin=False))
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is False
-
-    async def test_inactive_user_is_unauthorized(self):
-        provider, _ = self._provider(validate_result=self._token_for(is_active=False))
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is False
-
-    async def test_system_generated_user_is_unauthorized(self):
-        provider, _ = self._provider(
-            validate_result=self._token_for(system_generated=True)
-        )
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is False
-
-    async def test_userless_refresh_token_is_unauthorized(self):
-        provider, _ = self._provider(validate_result=SimpleNamespace(id="rt"))
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is False
-
-    async def test_validator_none_is_unauthorized(self):
-        provider, _ = self._provider(validate_result=None)
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is False
-
-    async def test_validator_raise_is_unauthorized_not_500(self):
-        provider, _ = self._provider(validate_side_effect=ValueError("bad token"))
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is False
-
-    async def test_awaitable_validator_result_is_awaited(self):
-        hass = _make_hass()
-
-        async def _async_validate(_token):
-            return SimpleNamespace(
-                id="rt",
-                user=SimpleNamespace(
-                    is_admin=True, is_active=True, system_generated=False
-                ),
-            )
-
-        hass.auth.async_validate_access_token = MagicMock(side_effect=_async_validate)
-        provider = mw.ResourceServer(hass, WEBHOOK_ID)
-        request = make_request(headers={"Authorization": "Bearer tok"})
-        assert await provider.validate_request(request) is True
-
-
-# ---------------------------------------------------------------------------
-# Discovery documents (RFC 8414 / RFC 9728)
-# ---------------------------------------------------------------------------
-
-
-def _live_hass(
-    auth_mode: str = WEBHOOK_AUTH_HA, webhook_id: str = WEBHOOK_ID
-) -> MagicMock:
-    hass = _make_hass()
-    # Mirrors async_register_webhook's runtime cfg: the views resolve the
-    # ACTIVE provider from here per request (stale-binding fix).
-    hass.data[DOMAIN] = {
-        DATA_WEBHOOK: {
-            "webhook_id": webhook_id,
-            "auth_mode": auth_mode,
-            # Mirror production: a resource_server exists only in ha_auth mode
-            # (active_auth_mode keys off its presence, not the auth_mode string).
-            "resource_server": (
-                mw.ResourceServer(hass, webhook_id)
-                if auth_mode == WEBHOOK_AUTH_HA
-                else None
-            ),
-            # ...and an oauth_provider only in legacy mode, same presence rule.
-            "oauth_provider": (
-                LegacyOAuthProvider(
-                    "cid",
-                    "secret",
-                    secrets.token_bytes(32),
-                    lambda: WEBHOOK_AUTH_LEGACY,
-                )
-                if auth_mode == WEBHOOK_AUTH_LEGACY
-                else None
-            ),
-        }
-    }
-    return hass
-
-
-class TestDiscoveryViews:
-    def test_build_base_url_prefers_forwarded_headers(self):
-        request = make_request(
-            headers={
-                "Host": "internal:8123",
-                "X-Forwarded-Host": "abc.ui.nabu.casa",
-                "X-Forwarded-Proto": "https",
-            },
-            scheme="http",
-        )
-        assert mw._build_base_url(request) == "https://abc.ui.nabu.casa"
-
-    def test_build_base_url_falls_back_to_request(self):
-        request = make_request(headers={"Host": "ha.local:8123"}, scheme="http")
-        assert mw._build_base_url(request) == "http://ha.local:8123"
-
-    def test_authorization_server_document_shape(self):
-        doc = mw._authorization_server_document("https://x.nabu.casa")
-        assert doc["issuer"] == f"https://x.nabu.casa{OAUTH_BASE}"
-        assert doc["authorization_endpoint"] == "https://x.nabu.casa/auth/authorize"
-        assert doc["token_endpoint"] == "https://x.nabu.casa/auth/token"
-        assert doc["response_types_supported"] == ["code"]
-        assert doc["code_challenge_methods_supported"] == ["S256"]
-        assert doc["token_endpoint_auth_methods_supported"] == ["none"]
-        assert doc["client_id_metadata_document_supported"] is True
-        assert "registration_endpoint" not in doc
-
-    async def test_protected_resource_view_payload_when_live(self):
-        hass = _live_hass()
-        view = mw._ProtectedResourceMetadataView(hass)
-        request = make_request(headers={"Host": "abc.ui.nabu.casa"})
-        resp = await view.get(request)
-        assert resp.status == 200
-        body = resp.json_body
-        assert body["resource"] == f"https://abc.ui.nabu.casa/api/webhook/{WEBHOOK_ID}"
-        assert body["authorization_servers"] == [
-            f"https://abc.ui.nabu.casa{OAUTH_BASE}"
-        ]
-        assert body["bearer_methods_supported"] == ["header"]
-
-    async def test_protected_resource_view_404_when_not_live(self):
-        hass = _live_hass(auth_mode=WEBHOOK_AUTH_NONE)
-        view = mw._ProtectedResourceMetadataView(hass)
-        resp = await view.get(make_request(headers={"Host": "x"}))
-        assert resp.status == 404
-
-    async def test_authorization_server_view_payload_when_live(self):
-        hass = _live_hass()
-        view = mw._AuthorizationServerMetadataView(hass)
-        resp = await view.get(make_request(headers={"Host": "abc.ui.nabu.casa"}))
-        assert resp.status == 200
-        assert resp.json_body["token_endpoint"] == "https://abc.ui.nabu.casa/auth/token"
-
-    async def test_authorization_server_view_404_when_entry_unloaded(self):
-        hass = _make_hass()  # no DOMAIN data at all
-        view = mw._AuthorizationServerMetadataView(hass)
-        resp = await view.get(make_request(headers={"Host": "x"}))
-        assert resp.status == 404
-
-    async def test_authorization_server_view_serves_legacy_document(self):
-        # Review gap: the legacy RFC 8414 document had no shape assertions
-        # anywhere -- reverting the mode dispatch to always serve the ha_auth
-        # document would not have failed any test.
-        hass = _live_hass(auth_mode=WEBHOOK_AUTH_LEGACY)
-        view = mw._AuthorizationServerMetadataView(hass)
-        resp = await view.get(make_request(headers={"Host": "abc.ui.nabu.casa"}))
-        assert resp.status == 200
-        doc = resp.json_body
-        assert doc["authorization_endpoint"] == (
-            f"https://abc.ui.nabu.casa{mw.AUTHORIZE_PATH}"
-        )
-        assert doc["token_endpoint"] == f"https://abc.ui.nabu.casa{mw.TOKEN_PATH}"
-        assert doc["code_challenge_methods_supported"] == ["S256"]
-        assert set(doc["token_endpoint_auth_methods_supported"]) == {
-            "client_secret_basic",
-            "client_secret_post",
-        }
-        assert doc["grant_types_supported"] == [
-            "authorization_code",
-            "refresh_token",
-        ]
-
-    async def test_protected_resource_views_live_in_legacy_mode(self):
-        hass = _live_hass(auth_mode=WEBHOOK_AUTH_LEGACY)
-        plain = mw._ProtectedResourceMetadataView(hass)
-        resp = await plain.get(make_request(headers={"Host": "abc.ui.nabu.casa"}))
-        assert resp.status == 200
-
-    def test_wellknown_protected_resource_url_is_parameterized(self):
-        # Stale-binding fix: the webhook id is a route PARAMETER, so the one
-        # bound view serves whichever entry is currently live (a remove+re-add
-        # mints a new id in the same HA session).
-        assert mw._WellKnownProtectedResourceView.url == (
-            "/.well-known/oauth-protected-resource/api/webhook/{webhook_id}"
-        )
-
-    async def test_wellknown_protected_resource_serves_only_current_id(self):
-        hass = _live_hass()
-        view = mw._WellKnownProtectedResourceView(hass)
-        request = make_request(headers={"Host": "abc.ui.nabu.casa"})
-        ok = await view.get(request, webhook_id=WEBHOOK_ID)
-        assert ok.status == 200
-        stale = await view.get(request, webhook_id="mcp_stale_previous_entry")
-        assert stale.status == 404
-
-    async def test_views_serve_new_provider_after_entry_recreate(self):
-        # The live-found stale-binding scenario: views registered during the
-        # FIRST entry keep working for a SECOND entry with a new webhook id.
-        hass = _live_hass()
-        view = mw._ProtectedResourceMetadataView(hass)
-        hass.data[DOMAIN][DATA_WEBHOOK] = {
-            "webhook_id": "mcp_second_entry_id",
-            "auth_mode": WEBHOOK_AUTH_HA,
-            "resource_server": mw.ResourceServer(hass, "mcp_second_entry_id"),
-        }
-        resp = await view.get(make_request(headers={"Host": "abc.ui.nabu.casa"}))
-        assert resp.status == 200
-        assert resp.json_body["resource"] == (
-            "https://abc.ui.nabu.casa/api/webhook/mcp_second_entry_id"
-        )
-
-    def test_metadata_views_bundle_is_seven_unique_named_views(self):
-        views = mw._metadata_views(_make_hass())
-        assert len(views) == 7
-        names = {v.name for v in views}
-        assert len(names) == 7  # all unique route names
-        urls = {v.url for v in views}
-        assert len(urls) == 7  # all unique route paths
-
-
-# ---------------------------------------------------------------------------
-# None-mode auto-approve discovery (issue #1969)
-# ---------------------------------------------------------------------------
-
-
-def _none_live_hass(webhook_id: str = WEBHOOK_ID) -> MagicMock:
-    """A hass whose live webhook cfg is none-mode auto-approve (provider set) —
-    mirrors what async_register_webhook stores in none mode with the endpoint
-    enabled. Distinct from _live_hass(WEBHOOK_AUTH_NONE), which models the
-    local-only cfg (no provider) that advertises nothing."""
-    hass = _make_hass()
-    hass.data[DOMAIN] = {
-        DATA_WEBHOOK: {
-            "webhook_id": webhook_id,
-            "auth_mode": WEBHOOK_AUTH_NONE,
-            "resource_server": None,
-            "oauth_provider": None,
-            mw.CFG_AUTOAPPROVE_PROVIDER: mw.AutoApproveProvider(),
-        }
-    }
-    return hass
-
-
-class TestNoneModeDiscovery:
-    def test_none_mode_as_document_shape(self):
-        doc = mw._none_mode_authorization_server_document("https://x.nabu.casa")
-        assert doc["issuer"] == f"https://x.nabu.casa{OAUTH_BASE}"
-        # Points at OUR auto-approve endpoints, NOT HA core's /auth/*.
-        assert (
-            doc["authorization_endpoint"]
-            == f"https://x.nabu.casa{OAUTH_BASE}/authorize"
-        )
-        assert doc["token_endpoint"] == f"https://x.nabu.casa{OAUTH_BASE}/token"
-        assert doc["response_types_supported"] == ["code"]
-        assert doc["grant_types_supported"] == ["authorization_code"]
-        assert doc["code_challenge_methods_supported"] == ["S256"]
-        # The two fields HA core's root doc lacks — the whole reason for #1969.
-        assert doc["token_endpoint_auth_methods_supported"] == ["none"]
-        assert doc["client_id_metadata_document_supported"] is True
-
-    def test_active_auth_mode_reports_none_when_autoapprove_live(self):
-        assert mw.active_auth_mode(_none_live_hass()) == WEBHOOK_AUTH_NONE
-
-    async def test_as_view_serves_none_document_when_live(self):
-        hass = _none_live_hass()
-        view = mw._AuthorizationServerMetadataView(hass)
-        resp = await view.get(make_request(headers={"Host": "abc.ui.nabu.casa"}))
-        assert resp.status == 200
-        doc = resp.json_body
-        assert doc["authorization_endpoint"] == (
-            f"https://abc.ui.nabu.casa{OAUTH_BASE}/authorize"
-        )
-        assert doc["token_endpoint_auth_methods_supported"] == ["none"]
-
-    async def test_fixed_path_protected_resource_404s_in_none_mode(self):
-        # SECURITY (#1976): the fixed, guessable /protected-resource path must
-        # NOT leak the webhook id (the sole credential in none mode) to an
-        # anonymous GET. It 404s in none mode, serving only the bearer-gated
-        # modes (see test_protected_resource_view_payload_when_live for ha_auth).
-        hass = _none_live_hass()
-        request = make_request(headers={"Host": "abc.ui.nabu.casa"})
-        plain = mw._ProtectedResourceMetadataView(hass)
-        assert (await plain.get(request)).status == 404
-
-    async def test_path_scoped_protected_resource_still_serves_in_none_mode(self):
-        # The path-scoped view claude.ai's none-mode discovery actually uses
-        # KEEPS serving: its URL embeds the id (a route param), so the caller
-        # already knows it — no leak (#1976).
-        hass = _none_live_hass()
-        request = make_request(headers={"Host": "abc.ui.nabu.casa"})
-        wellknown = mw._WellKnownProtectedResourceView(hass)
-        wk_resp = await wellknown.get(request, webhook_id=WEBHOOK_ID)
-        assert wk_resp.status == 200
-        assert wk_resp.json_body["resource"] == (
-            f"https://abc.ui.nabu.casa/api/webhook/{WEBHOOK_ID}"
-        )
-        assert wk_resp.json_body["authorization_servers"] == [
-            f"https://abc.ui.nabu.casa{OAUTH_BASE}"
-        ]
-
-    async def test_as_document_switches_on_mode_flip_without_rebinding(self):
-        # Hard requirement: with the ONE bound AS view, flipping the live mode
-        # none -> ha_auth -> none swaps which document is served, all by
-        # mutating hass.data cfg (no re-bind, no restart).
-        hass = _none_live_hass()
-        view = mw._AuthorizationServerMetadataView(hass)  # bound once
-        request = make_request(headers={"Host": "abc.ui.nabu.casa"})
-
-        none_doc = (await view.get(request)).json_body
-        assert none_doc["authorization_endpoint"] == (
-            f"https://abc.ui.nabu.casa{OAUTH_BASE}/authorize"
-        )
-
-        # Flip to ha_auth: HA-core-pointing document.
-        hass.data[DOMAIN][DATA_WEBHOOK] = {
-            "webhook_id": WEBHOOK_ID,
-            "auth_mode": WEBHOOK_AUTH_HA,
-            "resource_server": mw.ResourceServer(hass, WEBHOOK_ID),
-            "oauth_provider": None,
-            mw.CFG_AUTOAPPROVE_PROVIDER: None,
-        }
-        ha_doc = (await view.get(request)).json_body
-        assert (
-            ha_doc["authorization_endpoint"]
-            == "https://abc.ui.nabu.casa/auth/authorize"
-        )
-
-        # Flip back to none: auto-approve document again.
-        hass.data[DOMAIN][DATA_WEBHOOK] = {
-            "webhook_id": WEBHOOK_ID,
-            "auth_mode": WEBHOOK_AUTH_NONE,
-            "resource_server": None,
-            "oauth_provider": None,
-            mw.CFG_AUTOAPPROVE_PROVIDER: mw.AutoApproveProvider(),
-        }
-        back_doc = (await view.get(request)).json_body
-        assert back_doc["authorization_endpoint"] == (
-            f"https://abc.ui.nabu.casa{OAUTH_BASE}/authorize"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Registration / teardown
-# ---------------------------------------------------------------------------
-
-
-def _register_hass() -> MagicMock:
-    hass = _make_hass()
-    hass.data = {}
-    hass.config = SimpleNamespace(components={"webhook"})  # skip async_setup_component
-    hass.http = MagicMock()
-    return hass
-
-
-def _entry() -> MagicMock:
-    entry = MagicMock()
-    entry.data = {DATA_WEBHOOK_ID: WEBHOOK_ID}
-    return entry
-
-
-class TestRegisterWebhook:
-    @pytest.fixture(autouse=True)
-    def _reset_registration_state(self):
-        # async_register / async_unregister are module-global MagicMocks shared
-        # across tests; reset call history and any injected side effect so each
-        # registration test starts clean (the per-session views guard lives in
-        # hass.data, which is fresh per test).
-        mw.async_register.reset_mock(side_effect=True)
-        mw.async_unregister.reset_mock(side_effect=True)
-        yield
-        mw.async_register.reset_mock(side_effect=True)
-        mw.async_unregister.reset_mock(side_effect=True)
-
-    async def test_none_auth_registers_and_stores_cfg(self, monkeypatch):
-        hass = _register_hass()
-        fake_session = FakeSession()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: fake_session)
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-        )
-
-        cfg = hass.data[DOMAIN][DATA_WEBHOOK]
-        assert cfg["auth_mode"] == WEBHOOK_AUTH_NONE
-        assert cfg["target_url"] == "http://127.0.0.1:9584/private_x"
-        assert cfg["resource_server"] is None
-        mw.async_register.assert_called_once()
-        # Reload-safe: clears any stale registration before (re)registering.
-        mw.async_unregister.assert_called_once_with(hass, WEBHOOK_ID)
-
-    async def test_none_auth_binds_discovery_and_autoapprove_views(self, monkeypatch):
-        # #1969: none mode now serves our corrected discovery + the auto-approve
-        # authorization server, so it binds the 7 discovery views AND the 2
-        # auto-approve views and registers an AutoApproveProvider in cfg.
-        hass = _register_hass()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-        assert mw._OAUTH_VIEWS_REGISTERED_KEY not in hass.data
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-        )
-
-        cfg = hass.data[DOMAIN][DATA_WEBHOOK]
-        assert isinstance(cfg[mw.CFG_AUTOAPPROVE_PROVIDER], mw.AutoApproveProvider)
-        assert cfg["resource_server"] is None
-        assert cfg["oauth_provider"] is None
-        # 7 discovery views + 2 auto-approve views.
-        assert hass.http.register_view.call_count == 9
-        assert mw.active_auth_mode(hass) == WEBHOOK_AUTH_NONE
-
-    async def test_none_ha_auth_none_switch_reuses_bound_views(self, monkeypatch):
-        # aiohttp cannot rebind a view; a none->ha_auth->none cycle in one HA
-        # session must REUSE the already-bound view bundles (no new bindings, no
-        # raise) while active_auth_mode swaps which document is served.
-        hass = _register_hass()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-        )
-        assert hass.http.register_view.call_count == 9
-        assert mw.active_auth_mode(hass) == WEBHOOK_AUTH_NONE
+            "client_secret_basic" in doc["token_endpoint_auth_methods_supported"]
+        ) == (mode == WEBHOOK_AUTH_LEGACY)
         await mw.async_unregister_webhook(hass)
 
-        # Switch to ha_auth: discovery views already bound (guarded), the
-        # auto-approve views are simply left bound (they 404 while inactive).
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_HA,
-        )
-        assert hass.http.register_view.call_count == 9
-        assert mw.active_auth_mode(hass) == WEBHOOK_AUTH_HA
+
+async def test_no_fixed_path_document_reveals_the_webhook_id_in_any_mode(
+    hass: HomeAssistant, register: Register, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    """SECURITY (#1976): a document reachable without already holding the id must
+    never carry it; a fixed-path protected-resource document once did, and a
+    later switch back to none mode, where the id is the only credential, turned
+    that into a credential disclosure."""
+    client = await hass_client_no_auth()
+    fixed_urls = [
+        *AS_URLS,
+        "/.well-known/oauth-protected-resource",
+        f"/.well-known/oauth-protected-resource{OAUTH_BASE}",
+        f"{OAUTH_BASE}/.well-known/oauth-protected-resource",
+    ]
+    for mode in AUTH_MODES:
+        await register(mode)
+        assert mw.active_auth_mode(hass) == mode
+        assert (await client.get(AS_URL, headers=PUBLIC_HEADERS)).status == 200
+        for url in fixed_urls:
+            resp = await client.get(url, headers=PUBLIC_HEADERS)
+            assert WEBHOOK_ID not in await resp.text(), url
         await mw.async_unregister_webhook(hass)
-
-        # Switch back to none: still no re-bind, auto-approve live again.
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-        )
-        assert hass.http.register_view.call_count == 9
-        assert mw.active_auth_mode(hass) == WEBHOOK_AUTH_NONE
-
-    async def test_ha_auth_registers_resource_server_and_views(self, monkeypatch):
-        hass = _register_hass()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-        # Fresh hass ⇒ the once-per-session guard flag is absent, so this run
-        # binds the discovery views.
-        assert mw._OAUTH_VIEWS_REGISTERED_KEY not in hass.data
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_HA,
-        )
-
-        cfg = hass.data[DOMAIN][DATA_WEBHOOK]
-        assert isinstance(cfg["resource_server"], mw.ResourceServer)
-        # Seven discovery views were bound on hass.http.
-        assert hass.http.register_view.call_count == 7
-        assert hass.data.get(mw._OAUTH_VIEWS_REGISTERED_KEY) is True
-
-    async def test_ha_auth_re_enable_reuses_bound_views(self, monkeypatch):
-        # aiohttp cannot unregister a bound view; the once-per-session guard
-        # lives at a TOP-LEVEL hass.data key precisely so a none->ha_auth->
-        # none->ha_auth cycle re-USES the 7 views instead of re-binding them
-        # (which raises and takes the whole bring-up down). Review finding:
-        # only the first registration was tested.
-        hass = _register_hass()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_HA,
-        )
-        assert hass.http.register_view.call_count == 7
-        await mw.async_unregister_webhook(hass)
-
-        # Second enable in the same HA session: no new bindings, no raise.
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_HA,
-        )
-        assert hass.http.register_view.call_count == 7
-        assert isinstance(
-            hass.data[DOMAIN][DATA_WEBHOOK]["resource_server"], mw.ResourceServer
-        )
-
-    async def test_unknown_auth_mode_fails_closed(self, monkeypatch):
-        # Review gap: a corrupted/hand-edited options value must refuse
-        # bring-up (repair issue), never fall through to the unauthenticated
-        # forward path.
-        hass = _register_hass()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-        with pytest.raises(ValueError, match="Unknown webhook auth mode"):
-            await mw.async_register_webhook(
-                hass,
-                _entry(),
-                port=9584,
-                secret_path="/private_x",
-                auth_mode="bogus",
-            )
-
-    async def test_legacy_missing_credentials_fails_closed(self, monkeypatch):
-        # Legacy mode without the minted credentials must fail loud and leave no
-        # endpoint or leaked session behind — never an unprotected forward path.
-        hass = _register_hass()
-        fake_session = FakeSession()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: fake_session)
-
-        with pytest.raises(ValueError, match="legacy webhook auth mode requires"):
-            await mw.async_register_webhook(
-                hass,
-                _entry(),
-                port=9584,
-                secret_path="/private_x",
-                auth_mode=WEBHOOK_AUTH_LEGACY,
-                oauth_client_id="cid",
-                oauth_client_secret="",  # missing
-                oauth_signing_key=secrets.token_hex(32),
-            )
-        assert fake_session.closed is True
-        assert DATA_WEBHOOK not in hass.data.get(DOMAIN, {})
-
-    async def test_legacy_registers_provider_and_root_views(self, monkeypatch):
-        hass = _register_hass()
-        hass.is_running = False  # boot: routes bind cleanly, no restart needed
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-
-        restart_needed = await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_LEGACY,
-            oauth_client_id="cid",
-            oauth_client_secret="secret",
-            oauth_signing_key=secrets.token_hex(32),
-        )
-
-        cfg = hass.data[DOMAIN][DATA_WEBHOOK]
-        assert isinstance(cfg["oauth_provider"], LegacyOAuthProvider)
-        assert cfg["resource_server"] is None
-        # 7 discovery views + the 2 root /authorize + /token views.
-        assert hass.http.register_view.call_count == 9
-        assert hass.data.get(OAUTH_ROUTE_OWNER_KEY) == DOMAIN
-        assert restart_needed is False
-
-    async def test_legacy_route_conflict_becomes_value_error(self, monkeypatch):
-        # The webhook-proxy add-on already owns the root routes → surfaced as a
-        # ValueError so bring-up files a repair, not a silently-shadowed binding.
-        hass = _register_hass()
-        hass.data[OAUTH_ROUTE_OWNER_KEY] = "webhook_proxy"
-        fake_session = FakeSession()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: fake_session)
-
-        with pytest.raises(ValueError, match="already"):
-            await mw.async_register_webhook(
-                hass,
-                _entry(),
-                port=9584,
-                secret_path="/private_x",
-                auth_mode=WEBHOOK_AUTH_LEGACY,
-                oauth_client_id="cid",
-                oauth_client_secret="secret",
-                oauth_signing_key=secrets.token_hex(32),
-            )
-        assert fake_session.closed is True
-        assert DATA_WEBHOOK not in hass.data.get(DOMAIN, {})
-
-    async def test_switched_away_from_legacy_flags_restart(self, monkeypatch):
-        # Legacy root views are still bound from a prior registration; this
-        # (non-legacy) registration cannot release them without a restart.
-        hass = _register_hass()
-        hass.data[OAUTH_ROUTE_OWNER_KEY] = DOMAIN
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-
-        restart_needed = await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-        )
-        assert restart_needed is True
-
-    async def test_legacy_webhook_off_flags_restart_when_routes_owned(
-        self, monkeypatch
-    ):
-        # register_endpoint=False while the mode is still legacy: no provider is
-        # bound this call, but a prior legacy registration still owns the root
-        # routes → a restart is still needed to release them, so the repair must
-        # not be cleared.
-        hass = _register_hass()
-        hass.data[OAUTH_ROUTE_OWNER_KEY] = DOMAIN
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-
-        restart_needed = await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_LEGACY,
-            register_endpoint=False,
-            oauth_client_id="cid",
-            oauth_client_secret="secret",
-            oauth_signing_key=secrets.token_hex(32),
-        )
-        assert restart_needed is True
-        assert hass.data[DOMAIN][DATA_WEBHOOK]["oauth_provider"] is None
-
-    async def test_registration_failure_closes_session_and_unregisters(
-        self, monkeypatch
-    ):
-        hass = _register_hass()
-        fake_session = FakeSession()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: fake_session)
-        # async_register raises → the except path must unregister + close session.
-        mw.async_register.side_effect = RuntimeError("duplicate webhook")
-
-        with pytest.raises(RuntimeError):
-            await mw.async_register_webhook(
-                hass,
-                _entry(),
-                port=9584,
-                secret_path="/private_x",
-                auth_mode=WEBHOOK_AUTH_NONE,
-            )
-
-        assert fake_session.closed is True
-        assert DATA_WEBHOOK not in hass.data.get(DOMAIN, {})
-
-    async def test_unregister_pops_cfg_and_closes_session(self, monkeypatch):
-        hass = _register_hass()
-        fake_session = FakeSession()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: fake_session)
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-        )
-
-        await mw.async_unregister_webhook(hass)
-        assert DATA_WEBHOOK not in hass.data[DOMAIN]
-        assert fake_session.closed is True
-
-    async def test_unregister_is_idempotent(self):
-        hass = _register_hass()
-        # No cfg present — must be a clean no-op.
-        await mw.async_unregister_webhook(hass)
-        await mw.async_unregister_webhook(hass)
-
-    async def test_register_endpoint_false_stores_forwarding_only(self, monkeypatch):
-        # #1803: with remote webhook access disabled, the loopback forwarding
-        # config must still be stored (the sidebar settings panel proxies
-        # through it) while NO public endpoint is registered.
-        hass = _register_hass()
-        fake_session = FakeSession()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: fake_session)
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_NONE,
-            register_endpoint=False,
-        )
-
-        cfg = hass.data[DOMAIN][DATA_WEBHOOK]
-        assert cfg["target_url"] == "http://127.0.0.1:9584/private_x"
-        assert cfg["session"] is fake_session
-        assert cfg["resource_server"] is None
-        # Local-only none mode advertises nothing: no auto-approve provider, so
-        # active_auth_mode is None and every discovery/auto-approve view 404s.
-        assert cfg[mw.CFG_AUTOAPPROVE_PROVIDER] is None
-        assert mw.active_auth_mode(hass) is None
-        mw.async_register.assert_not_called()
-        hass.http.register_view.assert_not_called()
-        # Off means off: a leftover endpoint from a crashed unload is cleared
-        # even though nothing gets (re)registered.
-        mw.async_unregister.assert_called_once_with(hass, WEBHOOK_ID)
-
-        # Teardown still drops the cfg and closes the session.
-        await mw.async_unregister_webhook(hass)
-        assert DATA_WEBHOOK not in hass.data[DOMAIN]
-        assert fake_session.closed is True
-
-    async def test_register_endpoint_false_skips_ha_auth_surface(self, monkeypatch):
-        # Even with ha_auth configured, a disabled endpoint must not construct
-        # the resource server or bind the discovery views — the per-request
-        # resolver would otherwise advertise a webhook that does not exist.
-        hass = _register_hass()
-        monkeypatch.setattr(mw.aiohttp, "ClientSession", lambda **kw: FakeSession())
-
-        await mw.async_register_webhook(
-            hass,
-            _entry(),
-            port=9584,
-            secret_path="/private_x",
-            auth_mode=WEBHOOK_AUTH_HA,
-            register_endpoint=False,
-        )
-
-        cfg = hass.data[DOMAIN][DATA_WEBHOOK]
-        assert cfg["resource_server"] is None
-        mw.async_register.assert_not_called()
-        hass.http.register_view.assert_not_called()
-        assert mw.active_auth_mode(hass) is None

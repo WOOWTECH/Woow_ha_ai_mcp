@@ -39,11 +39,10 @@ def test_remember_cache_hit_within_ttl():
     assert q.is_remembered("ha_x", "deadbeef") is True
 
 
-def test_remember_cache_expired():
+def test_remember_cache_expired(freezer):
     q = ApprovalQueue()
     q.remember("ha_x", "deadbeef", minutes=5)
-    # rewind expiry into the past
-    q._remember[("ha_x", "deadbeef")] = datetime.now(UTC) - timedelta(seconds=1)
+    freezer.tick(timedelta(minutes=6))
     assert q.is_remembered("ha_x", "deadbeef") is False
 
 
@@ -64,20 +63,24 @@ def test_find_returns_none_for_unknown():
     assert q.find("ha_x", "abc") is None
 
 
-def test_approve_sets_decision_and_fires_event():
+@pytest.mark.anyio
+async def test_approve_sets_decision_and_fires_event():
     q = ApprovalQueue()
     p = q.create("ha_x", "abc", {}, ttl_minutes=5)
     assert q.approve(p.token) is True
     assert p.decision == "approved"
-    assert p._event.is_set()
+    with anyio.fail_after(1):
+        assert await p.wait() == p.decision
 
 
-def test_deny_sets_decision_and_fires_event():
+@pytest.mark.anyio
+async def test_deny_sets_decision_and_fires_event():
     q = ApprovalQueue()
     p = q.create("ha_x", "abc", {}, ttl_minutes=5)
     assert q.deny(p.token) is True
     assert p.decision == "denied"
-    assert p._event.is_set()
+    with anyio.fail_after(1):
+        assert await p.wait() == p.decision
 
 
 def test_approve_unknown_token_returns_false():
@@ -308,62 +311,114 @@ def test_create_after_sweep_still_evicts_when_pending_fills_cap():
         assert q.get(entry.token) is not None
 
 
-@pytest.mark.anyio
-async def test_find_or_create_lock_blocks_concurrent_create_under_real_race():
-    """The previous test_find_or_create_concurrent_callers_share_entry
-    passes even without the lock because find() and create() are both
-    sync and run to completion in one task before another can start.
-    To actually exercise the lock, monkey-patch find() to await — now
-    a missing lock would let multiple tasks pass the find()==None
-    check before any of them runs create().
+# --- Issue #2387: consumption is one-shot ---
+
+
+def test_consume_claims_the_entry_exactly_once():
+    """Two waiters woken by one ``decide()`` must not both consume it."""
+    q = ApprovalQueue()
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+    entry.decide("approved")
+    assert q.consume_and_maybe_remember(entry, remember_minutes=0) is True
+    assert q.consume_and_maybe_remember(entry, remember_minutes=0) is False
+    assert q.get(entry.token) is None
+
+
+def test_swept_approved_entry_is_still_claimable_by_its_waiter():
+    """The claim lives on the entry, not on queue membership.
+
+    ``_sweep_expired`` drops entries by ``expires_at`` regardless of
+    decision and runs on every ``find``/``get``/``list_pending`` — which
+    the settings UI polls. A waiter holding its own reference to an
+    approved entry must still be able to consume it after such a sweep;
+    keying the claim on dict membership would turn a legitimate approval
+    into a spurious re-prompt.
     """
     q = ApprovalQueue()
-    orig_find = q.find
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+    entry.decide("approved")
+    entry.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert q.list_pending() == []
+    assert q.get(entry.token) is None
+    assert q.consume_and_maybe_remember(entry, remember_minutes=0) is True
 
-    def slow_find(tool_name: str, args_hash: str):
-        # Use a synchronous sleep equivalent — anyio yield wrapped in
-        # the underlying find. Easiest: replace with a coroutine via
-        # closure that the lock-holding flow awaits inside.
-        return orig_find(tool_name, args_hash)
 
-    # Instead of patching find (which is sync), insert a yield point
-    # inside find_or_create by patching the queue's create to await.
-    orig_create = q.create
+def test_consume_populates_remember_cache_only_for_the_winner():
+    """A losing claim must not extend or re-arm the remember window."""
+    q = ApprovalQueue()
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+    entry.decide("approved")
+    assert q.consume_and_maybe_remember(entry, remember_minutes=10) is True
+    assert q.is_remembered("ha_x", "abc") is True
+    q.clear_remember_cache()
+    assert q.consume_and_maybe_remember(entry, remember_minutes=10) is False
+    assert q.is_remembered("ha_x", "abc") is False
 
-    async def slow_create_path(*args, **kwargs):
-        # Yield to the scheduler so any other waiting find_or_create
-        # task gets a chance to slip past its own find() check before
-        # we actually create. With the lock this is impossible; without
-        # it, the test would observe multiple tokens.
-        await anyio.sleep(0.01)
-        return orig_create(*args, **kwargs)
 
-    # Patch the bound method so find_or_create's internal call goes
-    # through the slow path. We patch via dunder rather than setattr
-    # because async-vs-sync mismatch would explode the signature; do
-    # a wrapper inside the test instead.
-    async def racing_find_or_create():
-        async with q._create_lock:
-            existing = q.find("ha_x", "abc")
-            if existing is not None:
-                return existing
-            return await slow_create_path("ha_x", "abc", {}, ttl_minutes=5)
+def test_approve_refuses_an_expired_entry():
+    """The TTL is enforced in the decision itself, not only on the way in.
 
-    tokens: list[str] = []
+    Every reader (``get``, ``find``, ``list_pending``) sweeps, so a caller
+    that reads before deciding never meets an expired entry. A decision
+    arriving from the Home Assistant event bus does not read first, and
+    approving there would wake a waiter still holding the row -- long past
+    the window the user was shown.
+    """
+    q = ApprovalQueue()
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+    entry.expires_at = datetime.now(UTC) - timedelta(seconds=1)
 
-    async def race(idx: int) -> None:
-        entry = await racing_find_or_create()
-        tokens.append(entry.token)
+    assert q.approve(entry.token) is False
+    assert entry.decision == "pending"
 
-    async with anyio.create_task_group() as tg:
-        for i in range(5):
-            tg.start_soon(race, i)
 
-    # With the lock, all 5 see the same token (the first task creates,
-    # the rest find it). Without the lock, all 5 would race past find()
-    # and each create a fresh token.
-    assert len(set(tokens)) == 1, f"lock failed; got {set(tokens)} tokens"
-    assert len(q.list_pending()) == 1
-    # Silence the slow_find reference so ruff doesn't complain about
-    # the unused helper — kept in the source for future strengthening.
-    _ = slow_find
+def test_deny_refuses_an_expired_entry():
+    q = ApprovalQueue()
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+    entry.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    assert q.deny(entry.token) is False
+    assert entry.decision == "pending"
+
+
+def test_approve_still_decides_a_live_entry():
+    """The sweep must not cost the ordinary case its decision."""
+    q = ApprovalQueue()
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+
+    assert q.approve(entry.token) is True
+    assert entry.decision == "approved"
+
+
+def test_an_expired_token_logs_as_expired_not_as_unknown(caplog):
+    """A late tap on a phone notification is not a token probe.
+
+    The unknown-token line is WARNING because it means a UI bug, a stale
+    tab, or somebody guessing tokens. An entry that simply ran out of TTL
+    is none of those, and it is the ordinary outcome of approving a minute
+    after the window closed.
+    """
+    import logging
+
+    q = ApprovalQueue()
+    entry = q.create("ha_x", "abc", {}, ttl_minutes=5)
+    entry.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    with caplog.at_level(logging.INFO):
+        assert q.approve(entry.token) is False
+
+    assert "expired before the decision reached it" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_genuinely_unknown_token_still_warns(caplog):
+    """The security signal stays a security signal."""
+    import logging
+
+    q = ApprovalQueue()
+
+    with caplog.at_level(logging.INFO):
+        assert q.approve("no-such-token") is False
+
+    assert "unknown token" in caplog.text
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING]

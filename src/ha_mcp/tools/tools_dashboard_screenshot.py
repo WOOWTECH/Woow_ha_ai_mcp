@@ -1,8 +1,9 @@
 """Dashboard screenshot tool (opt-in, beta).
 
 Gated behind ``enable_dashboard_screenshot``. Renders one or more Lovelace
-dashboard images via the separate screenshot engine add-on (or a docker-compose
-sidecar) and returns native MCP image blocks for visual verification.
+dashboard images via the separate screenshot engine app (add-on) or a
+docker-compose sidecar, and returns native MCP image blocks for visual
+verification.
 
 The companion ``include_screenshot`` / ``return_screenshot`` parameters on
 ``ha_config_get_dashboard`` / ``ha_config_set_dashboard`` share the same
@@ -14,10 +15,10 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any, Literal
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
-from fastmcp.tools.tool import ToolResult
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import ToolResult, tool
 
 from ..dashboard_screenshot.capture import (
     DEFAULT_HEIGHT,
@@ -37,11 +38,13 @@ from ..dashboard_screenshot.content import (
     dashboard_screenshot_warnings,
 )
 from ..dashboard_screenshot.paths import (
+    DashboardRenderTarget,
     resolve_dashboard_render_target,
 )
 from ..errors import ErrorCode, create_error_response
+from .coercion import JSON_STRING_COERCION
 from .helpers import log_tool_usage, raise_tool_error, register_tool_methods
-from .util_helpers import JSON_STRING_COERCION
+from .tool_hints import read_only_hints
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ logger = logging.getLogger(__name__)
 def _package_screenshot_result(
     *,
     captures: list[Any],
-    target: Any,
+    target: DashboardRenderTarget,
     capture_failures: list[dict[str, Any]],
     capture_warnings: list[str],
 ) -> ToolResult:
@@ -57,7 +60,7 @@ def _package_screenshot_result(
     try:
         structured_content: dict[str, Any] = {
             "success": True,
-            "dashboard_url_path": target.dashboard_url_path,
+            "url_path": target.url_path,
             "view_path": target.view_path,
             "view_index": target.view_index,
             "render_path": target.render_path,
@@ -81,7 +84,7 @@ def _package_screenshot_result(
         )
     except ToolError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         error_payload = create_error_response(
             ErrorCode.IMAGE_SERIALIZATION_FAILED,
             "Rendered dashboard images could not be packaged into the MCP response.",
@@ -107,11 +110,7 @@ class DashboardScreenshotTools:
     @tool(
         name="ha_get_dashboard_screenshot",
         tags={"Dashboard", "beta"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": False,
-            "title": "Get Dashboard Screenshot",
-        },
+        annotations=read_only_hints("Get Dashboard Screenshot", open_world=False),
     )
     @log_tool_usage
     async def ha_get_dashboard_screenshot(
@@ -122,11 +121,11 @@ class DashboardScreenshotTools:
                 description="Legacy Lovelace frontend path to render, e.g. "
                 "'lovelace/0' (default dashboard, first view), "
                 "'lovelace-home/kitchen', or 'my-dashboard'. Leading slash "
-                "optional. Prefer dashboard_url_path + view_path for a stable "
-                "named view. Mutually exclusive with dashboard_url_path."
+                "optional. Prefer url_path + view_path for a stable "
+                "named view. Mutually exclusive with url_path."
             ),
         ] = None,
-        dashboard_url_path: Annotated[
+        url_path: Annotated[
             str | None,
             Field(
                 description="Stable dashboard URL path, e.g. 'lovelace-home' "
@@ -137,7 +136,7 @@ class DashboardScreenshotTools:
             str | None,
             Field(
                 description="Stable Lovelace views[].path value to render. "
-                "Requires dashboard_url_path."
+                "Requires url_path."
             ),
         ] = None,
         width: Annotated[
@@ -153,7 +152,6 @@ class DashboardScreenshotTools:
         ] = DEFAULT_HEIGHT,
         viewport_presets: Annotated[
             list[ViewportPreset] | None,
-            JSON_STRING_COERCION,
             Field(
                 description="Render one or more named responsive viewports in "
                 "this order: mobile (390x844), tablet (768x1024), desktop "
@@ -161,6 +159,7 @@ class DashboardScreenshotTools:
                 min_length=1,
                 max_length=3,
             ),
+            JSON_STRING_COERCION,
         ] = None,
         orientation: Annotated[
             Orientation | None,
@@ -186,26 +185,21 @@ class DashboardScreenshotTools:
             bool,
             Field(
                 description=f"{FULL_PAGE_PARAM_DESC[:1].upper()}"
-                f"{FULL_PAGE_PARAM_DESC[1:]}. Uses Puppet's native auto-height "
-                "capture (currently capped at 4000 px); raise wait_ms for "
-                "lazy cards."
+                f"{FULL_PAGE_PARAM_DESC[1:]}. Height limits are engine-specific: "
+                "Puppet caps at 4000 px; WPE's configured limit can be up to "
+                "12000 px, with a width-dependent effective cap. Raise wait_ms "
+                "for lazy cards."
             ),
         ] = False,
         theme: Annotated[
             str | None,
             Field(
-                description="Installed Home Assistant frontend theme name, "
-                "applied to this render. The engine user's saved theme "
-                "preference is restored after the capture (best effort)."
+                description="Installed Home Assistant frontend theme name, applied to this render."
             ),
         ] = None,
         dark_mode: Annotated[
             bool,
-            Field(
-                description="Render the requested theme in dark mode, applied "
-                "to this render. The engine user's saved theme preference is "
-                "restored after the capture (best effort)."
-            ),
+            Field(description="Render the requested theme in dark mode."),
         ] = False,
         language: Annotated[
             str | None,
@@ -231,17 +225,21 @@ class DashboardScreenshotTools:
         ha_config_set_dashboard(return_screenshot=True) for a single workflow.
 
         Use it for repeatable visual checks, including ordered mobile, tablet,
-        and desktop captures. Puppet reports image bytes but does not confirm
-        that the frontend accepted a requested theme or language; structured
-        metadata therefore records the values sent to the engine.
+        and desktop captures. The engine returns image bytes but does not
+        confirm that the frontend accepted a requested theme or language;
+        structured metadata therefore records the values sent to the engine.
+        WPE Screenshot Engine applies frontend preferences temporarily. Puppet
+        may persist requested theme or dark-mode changes on the engine account;
+        ha-mcp reports detected changes in warnings but does not undo them (see
+        ha_manage_theme action='set_engine_theme').
 
-        To change the Puppet engine add-on itself (keep_browser_open, restart),
-        use ha_manage_addon.
+        To change the screenshot engine app's own options or restart it, use
+        ha_manage_app.
         """
         target = await resolve_dashboard_render_target(
             self._client,
             dashboard_path=dashboard_path,
-            dashboard_url_path=dashboard_url_path,
+            url_path=url_path,
             view_path=view_path,
         )
         validate_capture_parameters(
@@ -281,7 +279,7 @@ class DashboardScreenshotTools:
             )
         except ToolError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise_tool_error(
                 create_error_response(
                     ErrorCode.INTERNAL_ERROR,

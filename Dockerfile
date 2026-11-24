@@ -1,29 +1,36 @@
-# syntax=docker/dockerfile:1
 # Home Assistant MCP Server - Production Docker Image
 # Multi-stage build: uv for dependency resolution, slim Python for runtime
-# Python 3.13 - Security support until 2029-10
+# Python 3.14 - Security support until 2030-10
 # Base images pinned by digest - Renovate will create PRs for updates
 
+# PYTHON_BASE lets CI point the runtime base at another registry holding the
+# same digest when ECR Public rate-limits the pull; the default is the pin.
+ARG PYTHON_BASE=public.ecr.aws/docker/library/python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+
 # --- Build stage: install dependencies with uv ---
-FROM ghcr.io/astral-sh/uv:0.11.28-python3.13-trixie-slim@sha256:08477888ac23d6cfbeb8c7dc6fc70cf297fd38b7bf35522be33ce832750ca242 AS builder
+FROM ghcr.io/astral-sh/uv:0.13.9-python3.14-trixie-slim@sha256:da0f1f04404173d7d2fa158112e09624d5a80262efa86c89882b68389dfd44eb AS builder
 
 WORKDIR /app
 
 # Compile bytecode for faster startup; copy mode required with cache mounts
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
-# Install dependencies first (cached separately from source changes)
+# Install dependencies first (cached separately from source changes). The
+# dev-only test-env pyproject is copied because --locked reads every
+# package in the lock file, including dev ones that are not installed.
 COPY pyproject.toml uv.lock ./
+COPY tests/test-env/pyproject.toml ./tests/test-env/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev
 
 # Copy source and config, then install the project itself
+COPY README.md LICENSE ./
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 
 # --- Runtime stage: clean image without uv ---
-FROM python:3.13-slim@sha256:3de9a8d7aedbb7984dc18f2dff178a7850f16c1ae7c34ba9d7ecc23d0755e35f
+FROM ${PYTHON_BASE}
 
 LABEL org.opencontainers.image.title="Home Assistant MCP Server" \
       org.opencontainers.image.description="AI assistant integration for Home Assistant via Model Context Protocol" \
@@ -35,16 +42,37 @@ LABEL org.opencontainers.image.title="Home Assistant MCP Server" \
 # that callers running with `--user UID:GID` overrides — common in hardened
 # Docker setups, see issue #1125 — can stat HOME-relative paths. Write
 # access stays restricted to mcpuser via ownership.
-RUN groupadd -r mcpuser \
-    && useradd -r -g mcpuser -m mcpuser \
-    && chmod 0755 /home/mcpuser
+#
+# ~/.ha-mcp is pre-created and owned by mcpuser because Docker initializes a
+# fresh named volume from the image's directory at the mount point, ownership
+# included. Without this the mount point wouldn't exist in the image, Docker
+# would create it root-owned, and the documented
+# `-v ha-mcp-data:/home/mcpuser/.ha-mcp` would leave the container unable to
+# write there. ha-mcp then warns and falls back to a tmpdir (see
+# utils/data_paths.py), losing settings on every restart — issue #2078.
+#
+# The UID/GID are pinned rather than left to `-r`'s dynamic allocation: a
+# volume records numeric ownership, not names. If a base-image update shifted
+# the IDs `groupadd -r`/`useradd -r` hand out, an existing ha-mcp-data volume
+# would stay owned by the old UID and the new process couldn't write to it —
+# reintroducing exactly the tmpdir fallback this change exists to prevent.
+# 999 is what `-r` already allocated on this base image, so pinning it changed
+# nothing for existing deployments: volumes and `chown 999:999` bind mounts
+# created before the pin keep working.
+# Bind-mounting a host directory instead? It must be writable by UID 999 —
+# or by whatever UID you pass to `--user`, which a 999-owned named volume
+# will NOT satisfy.
+RUN groupadd -r -g 999 mcpuser \
+    && useradd -r -u 999 -g mcpuser -m mcpuser \
+    && chmod 0755 /home/mcpuser \
+    && mkdir -p /home/mcpuser/.ha-mcp \
+    && chown mcpuser:mcpuser /home/mcpuser/.ha-mcp
 
 WORKDIR /app
 
-# Copy the virtual environment, source, and config from builder
+# Copy the virtual environment and source from builder
 COPY --chown=mcpuser:mcpuser --from=builder /app/.venv /app/.venv
 COPY --chown=mcpuser:mcpuser --from=builder /app/src /app/src
-COPY --chown=mcpuser:mcpuser fastmcp.json fastmcp-http.json ./
 
 USER mcpuser
 
@@ -66,9 +94,8 @@ ENV HA_MCP_BUILD_VERSION=${BUILD_VERSION}
 
 # Environment variables (can be overridden)
 ENV HOMEASSISTANT_URL="" \
-    HOMEASSISTANT_TOKEN="" \
-    BACKUP_HINT="normal"
+    HOMEASSISTANT_TOKEN=""
 
-# Default: Run in stdio mode using fastmcp.json
+# Default: Run in stdio mode
 # For HTTP mode: docker run ... IMAGE ha-mcp-web
-CMD ["fastmcp", "run", "fastmcp.json"]
+CMD ["ha-mcp"]

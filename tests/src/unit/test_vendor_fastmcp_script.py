@@ -1,0 +1,545 @@
+"""Unit tests for scripts/vendor_fastmcp.py's import rewriting and patching."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import io
+import json
+import sys
+import tomllib
+import zipfile
+from pathlib import Path
+
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+
+import vendor_fastmcp as vendor  # noqa: E402
+
+
+def _bound_names(source: str) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names.update((a.asname or a.name.split(".")[0]) for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update((a.asname or a.name) for a in node.names)
+    return names
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from fastmcp import FastMCP\n",
+            "from ha_mcp._vendor.fastmcp import FastMCP\n",
+        ),
+        (
+            "from mcp.types import Tool as T\n",
+            "from ha_mcp._vendor.mcp.types import Tool as T\n",
+        ),
+        ("import mcp_types\n", "from ha_mcp._vendor import mcp_types\n"),
+        (
+            "import mcp.types\n",
+            "import ha_mcp._vendor.mcp.types; from ha_mcp._vendor import mcp\n",
+        ),
+        ("import fastmcp as fm\n", "import ha_mcp._vendor.fastmcp as fm\n"),
+        ("import os, mcp\n", "import os; from ha_mcp._vendor import mcp\n"),
+        ("from . import mcp\n", "from . import mcp\n"),
+        ("from mcpx import y\n", "from mcpx import y\n"),
+    ],
+)
+def test_rewrite_imports(source, expected):
+    assert vendor.rewrite_imports(source) == expected
+
+
+def test_rewrite_preserves_bindings_and_indentation():
+    source = (
+        "def f():\n"
+        "    import mcp.types\n"
+        "    from fastmcp import (\n"
+        "        Client,  # comment\n"
+        "    )\n"
+        "    return mcp.types, Client\n"
+    )
+    rewritten = vendor.rewrite_imports(source)
+    assert _bound_names(rewritten) == _bound_names(source) | {"ha_mcp"}
+    assert (
+        "    from ha_mcp._vendor.fastmcp import (\n        Client,  # comment\n"
+        in rewritten
+    )
+    assert vendor.remaining_vendored_imports(rewritten) == []
+
+
+def test_rewrite_leaves_strings_and_comments_alone():
+    source = '# from fastmcp import x\ns = "import mcp"\n"""from mcp import y"""\n'
+    assert vendor.rewrite_imports(source) == source
+
+
+def test_rewrite_handles_non_ascii_before_the_import():
+    source = 'x = "é"; import mcp\n'
+    assert vendor.rewrite_imports(source) == 'x = "é"; from ha_mcp._vendor import mcp\n'
+
+
+def test_rewrite_dynamic_imports():
+    source = (
+        'importlib.import_module("fastmcp.server")\n'
+        'importlib.import_module(f"fastmcp.server.{name}")\n'
+        'importlib.import_module("fastmcpx")\n'
+    )
+    assert vendor.rewrite_imports(source) == (
+        'importlib.import_module("ha_mcp._vendor.fastmcp.server")\n'
+        'importlib.import_module(f"ha_mcp._vendor.fastmcp.server.{name}")\n'
+        'importlib.import_module("fastmcpx")\n'
+    )
+
+
+_PINS = {"fastmcp-slim": "9.9.9", "mcp": "8.8.8", "mcp-types": "8.8.8"}
+_FASTMCP_INIT = (
+    "from importlib.metadata import PackageNotFoundError, version as _version\n"
+    'try:\n    __version__ = _version("fastmcp-slim")\n'
+    'except PackageNotFoundError:\n    __version__ = _version("fastmcp")\n'
+)
+
+
+def test_patch_pins_the_fastmcp_version():
+    patched = vendor.patch_package("fastmcp", "__init__.py", _FASTMCP_INIT, _PINS)
+    assert '__version__ = "9.9.9"\n' in patched
+    assert "_version(" not in patched
+
+
+def test_patch_fails_loudly_when_the_version_lookup_changes_shape():
+    with pytest.raises(SystemExit, match="changed shape"):
+        vendor.patch_package("fastmcp", "__init__.py", "__version__ = x\n", _PINS)
+
+
+def test_patch_keeps_upstream_logger_names():
+    source = "logger = get_logger(__name__)\nlog = logging.getLogger(name=__name__)\n"
+    patched = vendor.patch_package("mcp", "server/x.py", source, _PINS)
+    assert patched.count('__name__.removeprefix("ha_mcp._vendor.")') == 2
+
+
+def _wheel(members: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as wheel:
+        for name, body in members.items():
+            wheel.writestr(name, body)
+    return buffer.getvalue()
+
+
+def test_stage_package_rewrites_and_records_a_manifest(tmp_path):
+    spec = vendor.VendoredPackage("mcp", "mcp")
+    wheel = _wheel(
+        {
+            "mcp/__init__.py": "from mcp.types import Tool\n",
+            "mcp/types.py": "Tool = object\n",
+            "mcp/__pycache__/types.cpython-313.pyc": "x",
+            "mcp-8.8.8.dist-info/METADATA": "",
+        }
+    )
+    staging = tmp_path / "mcp"
+    count = vendor.stage_package(spec, wheel, b"MIT", _PINS, staging)
+    assert count == 2
+    assert (
+        staging / "__init__.py"
+    ).read_text() == "from ha_mcp._vendor.mcp.types import Tool\n"
+    assert (staging / "VENDORED").read_text().startswith("mcp==8.8.8\n")
+    assert (staging / "LICENSE").read_bytes() == b"MIT"
+    recorded = (staging / vendor.MANIFEST_NAME).read_text().splitlines()
+    assert recorded == vendor.manifest_lines(staging)
+    assert not (staging / "__pycache__").exists()
+
+
+def test_stage_package_refuses_path_traversal(tmp_path):
+    spec = vendor.VendoredPackage("mcp", "mcp")
+    wheel = _wheel({"mcp/__init__.py": "", "mcp/../../evil.py": ""})
+    with pytest.raises(SystemExit, match="escaping"):
+        vendor.stage_package(spec, wheel, b"MIT", _PINS, tmp_path / "mcp")
+
+
+@pytest.mark.parametrize("failed_package", [spec.package for spec in vendor.PACKAGES])
+def test_promote_restores_every_tree_when_a_swap_fails(
+    tmp_path, monkeypatch, failed_package
+):
+    _sync(tmp_path, monkeypatch, _project("authlib>=1.0"), {}, revision="original")
+    vendor_dir = tmp_path / "_vendor"
+    before = {
+        spec.package: vendor.manifest_lines(vendor_dir / spec.package)
+        for spec in vendor.PACKAGES
+    }
+    real_rename = Path.rename
+    promoted: list[str] = []
+    packages = [spec.package for spec in vendor.PACKAGES]
+
+    def failing_rename(self, target):
+        if self == vendor_dir / f"{failed_package}.incoming":
+            assert promoted == packages[: packages.index(failed_package)]
+            # Prove the fault happens after earlier replacements reached their
+            # final paths, while every unswapped replacement is still staged.
+            for package in packages:
+                tree = vendor_dir / (
+                    package if package in promoted else f"{package}.incoming"
+                )
+                assert (tree / "revision.txt").read_text() == f"{package}:replacement"
+                assert vendor.manifest_lines(tree) != before[package]
+            raise OSError("simulated")
+        result = real_rename(self, target)
+        if self.name.endswith(".incoming"):
+            promoted.append(self.name.removesuffix(".incoming"))
+        return result
+
+    monkeypatch.setattr(Path, "rename", failing_rename)
+    with pytest.raises(OSError, match="simulated"):
+        _sync(
+            tmp_path, monkeypatch, _project("authlib>=1.0"), {}, revision="replacement"
+        )
+    assert promoted == packages[: packages.index(failed_package)]
+    assert {
+        spec.package: vendor.manifest_lines(vendor_dir / spec.package)
+        for spec in vendor.PACKAGES
+    } == before
+    for package in packages:
+        assert (
+            vendor_dir / package / "revision.txt"
+        ).read_text() == f"{package}:original"
+    assert not list(vendor_dir.glob("*.incoming"))
+    assert not list(vendor_dir.glob("*.previous"))
+
+
+def test_rewrite_handles_a_backslash_continued_from_import():
+    source = "from \\\n    mcp.types import Tool\n"
+    assert vendor.rewrite_imports(source) == (
+        "from \\\n    ha_mcp._vendor.mcp.types import Tool\n"
+    )
+
+
+def test_patch_replaces_every_version_lookup_of_a_vendored_distribution():
+    source = 'v = importlib.metadata.version("mcp")\nw = importlib.metadata.version("fastmcp")\n'
+    patched = vendor.patch_package("mcp", "cli/cli.py", source, _PINS)
+    assert patched == 'v = "8.8.8"\nw = "9.9.9"\n'
+
+
+_TRACEBACK_SOURCE = 'for package in ("fastmcp", "mcp", "pydantic")\n'
+
+
+def test_patch_points_traceback_suppression_at_the_vendored_packages():
+    patched = vendor.patch_package(
+        "fastmcp", "utilities/logging.py", _TRACEBACK_SOURCE, _PINS
+    )
+    assert '"ha_mcp._vendor.fastmcp", "ha_mcp._vendor.mcp", "pydantic"' in patched
+
+
+def test_patch_fails_loudly_when_traceback_suppression_changes_shape():
+    with pytest.raises(SystemExit, match="changed shape"):
+        vendor.patch_package("fastmcp", "utilities/logging.py", "x = 1\n", _PINS)
+
+
+def test_stage_package_refuses_an_unpatched_package_lookup(tmp_path):
+    spec = vendor.VendoredPackage("mcp", "mcp")
+    wheel = _wheel(
+        {
+            "mcp/__init__.py": 'import importlib.util\nimportlib.util.find_spec("mcp")\n',
+            "mcp-8.8.8.dist-info/METADATA": "",
+        }
+    )
+    with pytest.raises(SystemExit, match="unpatched package lookup"):
+        vendor.stage_package(spec, wheel, b"MIT", _PINS, tmp_path / "mcp")
+
+
+def test_runtime_requirements_keep_base_and_selected_extras():
+    metadata = "\n".join(
+        [
+            "Metadata-Version: 2.4",
+            "Requires-Dist: pydantic>=2.12",
+            "Requires-Dist: anyio>=4.10; python_version >= '3.14'",
+            "Requires-Dist: httpx2>=2.5; extra == 'client'",
+            "Requires-Dist: uvicorn>=0.35; sys_platform != 'emscripten' and extra == 'server'",
+            "Requires-Dist: pywin32>=311; extra == 'server' and sys_platform == 'win32'",
+            "Requires-Dist: openai>=1; extra == 'openai'",
+        ]
+    )
+    wheel = _wheel({"pkg-1.0.dist-info/METADATA": metadata})
+    assert vendor.runtime_requirements(wheel, ("client", "server")) == [
+        "anyio>=4.10; python_version >= '3.14'",
+        "httpx2>=2.5",
+        "pydantic>=2.12",
+        "pywin32>=311; sys_platform == 'win32'",
+        "uvicorn>=0.35; sys_platform != 'emscripten'",
+    ]
+
+
+class _Release:
+    def __init__(self, entries):
+        self.entries = entries
+
+    def open(self, url, *, timeout):
+        payload = (
+            json.dumps({"urls": self.entries}).encode()
+            if url.startswith("https://pypi.org/pypi/")
+            else b"wheel-bytes"
+        )
+        return io.BytesIO(payload)
+
+
+def test_download_wheel_refuses_a_digest_mismatch(tmp_path, monkeypatch):
+    release = _Release(
+        [
+            {
+                "packagetype": "bdist_wheel",
+                "filename": "mcp-8.8.8-py3-none-any.whl",
+                "url": "https://files.example/mcp.whl",
+                "digests": {"sha256": "0" * 64},
+            }
+        ]
+    )
+    monkeypatch.setattr(vendor.urllib.request, "urlopen", release.open)
+    vendor_dir, project = _vendor_paths(tmp_path, _project("authlib>=1"))
+    with pytest.raises(SystemExit, match="sha256 mismatch"):
+        vendor.main(vendor_dir, project)
+
+
+def test_download_wheel_refuses_a_release_without_a_pure_python_wheel(
+    tmp_path, monkeypatch
+):
+    release = _Release(
+        [
+            {
+                "packagetype": "sdist",
+                "filename": "mcp-8.8.8.tar.gz",
+                "url": "https://files.example/x",
+            }
+        ]
+    )
+    monkeypatch.setattr(vendor.urllib.request, "urlopen", release.open)
+    vendor_dir, project = _vendor_paths(tmp_path, _project("authlib>=1"))
+    with pytest.raises(SystemExit, match="no pure-Python wheel"):
+        vendor.main(vendor_dir, project)
+
+
+def test_main_leaves_live_trees_untouched_when_a_download_fails(tmp_path, monkeypatch):
+    vendor_dir, project = _vendor_paths(tmp_path, _project("authlib>=1"))
+    for spec in vendor.PACKAGES:
+        (vendor_dir / spec.package).mkdir()
+        (vendor_dir / spec.package / "live.py").write_text("", encoding="utf-8")
+
+    good = _wheel(
+        {
+            "fastmcp/__init__.py": _FASTMCP_INIT,
+            "fastmcp-9.9.9.dist-info/METADATA": "",
+            "fastmcp-9.9.9.dist-info/licenses/LICENSE": "Apache",
+        }
+    )
+    _serve_wheels(
+        monkeypatch,
+        {"fastmcp-slim": good, "fastmcp": good, "mcp": OSError("network down")},
+    )
+    with pytest.raises(OSError, match="network down"):
+        vendor.main(vendor_dir, project)
+    assert not list(vendor_dir.glob("*.incoming"))
+    for spec in vendor.PACKAGES:
+        assert (vendor_dir / spec.package / "live.py").is_file()
+
+
+_PYPROJECT = """[project]
+name = "fixture"
+classifiers = ["Programming Language :: Python :: 3.14"]
+dependencies = [
+    # Runtime requirements of the vendored packages.
+{entries}
+]
+
+[dependency-groups]
+dev = [
+{dev}
+]
+"""
+
+
+def _project(*entries: str, dev: tuple[str, ...] | None = None) -> str:
+    def lines(items: tuple[str, ...]) -> str:
+        return "\n".join(f'    "{item}",' for item in items)
+
+    return _PYPROJECT.format(
+        entries=lines(entries), dev=lines(entries if dev is None else dev)
+    )
+
+
+def _vendor_paths(tmp_path, pyproject_text):
+    vendor_dir = tmp_path / "_vendor"
+    vendor_dir.mkdir(exist_ok=True)
+    (vendor_dir / "requirements.txt").write_text(
+        "fastmcp-slim==9.9.9\nmcp==8.8.8\nmcp-types==8.8.8\n", encoding="utf-8"
+    )
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(pyproject_text, encoding="utf-8")
+    return vendor_dir, pyproject
+
+
+def _serve_wheels(monkeypatch, wheels):
+    """Replace PyPI's HTTP transport, leaving download and digest checks live."""
+
+    def open_release(url, *, timeout):
+        distribution = (
+            url.split("/")[-3] if url.endswith("/json") else url.split("/")[-1]
+        )
+        payload = wheels[distribution]
+        if isinstance(payload, BaseException):
+            raise payload
+        if url.endswith("/json"):
+            payload = json.dumps(
+                {
+                    "urls": [
+                        {
+                            "packagetype": "bdist_wheel",
+                            "filename": f"{distribution}-py3-none-any.whl",
+                            "url": f"https://files.example/{distribution}",
+                            "digests": {"sha256": hashlib.sha256(payload).hexdigest()},
+                        }
+                    ]
+                }
+            ).encode()
+        return io.BytesIO(payload)
+
+    monkeypatch.setattr(vendor.urllib.request, "urlopen", open_release)
+
+
+def _sync(
+    tmp_path, monkeypatch, pyproject_text, requires_by_distribution, *, revision=None
+):
+    """Run the sync with each distribution's wheel declaring the given needs."""
+    vendor_dir, pyproject = _vendor_paths(tmp_path, pyproject_text)
+    wheels = {}
+    for distribution in (*_PINS, "fastmcp"):
+        needs = requires_by_distribution.get(distribution, [])
+        members = {
+            "fastmcp/__init__.py": _FASTMCP_INIT,
+            "mcp/__init__.py": "",
+            "mcp_types/__init__.py": "",
+            "pkg-9.9.9.dist-info/METADATA": "".join(
+                f"Requires-Dist: {need}\n" for need in needs
+            ),
+            "pkg-9.9.9.dist-info/licenses/LICENSE": "MIT",
+        }
+        if revision is not None:
+            members.update(
+                {
+                    f"{spec.package}/revision.txt": f"{spec.package}:{revision}"
+                    for spec in vendor.PACKAGES
+                }
+            )
+        wheels[distribution] = _wheel(members)
+
+    _serve_wheels(monkeypatch, wheels)
+    vendor.main(vendor_dir, pyproject)
+    return pyproject.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("declared", "needed", "expected"),
+    [
+        ("authlib>=1.6.11", "authlib>=1.9.5; extra == 'server'", "authlib>=1.9.5"),
+        (
+            "py-key-value-aio[memory]>=0.4.4,<0.5.0; sys_platform != 'emscripten'",
+            "py-key-value-aio>=0.4.6",
+            "py-key-value-aio[memory]>=0.4.6,<0.5.0; sys_platform != 'emscripten'",
+        ),
+        ("authlib >= 1.6.11, != 1.7.0", "authlib>=1.9.5", "authlib >=1.9.5, != 1.7.0"),
+        ("pyjwt[crypto]>=2.12", "pyjwt>=2.10.1", "pyjwt[crypto]>=2.12"),
+        ("cryptography>=48.0.0,<51", "cryptography>=51.0", "cryptography>=48.0.0,<51"),
+        ("pydantic-monty==0.0.18", "pydantic-monty>=0.0.19", "pydantic-monty==0.0.18"),
+        ("anyio>=4.10", "anyio>=5.0; python_version < '3.14'", "anyio>=4.10"),
+        (
+            "authlib>=1.6.11",
+            "authlib>=1.9.5; python_full_version >= '3.14.2'",
+            "authlib>=1.9.5",
+        ),
+    ],
+    ids=[
+        "raised",
+        "keeps-extras-ceiling-marker",
+        "keeps-exclusion-and-spacing",
+        "never-lowered",
+        "past-ceiling",
+        "exact-pin",
+        "unsupported-python",
+        "later-patch-release",
+    ],
+)
+def test_vendor_sync_raises_the_floors_a_bump_needs_so_installs_upgrade(
+    tmp_path, monkeypatch, declared, needed, expected
+):
+    """A bump that needs a newer dependency raises ha-mcp's published floor.
+
+    Home Assistant keeps whatever version already satisfies the floor ha-mcp
+    publishes, so a floor left behind keeps an older release installed.
+    Floors it cannot raise safely are left for a person to change.
+    """
+    text = _sync(tmp_path, monkeypatch, _project(declared), {"fastmcp-slim": [needed]})
+
+    project = tomllib.loads(text)
+    assert project["project"]["dependencies"] == [expected]
+    assert project["dependency-groups"]["dev"] == [declared]
+
+
+def test_vendor_sync_changes_only_the_floors_it_raises_and_reports_the_rest(
+    tmp_path, monkeypatch, capsys
+):
+    """The highest need across the vendored packages wins, and nothing else moves.
+
+    A floor the sync declines is named in its output, so the failing coverage
+    test is not the first place a person learns which entry needs them.
+    """
+    declared = (
+        "authlib>=1.6.11",
+        "authlib-extras>=1.0",
+        "pydantic[email]>=2.13.4,<3",
+        "cryptography>=48.0.0,<51",
+    )
+    text = _sync(
+        tmp_path,
+        monkeypatch,
+        _project(*declared),
+        {
+            "fastmcp-slim": ["authlib>=1.9.5", "pydantic>=2.12", "authlib-extras>=0.5"],
+            "mcp": ["authlib>=1.8.0", "pydantic>=2.14.1", "cryptography>=51.0"],
+        },
+    )
+
+    assert text == _project(
+        "authlib>=1.9.5",
+        "authlib-extras>=1.0",
+        "pydantic[email]>=2.14.1,<3",
+        "cryptography>=48.0.0,<51",
+        dev=declared,
+    )
+    assert "cryptography>=48.0.0,<51" in capsys.readouterr().out
+
+
+def test_the_checked_in_pyproject_already_meets_the_vendored_needs():
+    """The sync parses the real pyproject and finds nothing to change.
+
+    A pyproject the sync cannot read would otherwise surface only as an
+    artifact error on the next vendored bump.
+    """
+    pyproject = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    vendor_dir = _REPO_ROOT / "src" / "ha_mcp" / "_vendor"
+    requirements = [
+        line
+        for spec in vendor.PACKAGES
+        for line in (vendor_dir / spec.package / vendor.REQUIRES_NAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert vendor.raise_dependency_floors(pyproject, requirements) == (pyproject, [])
+
+
+def test_vendor_sync_refuses_a_dependencies_array_outside_project():
+    """Another table's ``dependencies`` array is never taken for ha-mcp's own."""
+    pyproject = (
+        '[project]\nname = "x"\n\n[tool.other]\ndependencies = [\n    "a>=1",\n]\n'
+    )
+    with pytest.raises(SystemExit, match=r"no \[project\] dependencies"):
+        vendor.raise_dependency_floors(pyproject, ["a>=2"])

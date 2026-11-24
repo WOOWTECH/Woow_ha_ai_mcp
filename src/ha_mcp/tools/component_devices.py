@@ -8,13 +8,13 @@ device registry and filter for one entry (``ha_get_device`` single lookup,
 single in-process read: ``device_get`` returns one ``DeviceEntry.dict_repr`` by
 id, ``device_list`` returns them all — each byte-identical to a
 ``config/device_registry/list`` element by construction (see
-``custom_components/ha_mcp_tools/websocket_api.py``). Consumers keep their own
+``custom_components/ha_mcp_tools/websocket_api/lookups.py``). Consumers keep their own
 transforms over that raw shape.
 
 This module owns the caps-gated fetch so the routing discipline — probe caps,
 send one frame, invalidate on ``unknown_command``, fall back to the legacy path
 on any component error — lives in one place instead of being duplicated per
-consumer (the pattern ``tools_search._fetch_states_via_component`` established
+consumer (the pattern ``search.state.fetch_states_via_component`` established
 for the ``states`` capability). Both helpers return ``None`` to mean "component
 unavailable — use the legacy path"; a component that answers authoritatively
 returns its payload (with ``device`` possibly ``None`` for "no such device").
@@ -44,6 +44,7 @@ from ..client.rest_client import (
 )
 from ..client.websocket_client import get_websocket_client
 from .component_api import (
+    DEVICE_REGISTRY_CHILD_SEMANTICS,
     component_supports,
     get_component_caps,
     invalidate_caps,
@@ -68,9 +69,9 @@ async def fetch_device_via_component(
     invalidate the cached caps), or errored (logged). A component that answers
     with ``{"device": None}`` is authoritative — the device does not exist — so
     the caller must distinguish that from a ``None`` return (which means "component
-    unavailable, fall back"). Falls back **silently**, mirroring
-    ``ha_get_state``: the legacy path returns the byte-identical device either way
-    and the ``log.warning`` preserves operator visibility. A
+    unavailable, fall back"). Falls back **silently**: the legacy path returns the
+    byte-identical device either way and the ``log.warning`` preserves operator
+    visibility. A
     ``HomeAssistantConnectionError`` — a pooled-WS drop, or a failed
     (re)connect — is caught here and mapped to ``None``: the consumers' legacy
     paths ride the ``send_websocket_message`` bridge (registry tools) or a
@@ -85,13 +86,23 @@ async def fetch_device_via_component(
     only the device (``_resolve_ieee`` / capture / remove) are unchanged.
     """
     caps = await get_component_caps(client)
-    if not component_supports(caps, "device_get"):
+    if not (
+        component_supports(caps, "device_get")
+        and component_supports(caps, DEVICE_REGISTRY_CHILD_SEMANTICS)
+    ):
         return None
     kwargs: dict[str, Any] = {"device_id": device_id}
     if include_entities:
         kwargs["include_entities"] = True
     try:
-        ws = await get_websocket_client(url=client.base_url, token=client.token)
+        ws = await get_websocket_client(
+            url=client.base_url,
+            token=client.token,
+            # verify_ssl keys the client pool, so omitting it hands back a
+            # DIFFERENT pooled client than the capability probe used and a
+            # self-signed setup fails the read after passing detection.
+            verify_ssl=getattr(client, "verify_ssl", None),
+        )
         raw = await ws.send_command(WS_DEVICE_GET, **kwargs)
     except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
         if is_unknown_command(exc):
@@ -99,7 +110,7 @@ async def fetch_device_via_component(
         else:
             logger.warning("%s failed; fell back to legacy: %r", WS_DEVICE_GET, exc)
         return None
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # HomeAssistantConnectionError: a pooled-WS drop or a failed
         # (re)connect. The legacy paths ride the send_websocket_message bridge /
         # a dedicated capture socket, so fall back to legacy; if the transport
@@ -160,10 +171,20 @@ async def fetch_device_list_via_component(client: Any) -> dict[str, Any] | None:
     fallback as :func:`fetch_device_via_component`.
     """
     caps = await get_component_caps(client)
-    if not component_supports(caps, "device_list"):
+    if not (
+        component_supports(caps, "device_list")
+        and component_supports(caps, DEVICE_REGISTRY_CHILD_SEMANTICS)
+    ):
         return None
     try:
-        ws = await get_websocket_client(url=client.base_url, token=client.token)
+        ws = await get_websocket_client(
+            url=client.base_url,
+            token=client.token,
+            # verify_ssl keys the client pool, so omitting it hands back a
+            # DIFFERENT pooled client than the capability probe used and a
+            # self-signed setup fails the read after passing detection.
+            verify_ssl=getattr(client, "verify_ssl", None),
+        )
         raw = await ws.send_command(WS_DEVICE_LIST)
     except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
         if is_unknown_command(exc):
@@ -171,8 +192,8 @@ async def fetch_device_list_via_component(client: Any) -> dict[str, Any] | None:
         else:
             logger.warning("%s failed; fell back to legacy: %r", WS_DEVICE_LIST, exc)
         return None
-    except Exception as exc:
-        # HomeAssistantConnectionError / plain establish Exception → legacy (the
+    except Exception as exc:  # noqa: BLE001
+        # HomeAssistantConnectionError or any other error → legacy (the
         # legacy device list rides the send_websocket_message bridge).
         logger.warning(
             "%s connection error; falling back to legacy: %r", WS_DEVICE_LIST, exc
@@ -186,3 +207,19 @@ async def fetch_device_list_via_component(client: Any) -> dict[str, Any] | None:
         )
         return None
     return result
+
+
+async def device_list_reply(client: Any) -> dict[str, Any]:
+    """The device registry as a ``config/device_registry/list`` reply, the
+    component asked first; without its answer Core's command is sent.
+
+    Not for rows the visibility resolver or the bulk selector judges: those
+    read :func:`~ha_mcp.visibility.resolver.core_device_list_reply`.
+    """
+    via_component = await fetch_device_list_via_component(client)
+    if via_component is not None:
+        return {"success": True, "result": via_component["devices"]}
+    reply: dict[str, Any] = await client.send_websocket_message(
+        {"type": "config/device_registry/list"}
+    )
+    return reply

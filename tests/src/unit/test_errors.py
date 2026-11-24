@@ -4,6 +4,8 @@ These tests verify that error codes, error responses, and helper functions
 work correctly to provide informative, structured error messages.
 """
 
+import pytest
+
 from ha_mcp.errors import (
     DEFAULT_SUGGESTIONS,
     ErrorCode,
@@ -11,6 +13,7 @@ from ha_mcp.errors import (
     create_config_error,
     create_connection_error,
     create_entity_not_found_error,
+    create_entity_unavailable_after_dispatch_error,
     create_error_response,
     create_service_error,
     create_timeout_error,
@@ -133,6 +136,51 @@ class TestCreateConnectionError:
 
         assert response["error"]["code"] == "CONNECTION_TIMEOUT"
 
+    def test_custom_suggestions_override_the_defaults(self):
+        """A caller-supplied ``suggestions`` list must be used verbatim, not
+        merged with or overridden by CONNECTION_FAILED's own network-centric
+        defaults (check HA is running / verify HOMEASSISTANT_URL / check
+        network) -- those are actively unhelpful for a non-network cause
+        (e.g. a malformed local registry row) that still routes through
+        this same connection-error shape.
+
+        Two custom suggestions, not one: ``create_error_response`` only
+        sets the plural ``suggestions`` key when there is more than one
+        (a single suggestion is carried solely in the singular
+        ``suggestion`` key), so a one-item list here could never actually
+        populate ``suggestions`` -- checking a default string is absent
+        from a key that is always absent by construction would prove
+        nothing about whether the defaults were really overridden.
+        """
+        custom_suggestions = [
+            "Check Home Assistant's device-registry logs",
+            "Restart Home Assistant if the issue persists",
+        ]
+
+        response = create_connection_error(
+            "Could not verify against Home Assistant's device registry",
+            suggestions=custom_suggestions,
+        )
+
+        assert response["error"]["suggestion"] == custom_suggestions[0]
+        assert response["error"]["suggestions"] == custom_suggestions
+
+    def test_omitted_suggestions_still_yield_the_defaults(self):
+        """No ``suggestions`` argument (the overwhelming majority of
+        ``create_connection_error`` call sites) must still produce
+        CONNECTION_FAILED's own default suggestions -- this is the
+        behavior every OTHER caller of this helper relies on, and
+        ``create_error_response`` treats a falsy ``suggestions`` (``None``
+        or ``[]``) identically, as "use the defaults": a caller that
+        passes ``suggestions=[]`` thinking that means "no suggestions"
+        would silently get the network boilerplate back instead.
+        """
+        response = create_connection_error("Failed to connect")
+
+        assert response["error"]["suggestion"] == (
+            "Check if Home Assistant is running and accessible"
+        )
+
 
 class TestCreateAuthError:
     """Tests for create_auth_error function."""
@@ -143,12 +191,6 @@ class TestCreateAuthError:
 
         assert response["success"] is False
         assert response["error"]["code"] == "AUTH_INVALID_TOKEN"
-
-    def test_expired_token_error(self):
-        """Expired auth error should have AUTH_EXPIRED code."""
-        response = create_auth_error("Token expired", expired=True)
-
-        assert response["error"]["code"] == "AUTH_EXPIRED"
 
     def test_invalid_token_suggestions_non_addon(self, monkeypatch):
         """Off the add-on, an invalid token keeps the token-centric defaults
@@ -174,14 +216,20 @@ class TestCreateAuthError:
         assert "home-assistant.log" in joined
         assert "long-lived access token" not in joined
 
-    def test_expired_token_unaffected_by_addon(self, monkeypatch):
-        """Expired errors keep their own defaults even on the add-on — the
-        swap targets invalid-token only."""
+    def test_invalid_token_suggestions_embedded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The in-process server's token lives in the HA-MCP Server entry (#2427):
+        point at Configure and the repair, not at a HOMEASSISTANT_TOKEN. HAOS's
+        Core container carries SUPERVISOR_TOKEN too, so embedded must win."""
+        monkeypatch.setenv("HA_MCP_EMBEDDED", "1")
         monkeypatch.setenv("SUPERVISOR_TOKEN", "fake-supervisor-token")
-        response = create_auth_error("Token expired", expired=True)
+        response = create_auth_error("Invalid token")
 
-        assert response["error"]["code"] == "AUTH_EXPIRED"
         joined = " ".join(response["error"].get("suggestions", []))
+        assert "HA-MCP Server" in joined
+        assert "Replace the administrator access token" in joined
+        assert "HOMEASSISTANT_TOKEN" not in joined
         assert "Supervisor" not in joined
 
 
@@ -205,6 +253,31 @@ class TestCreateEntityNotFoundError:
         )
 
         assert response["error"]["details"] == "Sensor was deleted"
+
+
+class TestCreateEntityUnavailableAfterDispatchError:
+    """Tests for create_entity_unavailable_after_dispatch_error function."""
+
+    def test_structure_and_dispatched_context(self):
+        """Response carries the distinct code, entity_id, and dispatched=True."""
+        response = create_entity_unavailable_after_dispatch_error("switch.pump")
+
+        assert response["success"] is False
+        assert response["error"]["code"] == "ENTITY_UNAVAILABLE"
+        assert "switch.pump" in response["error"]["message"]
+        assert response["entity_id"] == "switch.pump"
+        assert response["dispatched"] is True
+
+    def test_details_and_suggestions_mention_dispatch(self):
+        """The details/suggestions warn against retrying a non-idempotent service,
+        distinguishing this from a bare 'unavailable' report where the command
+        never went out."""
+        response = create_entity_unavailable_after_dispatch_error("light.porch")
+
+        assert "already dispatched" in response["error"]["details"]
+        suggestions = " ".join(response["error"]["suggestions"])
+        assert "already sent" in suggestions
+        assert "double-apply" in suggestions
 
 
 class TestCreateServiceError:

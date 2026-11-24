@@ -1,7 +1,8 @@
 """Read-only mode — catalog filtering and call-time write blocking (#1569).
 
 When ``Settings.read_only_mode`` is on (Tools-tab toggle in the web UI,
-``read_only_mode`` addon option, or ``READ_ONLY_MODE`` env var):
+``read_only_mode`` addon option, or ``READ_ONLY_MODE`` env var), or the
+HTTP connection uses the ``/readonly`` endpoint:
 
 - ``ReadOnlyToolsTransform`` hides write-capable tools from the MCP
   catalog at list time, except the exempt mixed read/write tools in
@@ -14,6 +15,8 @@ When ``Settings.read_only_mode`` is on (Tools-tab toggle in the web UI,
 Both consult the live settings singleton per request, so flipping the
 toggle in standalone HTTP mode takes effect without a restart (addon
 and stdio modes pick it up on restart, like every other feature flag).
+The HTTP endpoint additionally restricts its own request context without
+changing the shared settings.
 
 A tool counts as write-capable when its ``readOnlyHint`` annotation is
 not ``True`` — the same fail-closed default the policy handlers and the
@@ -28,25 +31,66 @@ whether the call is a read (allowed) or a write (blocked).
 
 from __future__ import annotations
 
-import json
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
-from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
-from fastmcp.server.transforms import Transform
-from fastmcp.tools import Tool
+from ha_mcp._vendor.fastmcp.server.middleware.middleware import (
+    CallNext,
+    Middleware,
+    MiddlewareContext,
+)
+from ha_mcp._vendor.fastmcp.server.transforms import Transform
+from ha_mcp._vendor.fastmcp.tools import Tool
 
 from .config import get_global_settings
 from .errors import ErrorCode, create_error_response
-from .policy.middleware import PROXY_META_TOOLS
+from .renamed_tools import current_tool_name
+from .tool_dispatch import CALL_PROXY_META_TOOLS, coerce_proxy_arguments
 from .tools.helpers import raise_tool_error
 
 if TYPE_CHECKING:
-    from fastmcp.server.transforms import GetToolNext
-    from fastmcp.utilities.versions import VersionSpec
+    from ha_mcp._vendor.fastmcp.server.transforms import GetToolNext
+    from ha_mcp._vendor.fastmcp.utilities.versions import VersionSpec
 
 logger = logging.getLogger(__name__)
+
+_request_read_only: ContextVar[bool] = ContextVar(
+    "ha_mcp_request_read_only", default=False
+)
+
+
+def is_read_only() -> bool:
+    """Apply the global setting or the current HTTP endpoint's restriction."""
+    return get_global_settings().read_only_mode or _request_read_only.get()
+
+
+@contextmanager
+def read_only_request() -> Iterator[None]:
+    """Restrict this request and its nested tool calls without affecting others."""
+    token = _request_read_only.set(True)
+    try:
+        yield
+    finally:
+        _request_read_only.reset(token)
+
+
+def read_only_remedy_hint() -> str:
+    """User-facing guidance for lifting Read Only Mode.
+
+    Deliberately never names the ``/readonly`` endpoint suffix: #2433 wants
+    this restriction to hold even for an untrusted model that could talk a
+    user into dropping it. The global setting has no such escape-hatch risk,
+    so it stays nameable when it is the (or an) active source.
+    """
+    if get_global_settings().read_only_mode:
+        return (
+            "To allow changes, the user must turn off Read Only Mode in the "
+            "ha-mcp settings UI (Tools tab) or the app (add-on) configuration."
+        )
+    return "This connection is read-only. If changes are needed, ask the user."
 
 
 class ReadOnlyExemption(NamedTuple):
@@ -74,13 +118,13 @@ def _backup_write(args: dict[str, Any]) -> str | None:
         return None
     if scope == "snapshot" and action == "list":
         return None
+    if scope == "settings" and action == "export":
+        return None
     return f"scope={scope!r}, action={action!r}"
 
 
-# Add-on parameters that, when present, mean the call mutates add-on
-# configuration (so the read-only middleware must block it). Module-level
-# so the schema-drift guard test (test_read_only.py) can pin an
-# independent manifest against it — see item 10b / ha_manage_addon.
+# ha_manage_app parameters that, set to anything but None, make the call an
+# app (add-on) configuration change, which the read-only middleware blocks.
 _ADDON_CONFIG_WRITE_PARAMS = ("options", "network", "boot", "auto_update", "watchdog")
 
 
@@ -90,7 +134,7 @@ def _addon_write(args: dict[str, Any]) -> str | None:
         return f"action={action!r}"
     for param in _ADDON_CONFIG_WRITE_PARAMS:
         if args.get(param) is not None:
-            return f"add-on configuration change ({param}=...)"
+            return f"app (add-on) configuration change ({param}=...)"
     if args.get("array_patch") is not None:
         return "array_patch modification"
     if args.get("websocket"):
@@ -125,6 +169,15 @@ def _pipeline_write(args: dict[str, Any]) -> str | None:
     return f"action={action!r}"
 
 
+def _security_policy_write(args: dict[str, Any]) -> str | None:
+    # ``action`` has no schema default, so an absent key is a malformed call
+    # rather than an implicit read — fail closed.
+    action = args.get("action")
+    if action == "get":
+        return None
+    return f"action={action!r}"
+
+
 def _custom_tool_write(args: dict[str, Any]) -> str | None:
     if args.get("list_saved") and not args.get("code") and not args.get("run_saved"):
         return None
@@ -143,19 +196,52 @@ def _updates_write(args: dict[str, Any]) -> str | None:
     return f"action={action!r}"
 
 
-def _dashboard_get_write(args: dict[str, Any]) -> str | None:
-    """Allow config/list/search reads; fail closed on a screenshot render."""
-    include_screenshot = args.get("include_screenshot")
-    if include_screenshot is None or include_screenshot is False:
+def _blueprint_write(args: dict[str, Any]) -> str | None:
+    # Reads (allowed): listing installed blueprints and reading one's
+    # metadata/inputs/body. ``substitute`` joins them because it is a pure
+    # render — core builds the standalone config in memory and sends it back,
+    # touching neither the blueprint store nor any automation/script; writing
+    # the rendered config anywhere still needs ha_config_set_automation /
+    # ha_config_set_script, which read-only mode blocks. ``import`` (writes a
+    # blueprint file), ``save`` (overwrites one with caller-supplied YAML) and
+    # ``delete`` stay blocked, and a missing/unknown action fails closed.
+    action = args.get("action")
+    if action in ("list", "get", "substitute"):
         return None
-    return "dashboard screenshot render (Puppet persists theme/dark preferences)"
+    return f"action={action!r}"
+
+
+def _theme_write(args: dict[str, Any]) -> str | None:
+    # Reads (allowed): listing installed themes and inspecting the screenshot
+    # engine account's saved per-user theme. The latter has no pure-read
+    # duplicate anywhere, and it is exactly what a caller needs in Read Only
+    # Mode: captures still make the engine persist a theme and still warn about
+    # it, so the value must stay inspectable even when restoring it is blocked.
+    # Both writes -- the backend default ('set') and the engine-account restore
+    # ('set_engine_theme') -- stay blocked. A missing action fails closed.
+    if args.get("action") in ("list", "get_engine_theme"):
+        return None
+    return f"action={args.get('action')!r}"
+
+
+def _logs_write(args: dict[str, Any]) -> str | None:
+    # Reads (allowed): Core's statistics listing and its validation issues,
+    # and describe=True, which sends no operation. Strict ``is True`` for the
+    # reason given at dry_run above.
+    if args.get("describe") is True or args.get("action") in (
+        "recorder/list_statistic_ids",
+        "recorder/validate_statistics",
+    ):
+        return None
+    return f"action={args.get('action')!r}"
 
 
 def _radio_write(args: dict[str, Any]) -> str | None:
     action = args.get("action")
     # Reads (allowed): per-node diagnostics, the integration/network summary,
     # the active reachability probe, a single Zigbee cluster-attribute read, and
-    # the Thread dataset listing. Everything else is a write — commission/add,
+    # the Thread dataset listing, and Z-Wave configuration-parameter reads
+    # (cache or explicit device request). Everything else is a write — commission/add,
     # remove, reinterview, firmware, fabric/credential/channel/network changes,
     # plus the two actions that LOOK read-ish but are not: zigbee network_backup
     # (creates a backup artifact + key material, like ha_manage_backup's blocked
@@ -167,19 +253,24 @@ def _radio_write(args: dict[str, Any]) -> str | None:
         "ping",
         "cluster_read",
         "list_datasets",
+        "get_config_params",
+        "get_config_param",
     ):
         return None
     return f"action={action!r}"
 
 
 # Mixed read/write tools whose read surface has no pure-read duplicate
-# (verified per tool: ha_get_addon cannot proxy-read addon-internal
+# (verified per tool: ha_get_app cannot proxy-read addon-internal
 # APIs; energy prefs and assist pipelines are reachable only through
 # these tools; edit-backup listing exists nowhere else; the saved-tools
 # cache is only listable here; ha_manage_radio's 'ping' probe, 'cluster_read'
-# and 'list_datasets' have no pure-read duplicate elsewhere, while its
-# 'diagnostics'/'network_status' reads mirror ha_get_device /
-# ha_get_system_health but stay reachable here mid-management). Everything
+# 'list_datasets', 'get_config_params' and 'get_config_param' have no pure-read
+# duplicate elsewhere, while its
+# 'diagnostics'/'network_status' reads overlap ha_get_device /
+# ha_get_system_health but stay reachable here mid-management;
+# ha_manage_security_policy's policy read is duplicated only by the
+# dev-mode-only ha_dev_manage_settings('get_policy')). Everything
 # NOT in this table and not ``readOnlyHint=True`` is hidden and blocked
 # outright.
 #
@@ -191,17 +282,19 @@ def _radio_write(args: dict[str, Any]) -> str | None:
 # against the real registered catalog at PR time, so the two sets
 # cannot drift apart silently.
 READ_ONLY_EXEMPT_TOOLS: dict[str, ReadOnlyExemption] = {
-    "ha_config_get_dashboard": ReadOnlyExemption(
-        _dashboard_get_write,
-        "dashboard config, list, and search reads with include_screenshot=false",
+    "ha_manage_theme": ReadOnlyExemption(
+        _theme_write,
+        "listing installed themes (action='list') and reading the screenshot "
+        "engine account's saved theme (action='get_engine_theme')",
     ),
     "ha_manage_backup": ReadOnlyExemption(
         _backup_write,
         "listing, viewing, and diffing per-edit backups (scope='edits', "
-        "action='list', 'view', or 'diff') and listing snapshots "
-        "(scope='snapshot', action='list')",
+        "action='list', 'view', or 'diff'), listing snapshots "
+        "(scope='snapshot', action='list') and exporting settings "
+        "(scope='settings', action='export')",
     ),
-    "ha_manage_addon": ReadOnlyExemption(
+    "ha_manage_app": ReadOnlyExemption(
         _addon_write,
         "HTTP GET proxy reads of add-on APIs (slug + path, method='GET')",
     ),
@@ -223,7 +316,8 @@ READ_ONLY_EXEMPT_TOOLS: dict[str, ReadOnlyExemption] = {
         "node diagnostics ('diagnostics'), the integration/network summary "
         "('network_status'), the active reachability probe ('ping'), a Zigbee "
         "cluster-attribute read ('cluster_read'), and the Thread dataset "
-        "listing ('list_datasets')",
+        "listing ('list_datasets'), and Z-Wave parameter reads "
+        "('get_config_params' / 'get_config_param', including explicit refresh)",
     ),
     # Update listing/details exist only here — ha_get_updates was merged
     # into this tool (issue #1726), so hiding it would remove the read
@@ -233,13 +327,37 @@ READ_ONLY_EXEMPT_TOOLS: dict[str, ReadOnlyExemption] = {
         "listing pending updates (action='list', the default) and reading "
         "update details/release notes (action='get')",
     ),
+    # Reading the security-policy document has no pure-read duplicate in
+    # standard mode: ha_dev_manage_settings('get_policy') is the only other
+    # reader and dev mode is off by default. Editing the policy stays
+    # blocked — it is exactly the kind of write read-only mode exists for.
+    "ha_manage_security_policy": ReadOnlyExemption(
+        _security_policy_write,
+        "reading the policy document (action='get')",
+    ),
+    # The recorder's statistics listing and Core's issues with them exist
+    # only here.
+    "ha_manage_logs": ReadOnlyExemption(
+        _logs_write,
+        "listing the recorder's statistics (action='recorder/list_statistic_ids'), "
+        "reading Core's issues with them (action='recorder/validate_statistics') "
+        "and describing any action (describe=true)",
+    ),
+    # Blueprint listing and reading exist only here — ha_get_blueprint was
+    # merged into this tool (issue #2329), so hiding it would remove the read
+    # surface entirely.
+    "ha_manage_blueprints": ReadOnlyExemption(
+        _blueprint_write,
+        "listing and reading blueprints (action='list' or 'get') and "
+        "rendering a standalone config (action='substitute')",
+    ),
 }
 
 
 def is_read_safe(tool: Tool) -> bool:
     """Return True when the tool's annotations declare it read-only."""
     annotations = getattr(tool, "annotations", None)
-    return bool(annotations and getattr(annotations, "readOnlyHint", None) is True)
+    return bool(annotations and annotations.read_only_hint is True)
 
 
 def read_only_visible(tool: Tool) -> bool:
@@ -250,6 +368,17 @@ def read_only_visible(tool: Tool) -> bool:
 def _raise_read_only_error(
     name: str, *, blocked_operation: str | None = None, allowed: str | None = None
 ) -> NoReturn:
+    raise_tool_error(
+        read_only_error_response(
+            name, blocked_operation=blocked_operation, allowed=allowed
+        )
+    )
+
+
+def read_only_error_response(
+    name: str, *, blocked_operation: str | None = None, allowed: str | None = None
+) -> dict[str, Any]:
+    """The structured ``READ_ONLY_MODE`` error for a blocked call to *name*."""
     context: dict[str, Any] = {"tool_name": name, "read_only_mode": True}
     if blocked_operation is not None:
         context["blocked_operation"] = blocked_operation
@@ -266,20 +395,22 @@ def _raise_read_only_error(
             f"'{name}' is a write-capable tool, so the call was blocked — "
             f"no changes were made."
         )
-    raise_tool_error(
-        create_error_response(
-            ErrorCode.READ_ONLY_MODE,
-            message,
-            suggestions=[
-                "Continue with read-only tools — searching, getting, and "
-                + "listing data all remain available.",
-                "If the user wants to allow changes, they must turn off "
-                + "Read Only Mode in the ha-mcp settings UI (Tools tab) or "
-                + "the add-on configuration.",
-            ],
-            context=context,
-        )
+    return create_error_response(
+        ErrorCode.READ_ONLY_MODE,
+        message,
+        suggestions=[
+            "Continue with read-only tools — searching, getting, and "
+            + "listing data all remain available.",
+            read_only_remedy_hint(),
+        ],
+        context=context,
     )
+
+
+def require_write_access(tool_name: str) -> None:
+    """Reject direct tool execution while Read Only Mode is enabled."""
+    if is_read_only():
+        _raise_read_only_error(tool_name)
 
 
 class ReadOnlyToolsTransform(Transform):
@@ -291,7 +422,7 @@ class ReadOnlyToolsTransform(Transform):
     """
 
     async def list_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
-        if not get_global_settings().read_only_mode:
+        if not is_read_only():
             return tools
         return [t for t in tools if read_only_visible(t)]
 
@@ -299,7 +430,7 @@ class ReadOnlyToolsTransform(Transform):
         self, name: str, call_next: GetToolNext, *, version: VersionSpec | None = None
     ) -> Tool | None:
         tool = await call_next(name, version=version)
-        if tool is None or not get_global_settings().read_only_mode:
+        if tool is None or not is_read_only():
             return tool
         return tool if read_only_visible(tool) else None
 
@@ -366,32 +497,6 @@ class ReadOnlyMiddleware(Middleware):
             return "write"
         return "unknown"
 
-    @staticmethod
-    def _coerce_arguments(arguments: Any) -> dict[str, Any] | None:
-        """Normalise a proxy envelope's ``arguments`` to a dict or None.
-
-        The categorized proxies tolerate ``arguments`` arriving as a JSON
-        string (small models sometimes serialize it) and json.loads it
-        AFTER this middleware runs (categorized_search.py ~313-352). So:
-        a dict is used as-is; an absent value (``None``) becomes ``{}``
-        (a legitimate no-argument call, not malformed); a string is
-        parsed and only a JSON *object* yields a dict. Anything else — an
-        unparseable string, a non-dict JSON value (list/scalar/null), or
-        a non-str/non-dict type — returns None, meaning "malformed
-        envelope".
-        """
-        if isinstance(arguments, dict):
-            return arguments
-        if arguments is None:
-            return {}
-        if isinstance(arguments, str):
-            try:
-                parsed = json.loads(arguments)
-            except (json.JSONDecodeError, ValueError):
-                return None
-            return parsed if isinstance(parsed, dict) else None
-        return None
-
     @classmethod
     def _unwrap_proxy_call(
         cls,
@@ -407,7 +512,7 @@ class ReadOnlyMiddleware(Middleware):
         lets the middleware decide on the inner call first. Mirrors the
         proxy's own double-wrap unwrapping.
 
-        ``arguments`` is coerced at every level (see _coerce_arguments)
+        ``arguments`` is coerced at every level (see coerce_proxy_arguments)
         because the proxy accepts it as a JSON string. Returns None when
         there is no usable envelope — including when ``arguments`` is a
         MALFORMED string (json.loads fails, or the JSON is not an object).
@@ -417,15 +522,15 @@ class ReadOnlyMiddleware(Middleware):
         (categorized_search.py ~313-352), so no write can occur.
         """
         name = args.get("name")
-        arguments = cls._coerce_arguments(args.get("arguments"))
+        arguments = coerce_proxy_arguments(args.get("arguments"))
         while (
             isinstance(name, str)
-            and name in PROXY_META_TOOLS
+            and name in CALL_PROXY_META_TOOLS
             and isinstance(arguments, dict)
             and isinstance(arguments.get("name"), str)
         ):
             name = arguments.get("name")
-            arguments = cls._coerce_arguments(arguments.get("arguments"))
+            arguments = coerce_proxy_arguments(arguments.get("arguments"))
         if not isinstance(name, str):
             return None
         if arguments is None:
@@ -440,23 +545,36 @@ class ReadOnlyMiddleware(Middleware):
     async def on_call_tool(
         self, context: MiddlewareContext, call_next: CallNext
     ) -> Any:
-        if not get_global_settings().read_only_mode:
+        if not is_read_only():
             return await call_next(context)
 
-        name = context.message.name
+        # RenamedToolAliasMiddleware runs ahead of this one and normally
+        # rewrites a retired name before it gets here. Resolving it again costs
+        # a dict lookup and removes the ordering dependency: were this gate ever
+        # registered ahead of the alias, it would read a name no exemption is
+        # keyed on, which does not fail closed.
+        name = current_tool_name(context.message.name)
         args = context.message.arguments or {}
 
         # Call proxies: decide on the INNER call (see _unwrap_proxy_call).
-        # ha_search_tools and envelope-less proxy calls pass through —
-        # searching is a read, and the proxy raises its own validation
-        # error for a missing inner name. When the inner call is allowed,
-        # the proxy dispatch re-enters this middleware with the real tool
-        # name anyway (harmless re-check, same verdict).
-        if name in PROXY_META_TOOLS:
+        # Envelope-less proxy calls pass through because the proxy raises its own
+        # validation error for a missing inner name. When the inner call is
+        # allowed, proxy dispatch re-enters this middleware with the real tool name
+        # anyway (harmless re-check, same verdict). ``ha_search_tools`` is not a
+        # dispatch proxy; it reaches generic classification below as an unknown
+        # synthetic tool, which passes through to the search transform (or the
+        # stale-tool hint path when search is disabled).
+        if name in CALL_PROXY_META_TOOLS:
             unwrapped = self._unwrap_proxy_call(args)
             if unwrapped is None:
                 return await call_next(context)
             inner_name, inner_args = unwrapped
+            # The envelope carries whatever name the client knows the tool by.
+            # An exemption is keyed on the current one, and a miss here does
+            # not block: _classify would call the stale name unknown, which is
+            # not "write", and the call would pass straight through to the
+            # proxy — which resolves the rename and dispatches the write tool.
+            inner_name = current_tool_name(inner_name)
             exemption = READ_ONLY_EXEMPT_TOOLS.get(inner_name)
             if exemption is not None:
                 blocked = exemption.blocked_write(inner_args)

@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from fastmcp.utilities.types import Image
-from mcp.types import ImageContent
+from ha_mcp._vendor.fastmcp.utilities.types import Image
+from ha_mcp._vendor.mcp.types import ImageContent
 
 from ..errors import ErrorCode, create_error_response
 from ..tools.helpers import raise_tool_error
@@ -23,7 +23,7 @@ def dashboard_image_content(
             image = Image(
                 data=capture.data, format=capture.image_format
             ).to_image_content(mime_type=capture.mime_type)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise_tool_error(
                 create_error_response(
                     ErrorCode.IMAGE_SERIALIZATION_FAILED,

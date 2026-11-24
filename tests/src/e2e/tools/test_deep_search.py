@@ -101,9 +101,10 @@ async def test_deep_search_automation(mcp_client):
 
     finally:
         # Cleanup: Delete the test automation
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_config_remove_automation",
-            {"identifier": "automation.deep_search_test_automation"},
+            {"entity_id": "automation.deep_search_test_automation"},
         )
         logger.info("🧹 Cleaned up test automation")
 
@@ -189,7 +190,7 @@ async def test_deep_search_script(mcp_client):
                 {"script_id": "deep_search_test_script"},
             )
             logger.info("🧹 Cleaned up test script")
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.warning(
                 "⚠️ Cleanup of test script failed (may not have been created)"
             )
@@ -212,7 +213,7 @@ async def test_deep_search_helper(mcp_client):
         {
             "helper_type": "input_select",
             "name": helper_config["name"],
-            "options": helper_config["options"],
+            "config": {"options": helper_config["options"]},
         },
     )
     create_data = assert_mcp_success(create_result, "Create test helper")
@@ -256,7 +257,8 @@ async def test_deep_search_helper(mcp_client):
 
     finally:
         # Cleanup: Delete the test helper
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_remove_helpers_integrations",
             {
                 "helper_type": "input_select",
@@ -288,14 +290,13 @@ async def test_deep_search_finds_ui_template_helper(mcp_client):
     # match on it can only come from probing the options flow config.
     body_marker = "deepsearchtemplatebody4471"
     config = {
-        "next_step_id": "sensor",
         "name": "Deep Search Template Helper",
         "state": "{{ states('sensor." + body_marker + "') }}",
     }
 
     create_result = await mcp_client.call_tool(
         "ha_config_set_helper",
-        {"helper_type": "template", "name": config["name"], "config": config},
+        {"helper_type": "template", "menu_choice": "sensor", "config": config},
     )
     create_data = assert_mcp_success(create_result, "Create template helper")
     entry_id = create_data.get("entry_id")
@@ -379,13 +380,13 @@ async def test_deep_search_finds_ui_template_helper(mcp_client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "helper_type,name,config",
+    "helper_type,menu_choice,name,config",
     [
         pytest.param(
             "group",
+            "light",
             "Deep Search Group E2E",
             {
-                "group_type": "light",
                 "name": "Deep Search Group E2E",
                 "entities": [],
                 "hide_members": False,
@@ -394,6 +395,7 @@ async def test_deep_search_finds_ui_template_helper(mcp_client):
         ),
         pytest.param(
             "min_max",
+            None,
             "Deep Search MinMax E2E",
             {
                 "name": "Deep Search MinMax E2E",
@@ -408,12 +410,12 @@ async def test_deep_search_finds_ui_template_helper(mcp_client):
     ],
 )
 async def test_deep_search_finds_non_template_flow_helpers(
-    mcp_client, helper_type, name, config
+    mcp_client, helper_type, menu_choice, name, config
 ):
     """deep_search surfaces non-template flow-based helpers too (issue #1457).
 
-    The flow-helper branch lists config entries for every domain in
-    ``FLOW_HELPER_TYPES``, so a group (menu-rooted flow) and a min_max (single
+    The flow-helper branch lists config entries for every helper flow Home
+    Assistant lists, so a group (menu-rooted flow) and a min_max (single
     form) must be findable by name alongside template helpers — not just the
     ``template`` domain.
     """
@@ -421,7 +423,7 @@ async def test_deep_search_finds_non_template_flow_helpers(
 
     create_result = await mcp_client.call_tool(
         "ha_config_set_helper",
-        {"helper_type": helper_type, "name": name, "config": config},
+        {"helper_type": helper_type, "menu_choice": menu_choice, "config": config},
     )
     create_data = assert_mcp_success(create_result, f"Create {helper_type} helper")
     entry_id = create_data.get("entry_id")
@@ -464,13 +466,12 @@ async def test_deep_search_flow_helper_fuzzy_probes_config(mcp_client):
 
     body_marker = "fuzzyflowbodymarker7788"
     config = {
-        "next_step_id": "sensor",
         "name": "Deep Search Fuzzy Template",
         "state": "{{ states('sensor." + body_marker + "') }}",
     }
     create_result = await mcp_client.call_tool(
         "ha_config_set_helper",
-        {"helper_type": "template", "name": config["name"], "config": config},
+        {"helper_type": "template", "menu_choice": "sensor", "config": config},
     )
     create_data = assert_mcp_success(create_result, "Create fuzzy template helper")
     entry_id = create_data.get("entry_id")
@@ -695,7 +696,8 @@ async def test_deep_search_default_surfaces_created_scene(mcp_client):
             f"✅ Default deep_search surfaced the created scene ({len(scenes)} total)"
         )
     finally:
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_config_remove_scene",
             {"scene_id": scene_id, "wait": False},
         )

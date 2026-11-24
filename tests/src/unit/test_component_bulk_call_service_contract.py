@@ -1,124 +1,75 @@
-"""Cross-seam contract test for the component ``bulk_call_service`` write capability.
+"""``bulk_device_control`` through the component's ``bulk_call_service`` on Core.
 
-Wires the REAL component batch functions (``_bulk_call_service_prep`` ->
-``_do_bulk_call_service``, driven against a FakeHass-backed ``hass.services`` /
-``hass.bus``) underneath the mocked WS transport and invokes the REAL
-``bulk_device_control`` consumer — so a shape drift on either side of the batch write
-seam fails here. Two seams are pinned: a confirmed two-op batch (the mapped consumer
-response matches the legacy bulk shape — successful counts, inline-confirmed per-op
-results, no operation-id polling handles), and the D1 batch domain block (the real
-component prep fail-closes the WHOLE batch on a reserved-domain op before any
-dispatch — the authoritative block that holds regardless of which path reaches it).
+The server's own client runs against a real ``hass`` with the ``ha_mcp_tools/*``
+commands registered, so the batch frame the server builds is validated and run
+by the component and the per-op results it maps come from Core's own service
+calls and state machine. The lights and the switch are devices below Core's own
+``light`` and ``switch`` integrations (``_switched_states``). The legacy per-op
+dispatch is spied on and must never run when the component serves the batch.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-import pytest
+from homeassistant.core import HomeAssistant
 
-from ha_mcp.tools import component_api, device_control
+from ha_mcp.client.rest_client import HomeAssistantClient
 from ha_mcp.tools.device_control import DeviceControlTools
 
-from ._component_routing_helpers import patch_ws
-
-# Importing the phase-2 async component suite installs the homeassistant.* stubs,
-# pins ServiceNotFound / EVENT_STATE_CHANGED onto them, and exposes the fake bulk
-# services / bus / hass builder the real component batch prep runs against.
-from .test_component_ws_phase2_async import (
-    _call_hass,
-    _FakeBulkServices,
-    _FakeBus,
-    wsapi,
-)
-from .test_component_ws_search import FakeState
+from ._component_core import ws_call
+from ._switched_states import UNAVAILABLE, set_up_devices
 
 
-def _real_bulk_ws(hass: Any) -> AsyncMock:
-    """A WS mock whose ``bulk_call_service`` frame is served by the REAL batch prep.
-
-    ``info`` returns the real ``_do_info()`` (so the caps probe sees
-    ``bulk_call_service`` advertised), and the batch command runs the REAL
-    ``_bulk_call_service_prep`` (the all-guards-first D1 pass, the one register-before-
-    fire sweep, the dispatch fan-out, the one shared bounded wait) against ``hass``
-    and formats it through the REAL ``_do_bulk_call_service``.
-    """
-    ws = AsyncMock()
-
-    async def _send(command_type: str, **kwargs: Any) -> dict[str, Any]:
-        if command_type == "ha_mcp_tools/info":
-            return {"success": True, "result": wsapi._do_info()}
-        if command_type == wsapi.WS_BULK_CALL_SERVICE:
-            msg = {"type": wsapi.WS_BULK_CALL_SERVICE, **kwargs}
-            extra = await wsapi._bulk_call_service_prep(hass, msg)
-            return {
-                "success": True,
-                "result": wsapi._do_bulk_call_service(hass, msg, **extra),
-            }
-        raise AssertionError(f"unexpected command {command_type!r}")
-
-    ws.send_command = AsyncMock(side_effect=_send)
-    return ws
+@contextmanager
+def _no_legacy_dispatch(client: HomeAssistantClient) -> Iterator[None]:
+    """The legacy per-op dispatch and its pre-validation must not run."""
+    with (
+        patch.object(
+            client, "call_service", AsyncMock(wraps=client.call_service)
+        ) as call_service,
+        patch.object(
+            client, "get_entity_state", AsyncMock(wraps=client.get_entity_state)
+        ) as get_entity_state,
+    ):
+        yield
+    call_service.assert_not_awaited()
+    get_entity_state.assert_not_awaited()
 
 
-class ContractClient:
-    """Credentialed HA client whose legacy per-op dispatch must NEVER fire when routed."""
-
-    def __init__(self) -> None:
-        self.base_url = "http://ha.local:8123"
-        self.token = "tok"
-
-    async def call_service(self, *args: Any, **kwargs: Any) -> Any:
-        raise AssertionError(
-            "legacy per-op dispatch must not run when component-served"
+async def _bulk(
+    client: HomeAssistantClient, operations: list[dict[str, Any]]
+) -> dict[str, Any]:
+    with _no_legacy_dispatch(client):
+        result: dict[str, Any] = await DeviceControlTools(client).bulk_device_control(
+            operations=operations, parallel=True
         )
-
-    async def get_entity_state(self, *args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("legacy validate must not run when component-served")
+    return result
 
 
-@pytest.fixture(autouse=True)
-def _clear_caps_cache() -> Any:
-    component_api._CAPS_CACHE.clear()
-    component_api._CAPS_LOCKS.clear()
-    yield
-    component_api._CAPS_CACHE.clear()
-    component_api._CAPS_LOCKS.clear()
+async def _unavailable_lamp(hass: HomeAssistant, behaviour: str) -> None:
+    """``light.b`` out of Core's reach, doing ``behaviour`` when a call names it."""
+    devices = await set_up_devices(hass, {"light.b": UNAVAILABLE})
+    devices.behaviour["light.b"] = behaviour
 
 
-@pytest.mark.asyncio
-async def test_confirmed_batch_maps_to_legacy_shape() -> None:
-    """A confirmed two-op batch through the REAL component prep + REAL consumer maps
-    into the legacy bulk response shape with inline-confirmed per-op results."""
-    new_a = FakeState("light.a", state="on")
-    new_b = FakeState("switch.b", state="on")
-    bus = _FakeBus()
-    services = _FakeBulkServices(
-        behaviors={
-            ("light", "turn_on"): {"on_call": lambda: bus.fire("light.a", new_a)},
-            ("switch", "turn_on"): {"on_call": lambda: bus.fire("switch.b", new_b)},
-        }
+async def test_a_confirmed_batch_maps_to_the_legacy_bulk_shape(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    devices = await set_up_devices(hass, {"light.a": "off", "switch.b": "off"})
+
+    resp = await _bulk(
+        component_core_client,
+        [
+            {"entity_id": "light.a", "action": "on"},
+            {"entity_id": "switch.b", "action": "on"},
+        ],
     )
-    hass = _call_hass(
-        [FakeState("light.a", state="off"), FakeState("switch.b", state="off")],
-        services,
-        bus,
-    )
-    ws = _real_bulk_ws(hass)
-    client = ContractClient()
-    tools = DeviceControlTools(client)
 
-    with patch_ws(ws, device_control):
-        resp = await tools.bulk_device_control(
-            operations=[
-                {"entity_id": "light.a", "action": "on"},
-                {"entity_id": "switch.b", "action": "on"},
-            ],
-            parallel=True,
-        )
-
-    # Legacy bulk shape, all component-served + confirmed inline.
     assert resp["total_operations"] == 2
     assert resp["successful_commands"] == 2
     assert resp["failed_commands"] == 0
@@ -135,39 +86,147 @@ async def test_confirmed_batch_maps_to_legacy_shape() -> None:
         "data": {"entity_id": "light.a"},
     }
     assert switch_res["confirmed"] is True
-    # Both ops dispatched exactly once on the component side.
-    assert services.call_count == 2
+    assert sorted(devices.targets()) == ["light.a", "switch.b"]
 
 
-@pytest.mark.asyncio
-async def test_component_bulk_prep_fail_closes_on_reserved_domain() -> None:
-    """The authoritative D1 batch block: driving the REAL batch prep with an op whose
-    resolved domain is ha_mcp_tools fail-closes the WHOLE batch BEFORE any dispatch —
-    even the valid op ahead of it never fires (all-guards-first)."""
-    bus = _FakeBus()
-    services = _FakeBulkServices(
-        known={("light", "turn_on"), ("ha_mcp_tools", "get_caller_token")}
-    )
-    hass = _call_hass([FakeState("light.a", state="off")], services, bus)
+async def test_a_nonexistent_entity_in_a_batch_fails_without_waiting_for_it(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    """The missing target is left out of the shared wait: the batch returns at
+    once instead of running the missing op's 10 s wait to its end."""
+    devices = await set_up_devices(hass, {"light.a": "off"})
 
-    with pytest.raises(Exception) as exc:
-        await wsapi._bulk_call_service_prep(
-            hass,
-            {
-                "type": wsapi.WS_BULK_CALL_SERVICE,
-                "operations": [
-                    {
-                        "domain": "light",
-                        "service": "turn_on",
-                        "entity_ids": ["light.a"],
-                    },
-                    {"domain": "ha_mcp_tools", "service": "get_caller_token"},
-                ],
-            },
+    async with asyncio.timeout(5):
+        resp = await _bulk(
+            component_core_client,
+            [
+                {"entity_id": "light.a", "action": "on"},
+                {"entity_id": "light.missing", "action": "on"},
+            ],
         )
 
-    assert "not callable" in str(exc.value)
-    # Zero dispatches for the whole batch — not even the valid op ahead of the
-    # refused one — and no register-before-fire listener.
-    assert services.call_count == 0
-    assert bus.listeners == []
+    assert resp["total_operations"] == 2
+    assert resp["successful_commands"] == 1
+    assert resp["failed_commands"] == 1
+    valid_res, missing_res = resp["results"]
+    assert valid_res["entity_id"] == "light.a"
+    assert valid_res["confirmed"] is True
+    assert missing_res["entity_id"] == "light.missing"
+    assert missing_res["error"]["code"] == "ENTITY_NOT_FOUND"
+    # Both ops are dispatched; Core's light service hands the unmatched
+    # target to no device.
+    assert devices.targets() == ["light.a"]
+
+
+async def test_an_unavailable_entity_that_never_reconnects_is_reported_unavailable(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    devices = await set_up_devices(hass, {"light.b": UNAVAILABLE})
+
+    resp = await _bulk(
+        component_core_client,
+        [{"entity_id": "light.b", "action": "on", "timeout_seconds": 0.05}],
+    )
+
+    assert resp["failed_commands"] == 1
+    (result,) = resp["results"]
+    assert result["error"]["code"] == "ENTITY_UNAVAILABLE"
+    # The caller can tell this apart from an op that never dispatched; Core
+    # skipped the unavailable light itself.
+    assert result.get("dispatched") is True
+    assert devices.calls == []
+
+
+async def test_a_comma_separated_target_is_not_reported_missing(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    """``light.a,light.b`` is no literal entity, so its empty pre-state is no
+    proof that an entity is missing."""
+    devices = await set_up_devices(hass, {"light.a": "on", "light.b": "on"})
+
+    resp = await _bulk(
+        component_core_client, [{"entity_id": "light.a,light.b", "action": "off"}]
+    )
+
+    assert resp["failed_commands"] == 0
+    (result,) = resp["results"]
+    assert "error" not in result
+    assert sorted(devices.targets()) == ["light.a", "light.b"]
+
+
+async def test_an_unavailable_target_removed_during_the_call_is_reported_not_found(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    await _unavailable_lamp(hass, "remove")
+
+    resp = await _bulk(
+        component_core_client,
+        [{"entity_id": "light.b", "action": "on", "timeout_seconds": 0.05}],
+    )
+
+    assert resp["failed_commands"] == 1
+    (result,) = resp["results"]
+    assert result["error"]["code"] == "ENTITY_NOT_FOUND"
+
+
+async def test_an_unavailable_target_back_in_another_state_is_not_unavailable(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    """It reconnected to ``off``, not the ``on`` the call asked for: the op is
+    dispatched but unconfirmed, not a false ENTITY_UNAVAILABLE."""
+    await _unavailable_lamp(hass, "off")
+
+    resp = await _bulk(
+        component_core_client,
+        [{"entity_id": "light.b", "action": "on", "timeout_seconds": 0.05}],
+    )
+
+    assert resp["failed_commands"] == 0
+    (result,) = resp["results"]
+    assert "error" not in result
+    assert result["confirmed"] is False
+    assert result["partial"] is True
+
+
+async def test_an_unavailable_target_that_reconnects_and_turns_on_is_confirmed(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient
+) -> None:
+    await _unavailable_lamp(hass, "on")
+
+    resp = await _bulk(
+        component_core_client, [{"entity_id": "light.b", "action": "on"}]
+    )
+
+    assert resp["failed_commands"] == 0
+    assert resp["successful_commands"] == 1
+    (result,) = resp["results"]
+    assert result["confirmed"] is True
+    assert result["final_state"] == "on"
+
+
+async def test_a_batch_with_an_ha_mcp_tools_op_dispatches_nothing(
+    hass: HomeAssistant, component_ws: Any
+) -> None:
+    """Every op is checked before any runs: the valid op ahead of the refused
+    one never fires, and no confirmation listener is left on the bus."""
+    devices = await set_up_devices(hass, {"light.a": "off"})
+    listeners = hass.bus.async_listeners()
+
+    reply = await ws_call(
+        component_ws,
+        "ha_mcp_tools/bulk_call_service",
+        operations=[
+            {
+                "domain": "light",
+                "service": "turn_on",
+                "service_data": {"entity_id": "light.a"},
+                "entity_ids": ["light.a"],
+            },
+            {"domain": "ha_mcp_tools", "service": "get_caller_token"},
+        ],
+    )
+
+    assert reply["success"] is False
+    assert "not callable" in reply["error"]["message"]
+    assert devices.calls == []
+    assert hass.bus.async_listeners() == listeners

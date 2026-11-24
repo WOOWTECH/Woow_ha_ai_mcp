@@ -1,12 +1,11 @@
 """Container/Docker-lane E2E for the dashboard screenshot sidecar path.
 
 The inaddon lane (``haos_only/test_dashboard_screenshot_addon.py``) exercises
-the Supervisor auto-discovery branch (``resolve_engine`` mode 2) + addon
-lifecycle against a lightweight mock engine. This module covers the **Docker /
-Container deployment** instead — the explicit
-``HAMCP_DASHBOARD_SCREENSHOT_ENGINE_URL`` sidecar path (``resolve_engine``
-mode 1), a different resolution branch that is otherwise untested. Neither lane
-runs real Chromium: that exercises balloob's add-on, not ha-mcp.
+Puppet Supervisor discovery and app lifecycle against a lightweight mock
+engine. This module covers the **Docker / Container deployment** through the
+explicit ``HAMCP_DASHBOARD_SCREENSHOT_ENGINE_URL`` path and exercises WPE
+Supervisor discovery through a mock Supervisor response. Neither lane runs
+real Chromium: that exercises the separate engine, not ha-mcp.
 
 A faithful FAKE engine stands in for ha-puppet, mirroring the real engine's
 HTTP contract so the capture client is exercised against the same wire shape it
@@ -15,8 +14,9 @@ format=...`` returning a matching native image body sized to the requested viewp
 For ``WIDTHxauto``, the fake uses a deterministic simulated content height.
 What is covered end-to-end here:
 
-* the explicit-URL resolution branch + the httpx capture client + the request
-  contract (asserted: the engine actually received the viewport/format params);
+* explicit-URL and WPE Supervisor-discovery branches + the httpx capture
+  client + the request contract (asserted: the engine received viewport and
+  format parameters);
 * ``ha_get_dashboard_screenshot`` returning an image;
 * ``include_screenshot`` / ``return_screenshot`` on the dashboard config tools
   (the HA-dependent create-and-see path).
@@ -25,7 +25,7 @@ Beta gating is the real production gate (``ENABLE_BETA_FEATURES`` master +
 ``HAMCP_ENABLE_DASHBOARD_SCREENSHOT`` sub-flag); the tool is only registered
 when both are on, same as for end users. The engine's *failure* degradation
 (feature off / engine unreachable → warning, never breaks the op) is pinned by
-the unit tests in ``tests/src/unit/test_dashboard_screenshot.py``.
+the unit tests in ``tests/src/unit/test_dashboard_screenshot_*.py``.
 
 ``container_only``: the test builds an in-process MCP server, which the inaddon
 lane does not have (it already covers the real engine), and the external-HAOS
@@ -39,17 +39,20 @@ import json
 import struct
 import threading
 import zlib
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastmcp import Client
-from fastmcp.exceptions import ToolError
 from test_constants import TEST_TOKEN
 
+from ha_mcp._vendor.fastmcp import Client
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 from ha_mcp.client.rest_client import HomeAssistantClient
 from ha_mcp.server import HomeAssistantSmartMCPServer
+
+from ..utilities.assertions import safe_call_tool
 
 pytestmark = [pytest.mark.container_only]
 
@@ -249,7 +252,7 @@ def _extract_png_bytes(result: Any) -> bytes | None:
         if isinstance(data, str):
             try:
                 return base64.b64decode(data)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 continue
         if isinstance(data, (bytes, bytearray)):
             return bytes(data)
@@ -318,6 +321,84 @@ async def test_get_dashboard_screenshot_returns_png(
     assert last["params"].get("format") == "png", last["params"]
 
 
+async def test_wpe_supervisor_discovery_returns_dashboard_image(
+    screenshot_mcp_client: Client,
+    fake_engine: _FakeEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Supervisor discovery selects the verified WPE app and renders via MCP."""
+    import httpx
+
+    import ha_mcp.config
+    from ha_mcp.client import supervisor_client
+    from ha_mcp.dashboard_screenshot import provision
+
+    engine_port = urlparse(fake_engine.url).port
+    assert engine_port is not None
+    monkeypatch.setattr(
+        provision,
+        "_SUPPORTED_ENGINES",
+        tuple(
+            replace(profile, port=engine_port)
+            if profile.name == "WPE Screenshot Engine"
+            else profile
+            for profile in provision._SUPPORTED_ENGINES
+        ),
+    )
+    monkeypatch.delenv("HAMCP_DASHBOARD_SCREENSHOT_ENGINE_URL")
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "test-supervisor-token")
+    ha_mcp.config._settings = None
+
+    addons = {"data": {"addons": [{"slug": "test_wpe_screenshot_engine"}]}}
+    engine_info = {
+        "data": {
+            "name": "WPE Screenshot Engine",
+            "state": "started",
+            "hostname": "127.0.0.1",
+            "schema": [
+                {"name": "home_assistant_url"},
+                {"name": "home_assistant_token"},
+                {"name": "dashboard_path"},
+            ],
+            "options": {
+                "home_assistant_url": "http://homeassistant:8123",
+                "home_assistant_token": "not-used-by-discovery",
+                "dashboard_path": "lovelace/energy",
+            },
+        }
+    }
+
+    def supervisor_response(request: httpx.Request) -> httpx.Response:
+        payload = {
+            "/addons": addons,
+            "/addons/test_wpe_screenshot_engine/info": engine_info,
+        }.get(request.url.path)
+        if payload is None:
+            return httpx.Response(404, request=request)
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setattr(
+        supervisor_client,
+        "make_supervisor_httpx_client",
+        lambda **kwargs: httpx.AsyncClient(
+            base_url="http://supervisor",
+            transport=httpx.MockTransport(supervisor_response),
+            timeout=kwargs["timeout"],
+        ),
+    )
+
+    result = await screenshot_mcp_client.call_tool(
+        "ha_get_dashboard_screenshot",
+        {"dashboard_path": "lovelace/0", "width": 640, "height": 480},
+    )
+
+    image = _extract_png_bytes(result)
+    assert image is not None
+    assert _png_dimensions(image) == (640, 480)
+    assert fake_engine.requests[-1]["path"].endswith("/lovelace/0")
+    assert fake_engine.requests[-1]["params"]["viewport"] == "640x480"
+
+
 async def test_non_png_format_survives_full_mcp_transport(
     screenshot_mcp_client: Client, fake_engine: _FakeEngine
 ) -> None:
@@ -334,7 +415,7 @@ async def test_non_png_format_survives_full_mcp_transport(
 
     images = _image_blocks(result)
     assert len(images) == 1
-    assert images[0].mimeType == "image/bmp"
+    assert images[0].mime_type == "image/bmp"
     raw = base64.b64decode(images[0].data)
     assert raw[:2] == b"BM"
     assert struct.unpack("<II", raw[18:26]) == (64, 64)
@@ -363,17 +444,18 @@ async def test_structured_named_view_returns_ordered_responsive_images(
             )
         )
         assert setup.get("success"), f"dashboard create failed: {setup}"
-        assert setup["render_paths"][0]["dashboard_url_path"] == url_path
+        assert setup["render_paths"][0]["url_path"] == url_path
         assert setup["render_paths"][0]["view_path"] == "home"
         request_count = len(fake_engine.requests)
 
         result = await screenshot_mcp_client.call_tool(
             "ha_get_dashboard_screenshot",
             {
-                "dashboard_url_path": url_path,
+                "url_path": url_path,
                 "view_path": "home",
                 "viewport_presets": ["mobile", "desktop"],
-                "theme": "backend-selected-theme",
+                # A seeded theme: a name Home Assistant does not list is refused.
+                "theme": "Test Theme A",
                 "dark_mode": True,
                 "language": "de",
                 "wait_ms": 17,
@@ -398,16 +480,14 @@ async def test_structured_named_view_returns_ordered_responsive_images(
             "1280x800",
         ]
         assert all(request["path"].endswith(f"{url_path}/home") for request in requests)
-        assert all(
-            request["params"]["theme"] == "backend-selected-theme"
-            for request in requests
-        )
+        assert all(request["params"]["theme"] == "Test Theme A" for request in requests)
+        assert any("defines no dark mode" in w for w in payload["warnings"])
         assert all(request["params"]["dark"] == "" for request in requests)
         assert all(request["params"]["lang"] == "de" for request in requests)
         assert all(request["params"]["wait"] == "17" for request in requests)
     finally:
-        await screenshot_mcp_client.call_tool(
-            "ha_config_delete_dashboard", {"url_path": url_path}
+        await safe_call_tool(
+            screenshot_mcp_client, "ha_config_delete_dashboard", {"url_path": url_path}
         )
 
 
@@ -454,7 +534,7 @@ async def test_mislabeled_engine_body_is_rejected_through_mcp(
 async def test_full_page_requests_native_auto_height(
     screenshot_mcp_client: Client, fake_engine: _FakeEngine
 ) -> None:
-    """full_page=True uses Puppet's content-sized WIDTHxauto request."""
+    """full_page=True uses the content-sized WIDTHxauto request."""
     result = await screenshot_mcp_client.call_tool(
         "ha_get_dashboard_screenshot",
         {
@@ -472,8 +552,21 @@ async def test_full_page_requests_native_auto_height(
 
 
 async def test_legacy_full_page_retry_surfaces_warning_through_mcp(
-    screenshot_mcp_client: Client, fake_engine: _FakeEngine
+    screenshot_mcp_client: Client,
+    fake_engine: _FakeEngine,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from ha_mcp.dashboard_screenshot import capture
+    from ha_mcp.dashboard_screenshot.provision import EngineTarget
+
+    async def resolve_legacy_puppet() -> EngineTarget:
+        return EngineTarget(
+            url=fake_engine.url,
+            engine_kind="puppet",
+            engine_version="2.4.9",
+        )
+
+    monkeypatch.setattr(capture, "resolve_engine", resolve_legacy_puppet)
     request_count = len(fake_engine.requests)
     result = await screenshot_mcp_client.call_tool(
         "ha_get_dashboard_screenshot",
@@ -534,7 +627,7 @@ async def test_get_dashboard_include_screenshot(
         )
         payload = _parse_payload(result)
         assert payload.get("success"), f"get_dashboard failed: {payload}"
-        assert payload["render_paths"][0]["dashboard_url_path"] == url_path
+        assert payload["render_paths"][0]["url_path"] == url_path
         assert payload["render_paths"][0]["view_path"] == "overview"
         png = _extract_png_bytes(result)
         assert png is not None, (
@@ -542,8 +635,8 @@ async def test_get_dashboard_include_screenshot(
         )
         _png_dimensions(png)
     finally:
-        await screenshot_mcp_client.call_tool(
-            "ha_config_delete_dashboard", {"url_path": url_path}
+        await safe_call_tool(
+            screenshot_mcp_client, "ha_config_delete_dashboard", {"url_path": url_path}
         )
 
 
@@ -573,7 +666,7 @@ async def test_set_dashboard_return_screenshot(
         )
         payload = _parse_payload(result)
         assert payload.get("success"), f"set_dashboard failed: {payload}"
-        assert payload["render_paths"][0]["dashboard_url_path"] == url_path
+        assert payload["render_paths"][0]["url_path"] == url_path
         assert payload["render_paths"][0]["view_path"] == "overview"
         png = _extract_png_bytes(result)
         assert png is not None, (
@@ -581,6 +674,6 @@ async def test_set_dashboard_return_screenshot(
         )
         _png_dimensions(png)
     finally:
-        await screenshot_mcp_client.call_tool(
-            "ha_config_delete_dashboard", {"url_path": url_path}
+        await safe_call_tool(
+            screenshot_mcp_client, "ha_config_delete_dashboard", {"url_path": url_path}
         )

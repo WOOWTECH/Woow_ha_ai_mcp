@@ -28,10 +28,19 @@ from ...utilities.assertions import (
     extract_error_message,
     safe_call_tool,
 )
+from ...utilities.cleanup import CleanupSteps
+from ...utilities.component_services import (
+    bootstrap_caller_token,
+    set_extra_yaml_keys,
+)
 from ...utilities.wait_helpers import wait_for_tool_result
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ha_config_set_yaml writes through the component's privileged services, which
+# register only in the "File & YAML Tools" config entry (#2292).
+pytestmark = pytest.mark.requires_tools_entry
 
 FEATURE_FLAG = "ENABLE_YAML_CONFIG_EDITING"
 TOOL_NAME = "ha_config_set_yaml"
@@ -46,10 +55,10 @@ def yaml_config_tools_enabled(ha_container_with_fresh_config):
     addon container has its own env and is started with the flag set at
     install time (see ``build_image.install_ha_mcp_dev_addon``).
     """
-    os.environ[FEATURE_FLAG] = "true"
-    logger.info("YAML config editing feature flag enabled")
-    yield
-    os.environ.pop(FEATURE_FLAG, None)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(FEATURE_FLAG, "true")
+        logger.info("YAML config editing feature flag enabled")
+        yield
 
 
 @pytest.fixture
@@ -78,7 +87,7 @@ async def mcp_client_with_yaml_config(
             f"Out-of-process server ({backend}) is missing {TOOL_NAME}. The inaddon "
             f"addon needs enable_yaml_config_editing=true in its install-time "
             f"options (build_image.install_ha_mcp_dev_addon); the embedded backend "
-            f"needs it in feature_flags.json (conftest._EMBEDDED_FEATURE_FLAGS)."
+            f"needs it in feature_flags.json (_conftest_embedded._EMBEDDED_FEATURE_FLAGS)."
         )
         logger.debug("FastMCP client (%s, HTTP) reused for YAML tests", backend)
         # Session-scope mcp_client owns __aexit__; the per-test fixture
@@ -86,7 +95,7 @@ async def mcp_client_with_yaml_config(
         yield mcp_client
         return
 
-    from fastmcp import Client
+    from ha_mcp._vendor.fastmcp import Client
 
     client = Client(mcp_server.mcp)
     async with client:
@@ -189,14 +198,15 @@ class TestYamlConfigSecurity:
     async def test_blocked_key_rejected(self, mcp_client_with_yaml_config):
         """Keys not in the allowlist must be rejected."""
 
-        # 'homeassistant' is not in ALLOWED_YAML_KEYS
+        # An unknown key: not in ALLOWED_YAML_KEYS and not denylisted, so it
+        # gets the generic allowlist rejection.
         data = await safe_call_tool(
             mcp_client_with_yaml_config,
             TOOL_NAME,
             {
-                "yaml_path": "homeassistant",
+                "yaml_path": "zigbee2mqtt",
                 "action": "replace",
-                "content": "name: Hacked",
+                "content": "permit_join: true",
                 "file": "configuration.yaml",
             },
         )
@@ -204,6 +214,62 @@ class TestYamlConfigSecurity:
         assert inner.get("success") is False, f"Blocked key should fail: {data}"
         assert "not in the allowed list" in extract_error_message(inner).lower()
         logger.info("Correctly rejected blocked key")
+
+    async def test_denylisted_key_rejected_with_floor_message(
+        self, mcp_client_with_yaml_config
+    ):
+        """YAML_KEY_DENYLIST keys get the categorical refusal, not the
+        generic allowlist dump (#1887).
+
+        The distinction matters: the generic message reads as "pick another
+        key", while these can never be enabled at all, not even through the
+        extra-write-keys setting.
+        """
+
+        for key in ("homeassistant", "http", "frontend", "lovelace"):
+            data = await safe_call_tool(
+                mcp_client_with_yaml_config,
+                TOOL_NAME,
+                {
+                    "yaml_path": key,
+                    "action": "replace",
+                    "content": "name: Hacked",
+                    "file": "configuration.yaml",
+                },
+            )
+            assert data.get("success") is False, f"{key} must be refused: {data}"
+            message = extract_error_message(data).lower()
+            assert "can never be edited" in message, f"{key}: {message}"
+            assert "cannot be lifted" in message, f"{key}: {message}"
+            assert "not in the allowed list" not in message, f"{key}: {message}"
+        logger.info("Deny floor refused all trust-boundary keys")
+
+    async def test_packages_only_key_still_rejected_in_configuration_yaml(
+        self, mcp_client_with_yaml_config
+    ):
+        """automation/script/scene stay confined to packages/*.yaml (#1887).
+
+        The operator extra-key setting widens the allowlist, but it must not
+        reach these: they have storage-mode equivalents, and the per-key
+        toggle that governs them only applies to packages targets, so lifting
+        the restriction here would route around both.
+        """
+
+        for key in ("automation", "script", "scene"):
+            data = await safe_call_tool(
+                mcp_client_with_yaml_config,
+                TOOL_NAME,
+                {
+                    "yaml_path": key,
+                    "action": "add",
+                    "content": "[]",
+                    "file": "configuration.yaml",
+                },
+            )
+            assert data.get("success") is False, f"{key} must stay rejected: {data}"
+            message = extract_error_message(data).lower()
+            assert "packages/*.yaml" in message, f"{key}: {message}"
+        logger.info("Packages-only keys remain rejected in configuration.yaml")
 
     async def test_helper_keys_not_allowed(self, mcp_client_with_yaml_config):
         """Keys manageable via ha_config_set_helper must not be in the allowlist."""
@@ -352,11 +418,61 @@ class TestYamlConfigOperations:
             inner = data
             assert inner.get("success") is True, f"knx add should succeed: {data}"
             assert inner.get("action") == "add"
-            # knx is not in YAML_KEY_POST_ACTIONS, so it defaults to restart_required.
+            # knx is not loaded, so Core has no knx.reload and the edit needs a restart.
             assert inner.get("post_action") == "restart_required", (
-                f"knx should default to post_action=restart_required: {data}"
+                f"knx is not loaded, so it should need a restart: {data}"
             )
             logger.info("Successfully added knx to package file")
+
+    async def test_extra_key_write_succeeds_against_real_component(
+        self, mcp_client_with_yaml_config, ha_container_with_fresh_config
+    ):
+        """An operator extra key writes successfully against the real component (#1887).
+
+        Every rejection path is already e2e-covered; this pins the feature's
+        actual capability (the server forwarding ``extra_allowed_keys`` and
+        the component's real voluptuous schema accepting the widened key),
+        which the unit tests cannot reach (voluptuous is mocked there). The
+        write only succeeds because ``alert2`` was added to the allowlist;
+        without the operator setting it would take the generic allowlist
+        rejection.
+
+        ``alert2`` is wired into the container/in-process server's boot env
+        (``HA_MCP_EXTRA_YAML_KEYS``) and the embedded server's
+        ``feature_flags.json`` override. The inaddon HAOS backend has no
+        Supervisor option for this setting (it is a web-UI + env-var setting
+        by design), so its addon boots without the key; skip there rather than
+        assert a capability that backend was never given.
+        """
+        if ha_container_with_fresh_config.get("backend") == "haos_inaddon":
+            pytest.skip(
+                "HA_MCP_EXTRA_YAML_KEYS is not an inaddon Supervisor option; the "
+                "addon boots without it (web-UI/env-var setting by design)"
+            )
+
+        # alert2 is not in ALLOWED_YAML_KEYS; it reaches the write only through
+        # the operator extra-keys setting. Minimal valid mapping under the key.
+        content = "defaults: {}\n"
+
+        async with MCPAssertions(mcp_client_with_yaml_config) as mcp:
+            data = await call_set_yaml_confirmed(
+                mcp,
+                {
+                    "yaml_path": "alert2",
+                    "action": "add",
+                    "content": content,
+                    "file": "packages/_e2e_extra_key_alert2.yaml",
+                },
+            )
+            assert data.get("success") is True, (
+                f"extra-key (alert2) add should succeed: {data}"
+            )
+            assert data.get("action") == "add"
+            # alert2 has no reload service, so it defaults to restart_required.
+            assert data.get("post_action") == "restart_required", (
+                f"alert2 should default to post_action=restart_required: {data}"
+            )
+            logger.info("Successfully wrote operator extra key alert2")
 
     @pytest.mark.parametrize(
         ("key", "content", "reload_service"),
@@ -1191,37 +1307,32 @@ class TestYamlConfigThemesIntegration:
             logger.info(f"Verified {theme_name} appears in theme list")
 
         finally:
-            # Cleanup: remove the theme and verify it disappears from the list.
-            # This guarantees the themes-module count==2 assertion can never
-            # observe the extra theme (sequential within-worker execution).
-            async with MCPAssertions(mcp_client_with_yaml_config) as mcp:
-                remove_data = await call_set_yaml_confirmed(
-                    mcp,
-                    {
-                        "yaml_path": theme_name,
-                        "action": "remove",
-                        "file": theme_file,
-                    },
+            # Cleanup: remove the theme and verify it disappears from the list, so
+            # the themes-module count==2 assertion (sequential per-worker runs) does
+            # not see it.
+            with CleanupSteps() as cleanup, cleanup.step():
+                async with MCPAssertions(mcp_client_with_yaml_config) as mcp:
+                    remove_data = await call_set_yaml_confirmed(
+                        mcp,
+                        {
+                            "yaml_path": theme_name,
+                            "action": "remove",
+                            "file": theme_file,
+                        },
+                    )
+                    assert remove_data.get("success") is True, (
+                        f"Theme remove should succeed: {remove_data}"
+                    )
+                    assert remove_data.get("post_action") == "reload_performed", (
+                        f"Theme remove should trigger reload_performed: {remove_data}"
+                    )
+                    listed = await mcp.call_tool_success(
+                        "ha_manage_theme", {"action": "list"}
+                    )
+                final_theme_names = listed["data"]["themes"]
+                assert theme_name not in final_theme_names, (
+                    f"{theme_name} should disappear after remove+reload: {final_theme_names}"
                 )
-                assert remove_data.get("success") is True, (
-                    f"Theme remove should succeed: {remove_data}"
-                )
-                assert remove_data.get("post_action") == "reload_performed", (
-                    f"Theme remove should trigger reload_performed: {remove_data}"
-                )
-
-            # Verify the theme no longer appears.
-            list_after_remove = await safe_call_tool(
-                mcp_client_with_yaml_config, "ha_manage_theme", {"action": "list"}
-            )
-            assert list_after_remove.get("success") is True, (
-                f"List themes after remove failed: {list_after_remove}"
-            )
-            final_theme_names = list_after_remove["data"]["themes"]
-            assert theme_name not in final_theme_names, (
-                f"{theme_name} should disappear after remove+reload: {final_theme_names}"
-            )
-            logger.info(f"Verified {theme_name} removed and no longer in list")
 
 
 @pytest.mark.filesystem
@@ -1378,9 +1489,8 @@ class TestYamlConfigAutoBackup:
             assert read.get("success") is True, read
             assert "V1" in read["content"], read["content"]
         finally:
-            # Best-effort cleanup: drive the confirm flow with safe_call_tool
-            # so a preview (or a failure) can't raise out of ``finally`` and
-            # mask the real assertion error.
+            # Removes the key this test added to its own package file, so
+            # ``safe_call_tool`` is enough (tests/AGENTS.md "Test Patterns").
             rm = await safe_call_tool(
                 mcp,
                 TOOL_NAME,
@@ -1472,3 +1582,124 @@ class TestYamlConfirmFlow:
         assert not read.get("success", False), (
             f"wrong-token preview must not write the file: {read}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Extra YAML write keys configured via the component store (integration UI)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filesystem
+class TestExtraYamlKeysStorePathLive:
+    """The extra-key setting configured through the integration UI writes live.
+
+    The sibling ``test_extra_key_write_succeeds_against_real_component`` proves
+    the capability when the key is seeded via the ``HA_MCP_EXTRA_YAML_KEYS``
+    boot env. This class proves the other operator source (#1887): a key
+    configured only through the component's own store via the real
+    ``set_extra_yaml_keys`` service (the integration-UI path) with no env
+    seeding of that key. The server reads that store and unions it into the
+    write allowlist, so the write reaches the component. It also pins that the
+    deny floor is enforced on the store: a denylisted key pushed through the
+    service is dropped at save and still refused at the write.
+
+    Cross-lane (no backend marker): the store lives in the component (HA
+    process), so unlike the env-var path it is available in every backend,
+    including inaddon. The service calls go over HA REST
+    (``utilities/component_services.py``); the write goes through the MCP
+    ``ha_config_set_yaml`` tool.
+    """
+
+    async def test_store_configured_key_writes_live(
+        self, mcp_client_with_yaml_config, ha_container_with_fresh_config
+    ):
+        """A key configured only via the store writes successfully (#1887).
+
+        ``alert2_store`` is not in ``ALLOWED_YAML_KEYS`` and is not the env-seeded
+        ``alert2``, so it reaches the write solely through the component store the
+        options flow writes. Without the store entry the same write would take the
+        generic allowlist rejection, so the success actually pins the store path.
+        """
+        base_url = ha_container_with_fresh_config["base_url"]
+        token = await bootstrap_caller_token(base_url)
+        # Session-scoped container: delete the package in finally so it does not
+        # linger for later tests (parity with test_custom_paths.py).
+        fname = f"packages/_e2e_store_key_{uuid.uuid4().hex[:8]}.yaml"
+        try:
+            sr = await set_extra_yaml_keys(base_url, token, ["alert2_store"])
+            assert sr.get("keys") == ["alert2_store"], sr
+            assert not sr.get("rejected"), sr
+
+            async with MCPAssertions(mcp_client_with_yaml_config) as mcp:
+                data = await call_set_yaml_confirmed(
+                    mcp,
+                    {
+                        "yaml_path": "alert2_store",
+                        "action": "add",
+                        "content": "defaults: {}\n",
+                        "file": fname,
+                    },
+                )
+                assert data.get("success") is True, (
+                    f"store-configured extra key should write: {data}"
+                )
+                assert data.get("action") == "add"
+                # alert2_store has no reload service, so it defaults to restart.
+                assert data.get("post_action") == "restart_required", (
+                    f"alert2_store should default to restart_required: {data}"
+                )
+                logger.info("Store-configured extra key alert2_store wrote live")
+        finally:
+            with CleanupSteps() as cleanup:
+                with cleanup.step():
+                    await safe_call_tool(
+                        mcp_client_with_yaml_config,
+                        "ha_delete_file",
+                        {"path": fname, "confirm": True},
+                    )
+                with cleanup.step():
+                    await set_extra_yaml_keys(base_url, token, [])
+
+    async def test_deny_floor_drops_store_key_and_blocks_write_live(
+        self, mcp_client_with_yaml_config, ha_container_with_fresh_config
+    ):
+        """A denylisted key pushed through the store is dropped and stays refused.
+
+        The store cannot widen the deny floor (#1887): ``set_extra_yaml_keys``
+        strips ``YAML_KEY_DENYLIST`` members on save (reporting them in
+        ``rejected``), and enforcement re-checks the floor first, so the write of
+        a denied key is refused live even after it was pushed through the service.
+        """
+        base_url = ha_container_with_fresh_config["base_url"]
+        token = await bootstrap_caller_token(base_url)
+        try:
+            # Push a denylisted key alongside a valid one in a single set.
+            sr = await set_extra_yaml_keys(
+                base_url, token, ["homeassistant", "alert2_store"]
+            )
+            assert "homeassistant" in sr.get("rejected", []), sr
+            assert "homeassistant" not in sr.get("keys", []), sr
+            assert sr.get("keys") == ["alert2_store"], sr
+
+            # Even after the attempt, the denied key takes the categorical floor
+            # message at the write, not the generic allowlist dump.
+            data = await safe_call_tool(
+                mcp_client_with_yaml_config,
+                TOOL_NAME,
+                {
+                    "yaml_path": "homeassistant",
+                    "action": "replace",
+                    "content": "name: Hacked",
+                    "file": "configuration.yaml",
+                },
+            )
+            assert data.get("success") is False, (
+                f"homeassistant must be refused: {data}"
+            )
+            message = extract_error_message(data).lower()
+            assert "can never be edited" in message, message
+            assert "cannot be lifted" in message, message
+            logger.info("Deny floor dropped the store key and blocked the write")
+        finally:
+            with CleanupSteps() as cleanup, cleanup.step():
+                await set_extra_yaml_keys(base_url, token, [])

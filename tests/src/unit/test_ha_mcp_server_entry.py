@@ -1,350 +1,703 @@
-"""Unit tests for the in-process server entry-point wiring (issue #1527).
+"""The server entry's lifecycle and the entry-type dispatch, on a real ``hass``.
 
-``embedded_entry`` is intentionally thin: generate the stable secrets, schedule
-the bring-up as a config-entry background task (so a minutes-long first pip
-install never stalls HA startup), reload only on a genuine options change, tear
-down on unload, and revoke credentials on removal. The bring-up / teardown
-themselves live in ``embedded_setup`` and are patched here.
+Core sets the entries up, unloads, reloads and removes them through its own
+config-entry machinery. What this pins: the stable connect URL secrets, the
+background bring-up, the access switch's start / stop ordering (#2801), the
+reload only on a genuine options change, credential revocation on removal, and
+the routing of the two entry types (``tools`` / ``server``) the domain shares.
 
-The domain dispatcher in the package ``__init__`` routes the two entry types
-(``tools`` / ``server``, discriminated by ``entry.data[entry_type]``, missing =
-``tools``) to their respective setup/unload/remove functions — exercised by
-``TestDomainDispatch`` below.
-
-Home Assistant / aiohttp are stubbed via ``_embedded_stubs``.
+Only the server's bring-up / teardown and the sidebar panel are replaced
+(``_server_entry``), so no server starts.
 """
 
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from homeassistant.components import switch as switch_component
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import STATE_OFF
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from pytest_homeassistant.common import MockConfigEntry
 
-from ._embedded_stubs import install
+import custom_components.ha_mcp_tools.embedded_entry as eentry
+import custom_components.ha_mcp_tools.embedded_setup as esetup
+from custom_components.ha_mcp_tools import const, oauth_redirect_allowlist
+from custom_components.ha_mcp_tools.config_flow import HaMcpToolsConfigFlow
+from custom_components.ha_mcp_tools.embedded_server import EmbeddedServerManager
 
-install()
-
-import custom_components.ha_mcp_tools as component  # noqa: E402
-import custom_components.ha_mcp_tools.embedded_entry as pkg  # noqa: E402
-import custom_components.ha_mcp_tools.embedded_setup as esetup  # noqa: E402
-from custom_components.ha_mcp_tools.const import (  # noqa: E402
-    CONF_ENTRY_TYPE,
-    DATA_BRINGUP_TASK,
-    DATA_LAST_OPTIONS,
-    DATA_SECRET_PATH,
-    DATA_WEBHOOK_ID,
-    DOMAIN,
-    ENTRY_TYPE_SERVER,
-    ENTRY_TYPE_TOOLS,
-)
+from ._server_entry import add_server_entry, replace_server, set_up
 
 
-def _make_hass() -> MagicMock:
-    hass = MagicMock(name="hass")
-    hass.data = {}
-
-    def _update_entry(entry, *, data=None, options=None, **_kw):
-        if data is not None:
-            entry.data = data
-        if options is not None:
-            entry.options = options
-
-    hass.config_entries.async_update_entry = MagicMock(side_effect=_update_entry)
-    hass.config_entries.async_reload = AsyncMock()
-    hass.config_entries.async_forward_entry_setups = AsyncMock()
-    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
-    return hass
+@pytest.fixture
+def server(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    return replace_server(monkeypatch)
 
 
-def _make_entry(*, options=None, data=None) -> MagicMock:
-    entry = MagicMock(name="entry")
-    entry.entry_id = "entry-1"
-    entry.options = {} if options is None else dict(options)
-    entry.data = {} if data is None else dict(data)
+class BringUp:
+    """A bring-up that stays running until Core cancels it."""
 
-    def _create_background_task(hass, coro, name):
-        # issue #1760: async_setup_server_entry now ALSO schedules the
-        # coordinator's initial version refresh as a real coroutine here (a
-        # second call, alongside the bring-up). This suite doesn't exercise
-        # coordinator behavior, so just close it to avoid an unawaited-
-        # coroutine warning rather than actually running it.
-        if asyncio.iscoroutine(coro):
-            coro.close()
-        return "BRINGUP_TASK"
+    def __init__(self, *, fail_on_cancel: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self._fail_on_cancel = fail_on_cancel
 
-    entry.async_create_background_task = MagicMock(side_effect=_create_background_task)
-    entry.add_update_listener = MagicMock(return_value="UNSUB")
-    entry.async_on_unload = MagicMock()
+    async def run(self, *_args: object, **_kwargs: object) -> None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            if self._fail_on_cancel:
+                raise RuntimeError("partial teardown failed") from None
+            raise
+
+
+def _entry_without_secrets(
+    hass: HomeAssistant, options: dict[str, Any] | None = None
+) -> MockConfigEntry:
+    """A server entry that has never generated its webhook id or secret path."""
+    entry = add_server_entry(hass, options=options)
+    hass.config_entries.async_update_entry(
+        entry, data={const.CONF_ENTRY_TYPE: const.ENTRY_TYPE_SERVER}
+    )
     return entry
 
 
-@pytest.fixture(autouse=True)
-def _patch_orchestration(monkeypatch):
-    # __init__ lazy-imports these from embedded_setup inside each entry function,
-    # so patch them on the SOURCE module (the lazy `from .embedded_setup import`
-    # resolves the name there at call time). async_bring_up_server is a plain
-    # MagicMock (not async) so its result is never an un-awaited coroutine.
-    monkeypatch.setattr(esetup, "async_bring_up_server", MagicMock(name="bring_up"))
-    monkeypatch.setattr(esetup, "async_teardown_server", AsyncMock(name="teardown"))
-    monkeypatch.setattr(
-        esetup, "async_revoke_credentials_on_remove", AsyncMock(name="revoke")
+def _add_tools_entry(
+    hass: HomeAssistant,
+    *,
+    data: dict[str, Any] | None = None,
+    title: str = const.TOOLS_ENTRY_TITLE,
+) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        title=title,
+        version=HaMcpToolsConfigFlow.VERSION,
+        minor_version=HaMcpToolsConfigFlow.MINOR_VERSION,
+        data=data or {},
     )
+    entry.add_to_hass(hass)
+    return entry
 
 
-class TestEnsureSecrets:
-    def test_generates_webhook_id_and_secret_when_missing(self):
-        hass = _make_hass()
-        entry = _make_entry()
-        pkg._ensure_secrets(hass, entry)
-        assert entry.data[DATA_WEBHOOK_ID].startswith("mcp_")
-        assert entry.data[DATA_SECRET_PATH].startswith("/private_")
+def _manager(*, running: bool) -> MagicMock:
+    manager = MagicMock(spec=EmbeddedServerManager)
+    manager.is_running = running
+    return manager
 
-    def test_idempotent_when_present(self):
-        hass = _make_hass()
-        entry = _make_entry(
-            data={DATA_WEBHOOK_ID: "mcp_existing", DATA_SECRET_PATH: "/private_keep"}
+
+TOOLS_ENTRY_DATA = pytest.mark.parametrize(
+    "data",
+    [{}, {const.CONF_ENTRY_TYPE: const.ENTRY_TYPE_TOOLS}],
+    ids=["no_entry_type", "explicit_tools"],
+)
+
+
+class TestConnectUrlSecrets:
+    async def test_a_first_setup_generates_the_webhook_id_and_secret_path(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = _entry_without_secrets(hass)
+
+        assert await set_up(hass, entry)
+
+        assert entry.data[const.DATA_WEBHOOK_ID].startswith("mcp_")
+        assert entry.data[const.DATA_SECRET_PATH].startswith("/private_")
+
+    async def test_a_webhook_override_replaces_the_stored_id(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(
+            hass,
+            data={const.DATA_WEBHOOK_ID: "mcp_old"},
+            options={const.OPT_WEBHOOK_ID_OVERRIDE: "my_custom_hook"},
         )
-        pkg._ensure_secrets(hass, entry)
-        hass.config_entries.async_update_entry.assert_not_called()
-        assert entry.data[DATA_WEBHOOK_ID] == "mcp_existing"
+        path = entry.data[const.DATA_SECRET_PATH]
 
-    def test_webhook_override_replaces_stored_id(self):
-        hass = _make_hass()
-        entry = _make_entry(
-            data={DATA_WEBHOOK_ID: "mcp_old", DATA_SECRET_PATH: "/private_keep"},
-            options={pkg.OPT_WEBHOOK_ID_OVERRIDE: "my_custom_hook"},
+        assert await set_up(hass, entry)
+
+        assert entry.data[const.DATA_WEBHOOK_ID] == "my_custom_hook"
+        assert entry.data[const.DATA_SECRET_PATH] == path
+
+    async def test_a_secret_path_override_gets_a_leading_slash(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(
+            hass, options={const.OPT_SECRET_PATH_OVERRIDE: "custom_path"}
         )
-        pkg._ensure_secrets(hass, entry)
-        assert entry.data[DATA_WEBHOOK_ID] == "my_custom_hook"
-        assert entry.data[DATA_SECRET_PATH] == "/private_keep"
 
-    def test_secret_path_override_gets_leading_slash(self):
-        hass = _make_hass()
-        entry = _make_entry(
-            data={DATA_WEBHOOK_ID: "mcp_keep", DATA_SECRET_PATH: "/private_old"},
-            options={pkg.OPT_SECRET_PATH_OVERRIDE: "custom_path"},
-        )
-        pkg._ensure_secrets(hass, entry)
-        assert entry.data[DATA_SECRET_PATH] == "/custom_path"
+        assert await set_up(hass, entry)
 
-    def test_regenerate_mints_fresh_and_clears_flag_and_overrides(self):
-        # One-shot rotation: fresh random values for BOTH secrets, the flag
-        # cleared, and the overrides cleared (a surviving override would
-        # silently undo the rotation on the next reload).
-        hass = _make_hass()
-        entry = _make_entry(
-            data={DATA_WEBHOOK_ID: "mcp_old", DATA_SECRET_PATH: "/private_old"},
+        assert entry.data[const.DATA_SECRET_PATH] == "/custom_path"
+
+    async def test_regenerating_rotates_both_secrets_and_clears_the_overrides(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A surviving override would silently undo the rotation on the next reload.
+        entry = add_server_entry(
+            hass,
             options={
-                pkg.OPT_REGENERATE_SECRETS: True,
-                pkg.OPT_WEBHOOK_ID_OVERRIDE: "stale_override",
-                pkg.OPT_SECRET_PATH_OVERRIDE: "/stale_path",
+                const.OPT_REGENERATE_SECRETS: True,
+                const.OPT_WEBHOOK_ID_OVERRIDE: "stale_override",
+                const.OPT_SECRET_PATH_OVERRIDE: "/stale_path",
             },
         )
-        pkg._ensure_secrets(hass, entry)
-        assert entry.data[DATA_WEBHOOK_ID].startswith("mcp_")
-        assert entry.data[DATA_WEBHOOK_ID] != "mcp_old"
-        assert entry.data[DATA_SECRET_PATH].startswith("/private_")
-        assert entry.data[DATA_SECRET_PATH] != "/private_old"
-        assert entry.options[pkg.OPT_REGENERATE_SECRETS] is False
-        assert entry.options[pkg.OPT_WEBHOOK_ID_OVERRIDE] == ""
-        assert entry.options[pkg.OPT_SECRET_PATH_OVERRIDE] == ""
+        old = dict(entry.data)
 
-    def test_regenerate_wins_over_overrides(self):
-        # Priority: regenerate ignores the override values entirely.
-        hass = _make_hass()
-        entry = _make_entry(
-            data={DATA_WEBHOOK_ID: "mcp_old", DATA_SECRET_PATH: "/private_old"},
+        assert await set_up(hass, entry)
+
+        assert entry.data[const.DATA_WEBHOOK_ID] != old[const.DATA_WEBHOOK_ID]
+        assert entry.data[const.DATA_WEBHOOK_ID].startswith("mcp_")
+        assert entry.data[const.DATA_SECRET_PATH] != old[const.DATA_SECRET_PATH]
+        assert entry.data[const.DATA_SECRET_PATH].startswith("/private_")
+        assert entry.options[const.OPT_REGENERATE_SECRETS] is False
+        assert entry.options[const.OPT_WEBHOOK_ID_OVERRIDE] == ""
+        assert entry.options[const.OPT_SECRET_PATH_OVERRIDE] == ""
+
+    async def test_regenerating_wins_over_an_override(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(
+            hass,
             options={
-                pkg.OPT_REGENERATE_SECRETS: True,
-                pkg.OPT_WEBHOOK_ID_OVERRIDE: "must_not_apply",
+                const.OPT_REGENERATE_SECRETS: True,
+                const.OPT_WEBHOOK_ID_OVERRIDE: "must_not_apply",
             },
         )
-        pkg._ensure_secrets(hass, entry)
-        assert entry.data[DATA_WEBHOOK_ID] != "must_not_apply"
+
+        assert await set_up(hass, entry)
+
+        assert entry.data[const.DATA_WEBHOOK_ID] != "must_not_apply"
 
 
-class TestSetupEntry:
-    async def test_generates_secrets_snapshots_options_and_schedules_bringup(self):
-        hass = _make_hass()
-        entry = _make_entry(options={"server_port": 9584})
+class TestUnload:
+    async def test_unload_cancels_a_running_bring_up_before_the_stop(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A bring-up left running would register the webhook after the stop.
+        held = BringUp()
+        server.bring_up.side_effect = held.run
+        seen: list[bool] = []
+        server.teardown.side_effect = lambda _hass: seen.append(held.cancelled)
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        await held.started.wait()
 
-        result = await pkg.async_setup_server_entry(hass, entry)
+        assert await hass.config_entries.async_unload(entry.entry_id)
 
-        assert result is True
-        # Secrets generated (entry.data was empty).
-        assert entry.data[DATA_WEBHOOK_ID].startswith("mcp_")
-        domain_data = hass.data[DOMAIN]
-        # Options snapshot taken so data writes don't self-reload.
-        assert domain_data[DATA_LAST_OPTIONS] == {"server_port": 9584}
-        # Bring-up AND the coordinator's initial version refresh are both
-        # scheduled as config-entry background tasks (issue #1760).
-        assert entry.async_create_background_task.call_count == 2
-        assert domain_data[DATA_BRINGUP_TASK] == "BRINGUP_TASK"
-        # Reload-on-options-change listener AND the coordinator's auto-update
-        # listener are both registered under async_on_unload for cleanup.
-        entry.add_update_listener.assert_called_once_with(pkg._async_options_updated)
-        unload_args = [c.args[0] for c in entry.async_on_unload.call_args_list]
-        assert "UNSUB" in unload_args  # options-change listener unsub
-        assert len(unload_args) == 2  # + the coordinator listener unsub
-        # The update platform entity is forwarded (issue #1760).
-        hass.config_entries.async_forward_entry_setups.assert_awaited_once_with(
-            entry, [pkg.Platform.UPDATE]
+        assert seen == [True]
+        server.teardown.assert_awaited_once_with(hass)
+
+    async def test_unload_after_the_bring_up_finished_stops_the_server(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        await asyncio.sleep(0)
+
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+        server.teardown.assert_awaited_once_with(hass)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [{"return_value": False}, {"side_effect": RuntimeError("boom")}],
+        ids=["refused", "raised"],
+    )
+    async def test_the_server_stops_even_when_the_switch_platform_fails_to_unload(
+        self,
+        hass: HomeAssistant,
+        server: SimpleNamespace,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: dict[str, Any],
+    ) -> None:
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        monkeypatch.setattr(
+            switch_component, "async_unload_entry", AsyncMock(**failure)
         )
 
+        assert not await hass.config_entries.async_unload(entry.entry_id)
 
-class TestUnloadEntry:
-    async def test_cancels_inflight_bringup_and_tears_down(self):
-        hass = _make_hass()
-        entry = _make_entry()
-        loop = asyncio.get_running_loop()
-        pending = loop.create_future()  # a still-running bring-up task
-        hass.data[DOMAIN] = {DATA_BRINGUP_TASK: pending, DATA_LAST_OPTIONS: {}}
+        server.teardown.assert_awaited_once_with(hass)
 
-        result = await pkg.async_unload_server_entry(hass, entry)
+    async def test_unload_waits_for_a_switch_on_in_progress(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A start scheduled after the unload's stop would run for an entry that
+        # is no longer loaded.
+        held = BringUp()
+        server.bring_up.side_effect = held.run
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+        assert await set_up(hass, entry)
+        stopping = asyncio.Event()
+        release = asyncio.Event()
 
-        assert result is True
-        assert pending.cancelled()
-        esetup.async_teardown_server.assert_awaited_once()
-        assert DATA_BRINGUP_TASK not in hass.data[DOMAIN]
-        assert DATA_LAST_OPTIONS not in hass.data[DOMAIN]
+        async def slow_first_stop(_hass: HomeAssistant) -> None:
+            if not stopping.is_set():
+                stopping.set()
+                await release.wait()
 
-    async def test_skips_cancel_when_bringup_done(self):
-        hass = _make_hass()
-        entry = _make_entry()
-        loop = asyncio.get_running_loop()
-        done = loop.create_future()
-        done.set_result(None)
-        hass.data[DOMAIN] = {DATA_BRINGUP_TASK: done, DATA_LAST_OPTIONS: {}}
+        server.teardown.side_effect = slow_first_stop
+        on = hass.async_create_task(eentry.async_set_access(hass, entry, True))
+        await stopping.wait()
+        unload = hass.async_create_task(
+            hass.config_entries.async_unload(entry.entry_id)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(on, unload)
 
-        result = await pkg.async_unload_server_entry(hass, entry)
-        assert result is True
-        assert not done.cancelled()
-        esetup.async_teardown_server.assert_awaited_once()
+        assert server.bring_up.call_count == 1
+        assert held.cancelled
+
+
+class TestAccessSwitch:
+    """The access switch opens and closes the server while the entry stays loaded (#2801)."""
+
+    async def test_access_left_off_keeps_the_server_down_after_a_restart(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+
+        assert await set_up(hass, entry)
+
+        server.bring_up.assert_not_called()
+
+    async def test_off_after_restart_option_closes_access_at_startup(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(
+            hass, options={const.OPT_ACCESS_OFF_AFTER_RESTART: True}
+        )
+
+        assert await set_up(hass, entry)
+
+        assert entry.data[const.DATA_ACCESS_ENABLED] is False
+        server.bring_up.assert_not_called()
+
+    async def test_off_after_restart_option_does_not_close_access_on_a_reload(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # An options save reloads the entry; that is not a restart, so access the
+        # user turned on stays on.
+        server.bring_up.side_effect = BringUp().run
+        entry = add_server_entry(
+            hass, options={const.OPT_ACCESS_OFF_AFTER_RESTART: True}
+        )
+        assert await set_up(hass, entry)
+        await eentry.async_set_access(hass, entry, True)
+        server.bring_up.reset_mock()
+
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.LOADED
+        assert eentry.access_enabled(entry)
+        server.bring_up.assert_called_once()
+
+    async def test_switch_starts_out_off_after_a_restart_with_the_option(
+        self,
+        hass: HomeAssistant,
+        server: SimpleNamespace,
+        entity_registry_enabled_by_default: None,
+    ) -> None:
+        # The switch reports the stored state when it is added; storing after
+        # the platform forward would show it on while the server is down.
+        entry = add_server_entry(
+            hass, options={const.OPT_ACCESS_OFF_AFTER_RESTART: True}
+        )
+
+        assert await set_up(hass, entry)
+
+        [state] = hass.states.async_all("switch")
+        assert state.state == STATE_OFF
+
+    async def test_switching_on_after_the_entry_unloaded_starts_nothing(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A switch-on queued behind the unload (disable, or a slow stop) must
+        # not start a server for an entry that is no longer loaded.
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+        assert await set_up(hass, entry)
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+        await eentry.async_set_access(hass, entry, True)
+
+        server.bring_up.assert_not_called()
+
+    async def test_switching_on_works_again_after_a_reload(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+        assert await set_up(hass, entry)
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+        await eentry.async_set_access(hass, entry, True)
+
+        server.bring_up.assert_called_once()
+
+    async def test_a_second_entry_starts_no_server_next_to_one_already_starting(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        server.bring_up.side_effect = BringUp().run
+        assert await set_up(hass, add_server_entry(hass))
+
+        assert await set_up(hass, add_server_entry(hass))
+
+        assert server.bring_up.call_count == 1
+
+    async def test_a_second_entry_set_up_during_a_stop_waits_for_it(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A start while the old server still holds the port would fail to bind.
+        first = add_server_entry(hass)
+        assert await set_up(hass, first)
+        stopping = asyncio.Event()
+        release = asyncio.Event()
+        order: list[str] = []
+
+        async def slow_first_stop(_hass: HomeAssistant) -> None:
+            if not order:
+                order.append("stop")
+                stopping.set()
+                await release.wait()
+                order.append("stop_done")
+
+        async def record_bring_up(*_args: object, **_kwargs: object) -> None:
+            order.append("bring_up")
+
+        server.teardown.side_effect = slow_first_stop
+        server.bring_up.side_effect = record_bring_up
+        unload = hass.async_create_task(
+            hass.config_entries.async_unload(first.entry_id)
+        )
+        await stopping.wait()
+        setup = hass.async_create_task(set_up(hass, add_server_entry(hass)))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(unload, setup)
+
+        assert order == ["stop", "stop_done", "bring_up"]
+
+    async def test_switching_access_keeps_the_connect_url(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        url = (entry.data[const.DATA_WEBHOOK_ID], entry.data[const.DATA_SECRET_PATH])
+
+        await eentry.async_set_access(hass, entry, False)
+
+        assert (
+            entry.data[const.DATA_WEBHOOK_ID],
+            entry.data[const.DATA_SECRET_PATH],
+        ) == url
+
+    async def test_switching_off_cancels_a_running_bring_up_before_teardown(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A bring-up still in flight would otherwise register the webhook and the
+        # LLM API after the teardown, reopening access.
+        held = BringUp()
+        server.bring_up.side_effect = held.run
+        seen: list[bool] = []
+        server.teardown.side_effect = lambda _hass: seen.append(held.cancelled)
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        await held.started.wait()
+
+        await eentry.async_set_access(hass, entry, False)
+
+        assert seen == [True]
+        assert entry.data[const.DATA_ACCESS_ENABLED] is False
+
+    async def test_switching_on_starts_the_server_without_a_notification(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+        assert await set_up(hass, entry)
+
+        await eentry.async_set_access(hass, entry, True)
+
+        server.bring_up.assert_called_once_with(hass, entry, announce=False)
+        assert eentry.access_enabled(entry)
+
+    async def test_switching_on_while_a_start_runs_starts_no_second_server(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        server.bring_up.side_effect = BringUp().run
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+
+        await eentry.async_set_access(hass, entry, True)
+
+        assert server.bring_up.call_count == 1
+        server.teardown.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "failed_start", [True, False], ids=["no_server", "crashed"]
+    )
+    async def test_switching_on_again_retries_a_failed_start(
+        self, hass: HomeAssistant, server: SimpleNamespace, failed_start: bool
+    ) -> None:
+        # A failed bring-up, or a server that crashed later, leaves access on
+        # with nothing running; turning the switch on again retries the start.
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        await asyncio.sleep(0)
+        if not failed_start:
+            hass.data[const.DOMAIN][const.DATA_MANAGER] = _manager(running=False)
+
+        await eentry.async_set_access(hass, entry, True)
+
+        server.teardown.assert_awaited_once_with(hass)
+        assert server.bring_up.call_count == 2
+
+    async def test_switching_on_leaves_a_running_server_alone(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # An automation turning the switch on while it is on must not drop the
+        # connected clients.
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        await asyncio.sleep(0)
+        hass.data[const.DOMAIN][const.DATA_MANAGER] = _manager(running=True)
+
+        await eentry.async_set_access(hass, entry, True)
+
+        server.teardown.assert_not_awaited()
+        assert server.bring_up.call_count == 1
+
+    async def test_switching_on_keeps_access_off_when_the_cleanup_fails(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+        assert await set_up(hass, entry)
+        server.teardown.side_effect = RuntimeError("stop failed")
+
+        with pytest.raises(RuntimeError):
+            await eentry.async_set_access(hass, entry, True)
+
+        assert not eentry.access_enabled(entry)
+
+    async def test_switching_off_again_retries_the_stop(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A stop that raised leaves access stored off; the next off must not be
+        # skipped as already done.
+        entry = add_server_entry(hass, data={const.DATA_ACCESS_ENABLED: False})
+        assert await set_up(hass, entry)
+
+        await eentry.async_set_access(hass, entry, False)
+
+        server.teardown.assert_awaited_once_with(hass)
+
+    async def test_switching_on_waits_for_a_stop_in_progress(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A start overlapping a slow stop would claim the server port while the
+        # old server still holds it.
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        stopping = asyncio.Event()
+        release = asyncio.Event()
+        order: list[str] = []
+
+        async def slow_first_stop(_hass: HomeAssistant) -> None:
+            if not order:
+                order.append("stop")
+                stopping.set()
+                await release.wait()
+                order.append("stop_done")
+
+        async def record_bring_up(*_args: object, **_kwargs: object) -> None:
+            order.append("bring_up")
+
+        server.teardown.side_effect = slow_first_stop
+        server.bring_up.side_effect = record_bring_up
+        off = hass.async_create_task(eentry.async_set_access(hass, entry, False))
+        await stopping.wait()
+        on = hass.async_create_task(eentry.async_set_access(hass, entry, True))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(off, on)
+
+        assert order == ["stop", "stop_done", "bring_up"]
+
+    async def test_switching_off_stops_the_server_when_the_cancelled_start_fails(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # A start cancelled mid-way tears down its partial state itself; when
+        # that raises, the stop must still run.
+        held = BringUp(fail_on_cancel=True)
+        server.bring_up.side_effect = held.run
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
+        await held.started.wait()
+
+        with pytest.raises(RuntimeError):
+            await eentry.async_set_access(hass, entry, False)
+
+        server.teardown.assert_awaited_once_with(hass)
+
+
+class TestOptionsChanges:
+    async def test_a_changed_server_option_reloads_the_server(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = add_server_entry(hass, options={"server_port": 9584})
+        assert await set_up(hass, entry)
+
+        hass.config_entries.async_update_entry(entry, options={"server_port": 9999})
+        await hass.async_block_till_done()
+
+        server.teardown.assert_awaited_once_with(hass)
+        assert server.bring_up.call_count == 2
+
+    async def test_the_bring_ups_data_writes_do_not_reload_the_server(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        # The background bring-up writes ids and tokens to entry.data, which
+        # fires the same update listener.
+        entry = add_server_entry(hass, options={"server_port": 9584})
+        assert await set_up(hass, entry)
+
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, "adopted": "x"}
+        )
+        await hass.async_block_till_done()
+
+        server.teardown.assert_not_awaited()
+        assert server.bring_up.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            (oauth_redirect_allowlist.OPT_OAUTH_REDIRECT_ALLOWLIST, []),
+            (const.OPT_ACCESS_OFF_AFTER_RESTART, True),
+        ],
+        ids=["callback_allowlist", "off_after_restart"],
+    )
+    async def test_options_read_per_request_do_not_reload_the_server(
+        self,
+        hass: HomeAssistant,
+        server: SimpleNamespace,
+        option: str,
+        value: object,
+    ) -> None:
+        # The settings panel saves the allowlist through the running server; a
+        # reload would tear that server down mid-request (#2427).
+        entry = add_server_entry(hass, options={"server_port": 9584})
+        assert await set_up(hass, entry)
+
+        hass.config_entries.async_update_entry(
+            entry, options={**entry.options, option: value}
+        )
+        await hass.async_block_till_done()
+
+        server.teardown.assert_not_awaited()
+        assert server.bring_up.call_count == 1
 
 
 class TestRemoveEntry:
-    async def test_revokes_credentials(self):
-        hass = _make_hass()
-        entry = _make_entry()
-        await pkg.async_remove_server_entry(hass, entry)
-        esetup.async_revoke_credentials_on_remove.assert_awaited_once_with(hass, entry)
+    async def test_removing_the_server_entry_revokes_its_credentials(
+        self,
+        hass: HomeAssistant,
+        server: SimpleNamespace,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        revoke = AsyncMock(wraps=esetup.async_revoke_credentials_on_remove)
+        monkeypatch.setattr(esetup, "async_revoke_credentials_on_remove", revoke)
+        entry = add_server_entry(hass)
+        assert await set_up(hass, entry)
 
+        await hass.config_entries.async_remove(entry.entry_id)
 
-class TestOptionsUpdatedListener:
-    async def test_reloads_on_genuine_options_change(self):
-        hass = _make_hass()
-        entry = _make_entry(options={"server_port": 9999})
-        hass.data[DOMAIN] = {DATA_LAST_OPTIONS: {"server_port": 9584}}
+        revoke.assert_awaited_once_with(hass, entry)
 
-        await pkg._async_options_updated(hass, entry)
-        hass.config_entries.async_reload.assert_awaited_once_with("entry-1")
+    async def test_removing_the_tools_entry_revokes_nothing(
+        self,
+        hass: HomeAssistant,
+        server: SimpleNamespace,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        revoke = AsyncMock(wraps=esetup.async_revoke_credentials_on_remove)
+        monkeypatch.setattr(esetup, "async_revoke_credentials_on_remove", revoke)
+        entry = _add_tools_entry(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
 
-    async def test_ignores_data_only_writes(self):
-        # The background bring-up writes ids/token to entry.data (not options),
-        # firing the same listener — it must NOT reload.
-        hass = _make_hass()
-        entry = _make_entry(options={"server_port": 9584})
-        hass.data[DOMAIN] = {DATA_LAST_OPTIONS: {"server_port": 9584}}
+        await hass.config_entries.async_remove(entry.entry_id)
 
-        await pkg._async_options_updated(hass, entry)
-        hass.config_entries.async_reload.assert_not_awaited()
+        revoke.assert_not_awaited()
 
 
 class TestDomainDispatch:
-    """The package ``__init__`` dispatcher routes on ``entry.data[entry_type]``.
+    """One domain holds both entry types, told apart by ``entry_type``."""
 
-    Both entry types live under one domain; the server functions are lazy-imported
-    from ``embedded_entry`` inside each dispatcher, so they are patched on that
-    module (``pkg``). The tools functions are patched on the package.
-    """
+    @TOOLS_ENTRY_DATA
+    async def test_a_tools_entry_sets_up_the_services_and_no_server(
+        self, hass: HomeAssistant, server: SimpleNamespace, data: dict[str, Any]
+    ) -> None:
+        # Entries from before the server entry carry no entry_type and must
+        # route to the tools setup with no migration.
+        entry = _add_tools_entry(hass, data=data)
 
-    @pytest.fixture(autouse=True)
-    def _patch_dispatch_targets(self, monkeypatch):
-        monkeypatch.setattr(
-            component, "_async_setup_tools_entry", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(
-            component, "_async_unload_tools_entry", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(
-            pkg, "async_setup_server_entry", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(
-            pkg, "async_unload_server_entry", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(pkg, "async_remove_server_entry", AsyncMock())
+        assert await hass.config_entries.async_setup(entry.entry_id)
 
-    async def test_server_entry_setup_routes_to_server(self):
-        entry = _make_entry(data={CONF_ENTRY_TYPE: ENTRY_TYPE_SERVER})
-        assert await component.async_setup_entry(_make_hass(), entry) is True
-        pkg.async_setup_server_entry.assert_awaited_once()
-        component._async_setup_tools_entry.assert_not_awaited()
+        assert entry.state is ConfigEntryState.LOADED
+        assert hass.services.async_services_internal().get(const.DOMAIN)
+        server.bring_up.assert_not_called()
 
-    async def test_missing_entry_type_setup_defaults_to_tools(self):
-        # Pre-existing services entries carry no entry_type key — they must route
-        # to the tools setup, never the server setup, with no migration.
-        entry = _make_entry(data={})
-        assert await component.async_setup_entry(_make_hass(), entry) is True
-        component._async_setup_tools_entry.assert_awaited_once()
-        pkg.async_setup_server_entry.assert_not_awaited()
+    @TOOLS_ENTRY_DATA
+    async def test_unloading_a_tools_entry_removes_the_services_and_stops_no_server(
+        self, hass: HomeAssistant, server: SimpleNamespace, data: dict[str, Any]
+    ) -> None:
+        entry = _add_tools_entry(hass, data=data)
+        assert await hass.config_entries.async_setup(entry.entry_id)
 
-    async def test_explicit_tools_entry_setup_routes_to_tools(self):
-        entry = _make_entry(data={CONF_ENTRY_TYPE: ENTRY_TYPE_TOOLS})
-        assert await component.async_setup_entry(_make_hass(), entry) is True
-        component._async_setup_tools_entry.assert_awaited_once()
-        pkg.async_setup_server_entry.assert_not_awaited()
+        assert await hass.config_entries.async_unload(entry.entry_id)
 
-    async def test_server_entry_unload_routes_to_server(self):
-        entry = _make_entry(data={CONF_ENTRY_TYPE: ENTRY_TYPE_SERVER})
-        assert await component.async_unload_entry(_make_hass(), entry) is True
-        pkg.async_unload_server_entry.assert_awaited_once()
-        component._async_unload_tools_entry.assert_not_awaited()
-
-    async def test_missing_entry_type_unload_defaults_to_tools(self):
-        entry = _make_entry(data={})
-        assert await component.async_unload_entry(_make_hass(), entry) is True
-        component._async_unload_tools_entry.assert_awaited_once()
-        pkg.async_unload_server_entry.assert_not_awaited()
-
-    async def test_server_entry_remove_revokes(self):
-        entry = _make_entry(data={CONF_ENTRY_TYPE: ENTRY_TYPE_SERVER})
-        await component.async_remove_entry(_make_hass(), entry)
-        pkg.async_remove_server_entry.assert_awaited_once()
-
-    async def test_tools_entry_remove_is_noop(self):
-        entry = _make_entry(data={})
-        await component.async_remove_entry(_make_hass(), entry)
-        pkg.async_remove_server_entry.assert_not_awaited()
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert not hass.services.async_services_internal().get(const.DOMAIN)
+        server.teardown.assert_not_awaited()
 
 
-class TestToolsEntrySetupFinalization:
-    """Source-level guards for the #1853 finalization in the tools setup.
+class TestToolsEntrySetup:
+    async def test_the_pre_rename_default_title_is_migrated(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = _add_tools_entry(hass, title=const.TOOLS_ENTRY_LEGACY_TITLE)
 
-    ``_async_setup_tools_entry`` cannot run in this unit harness (it drives the
-    caller-token Store, the legacy-backup migration, ~10 service registrations,
-    and the WebSocket registry), so — like the existing security-regression guard
-    on the same function — these assert the wiring at the source level: the
-    rename migration and the tools-entry device registration must stay present.
-    A behavioral retitle/preserve test needs the full setup scaffolding no unit
-    harness provides.
-    """
+        assert await hass.config_entries.async_setup(entry.entry_id)
 
-    def test_setup_migrates_the_pre_rename_default_title(self):
-        import inspect
+        assert entry.title == const.TOOLS_ENTRY_TITLE
 
-        src = inspect.getsource(component._async_setup_tools_entry)
-        # Retitle only the exact old default, via async_update_entry, to the new
-        # title constant — never a hardcoded literal that could drift from it.
-        assert "entry.title == TOOLS_ENTRY_LEGACY_TITLE" in src
-        assert "TOOLS_ENTRY_TITLE" in src
-        assert "async_update_entry" in src
+    async def test_a_title_the_user_chose_is_kept(
+        self, hass: HomeAssistant, server: SimpleNamespace
+    ) -> None:
+        entry = _add_tools_entry(hass, title="My file tools")
 
-    def test_setup_registers_a_device_for_the_tools_entry(self):
-        import inspect
+        assert await hass.config_entries.async_setup(entry.entry_id)
 
-        src = inspect.getsource(component._async_setup_tools_entry)
-        assert "async_get_or_create" in src
-        assert "config_entry_id=entry.entry_id" in src
-        assert "File & YAML editing services" in src
-        assert "homeassistant-ai" in src
+        assert entry.title == "My file tools"
+
+    async def test_the_tools_entry_gets_a_device(
+        self,
+        hass: HomeAssistant,
+        server: SimpleNamespace,
+        device_registry: dr.DeviceRegistry,
+    ) -> None:
+        entry = _add_tools_entry(hass)
+
+        assert await hass.config_entries.async_setup(entry.entry_id)
+
+        [device] = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        assert device.name == const.TOOLS_ENTRY_TITLE

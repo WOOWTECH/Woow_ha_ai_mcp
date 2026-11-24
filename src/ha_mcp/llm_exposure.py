@@ -12,11 +12,14 @@ axis from the global enable/disable in the settings UI:
   conversation agents — in both the full-catalog and tool-search exposure
   modes of the component.
 
-The single source of truth travels **in-band**: :class:`LlmExposureMiddleware`
-stamps every ``tools/list`` entry with
-``_meta.ha_mcp = {"llm_api_exposed": bool, "pinned": bool}`` so the component
-(one more loopback MCP client) filters on data that can never drift from the
-server's settings, with zero extra round-trips. Stamping re-reads the
+For embedded servers with the Home Assistant LLM API enabled, the single
+source of truth travels **in-band**: :class:`LlmExposureMiddleware` stamps
+every ``tools/list`` entry with
+``_meta.ha_mcp = {"llm_api_exposed": bool, "pinned": bool, "params": str,
+"policy": {...}}``
+so the component (one more loopback MCP client) filters on data that can never
+drift from the server's settings, with zero extra round-trips. The ``policy``
+block reports the serving server's gating state (#1990 — see META_POLICY_KEY). Stamping re-reads the
 persisted settings behind a short coalescing cache (2s TTL), so settings-UI
 changes apply on the agent's next conversation turn without a restart.
 
@@ -31,15 +34,15 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from fastmcp.server.middleware import Middleware
+from ha_mcp._vendor.fastmcp.server.middleware import Middleware
 
 if TYPE_CHECKING:
-    from fastmcp.server.middleware import CallNext, MiddlewareContext
-    from fastmcp.tools import Tool
-    from mcp import types as mt
+    from ha_mcp._vendor.fastmcp.server.middleware import CallNext, MiddlewareContext
+    from ha_mcp._vendor.fastmcp.tools import Tool
+    from ha_mcp._vendor.mcp import types as mt
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,19 @@ logger = logging.getLogger(__name__)
 META_NAMESPACE = "ha_mcp"
 META_EXPOSED_KEY = "llm_api_exposed"
 META_PINNED_KEY = "pinned"
+# The one-line parameter summary the component's search hits show (#2633).
+# Rendered here so the component, which cannot import this package, carries
+# no copy of the renderer.
+META_PARAMS_KEY = "params"
+
+# Serving-server policy/identity block stamped alongside the per-tool keys
+# (#1990). A client (or a debugging agent) reading tools/list can see the
+# ACTUAL gating state of the server answering this connection — configured
+# flag, live middleware, and rule count — plus the deployment mode. Without
+# this, a client pointed at a different server than the one the user
+# configured rules on fails silently: calls execute ungated and nothing
+# anywhere says "this server has zero rules".
+META_POLICY_KEY = "policy"
 
 # Key in tool_config.json holding the user's per-tool overrides
 # ({tool_name: bool}). Sparse on purpose: only tools the user explicitly
@@ -59,13 +75,15 @@ LLM_API_CONFIG_KEY = "llm_api"
 
 # Tools hidden from conversation agents by default regardless of tags:
 # operational hazards where an agent mistake is expensive (restart loops,
-# config reloads mid-edit, backup churn). Users can still enable each in the
-# settings UI.
+# config reloads mid-edit, backup churn) — and ha_manage_security_policy,
+# which can rewrite the approval gates themselves. Users can still enable
+# each in the settings UI.
 LLM_API_DEFAULT_OFF_TOOLS: frozenset[str] = frozenset(
     {
         "ha_restart",
         "ha_reload_core",
         "ha_manage_backup",
+        "ha_manage_security_policy",
     }
 )
 
@@ -146,16 +164,27 @@ def _pinned_tool_names() -> set[str]:
 
 
 class LlmExposureMiddleware(Middleware):
-    """Stamp every listed tool with its LLM-API exposure + pinned state.
+    """Stamp listed tools when an embedded LLM-API connection is enabled.
 
     Runs after the visibility layer, so globally-disabled tools are already
-    absent and never carry a stamp. The stamp is additive metadata — no tool
-    is hidden or altered for regular MCP clients.
+    absent and never carry a stamp. ``server.py`` installs this middleware for
+    an embedded connection whose LLM API is enabled; older components that do
+    not send that flag retain the historical stamping behavior. Where it is
+    installed, the stamp is additive metadata — no tool is hidden or altered
+    for regular MCP clients.
     """
 
-    def __init__(self) -> None:
-        """Initialize the short-lived settings cache."""
+    def __init__(self, policy_live: Callable[[], bool] | None = None) -> None:
+        """Initialize the short-lived settings cache.
+
+        ``policy_live`` reports whether the gating middleware/queue are
+        actually wired on this server (they only wire at startup); the
+        stamp carries it so "configured but not enforcing until restart"
+        is visible on the wire.
+        """
         self._cache: tuple[float, dict[str, bool], set[str]] | None = None
+        self._policy_live = policy_live
+        self._policy_cache: tuple[float, dict[str, Any]] | None = None
 
     def _current_settings(self) -> tuple[dict[str, bool], set[str]]:
         """Return (overrides, pinned) with a short TTL over the file reads."""
@@ -192,14 +221,62 @@ class LlmExposureMiddleware(Middleware):
         self._cache = (now, overrides, pinned)
         return overrides, pinned
 
+    def _policy_block(self) -> dict[str, Any]:
+        """Serving-server policy/identity block (TTL-cached like the overrides).
+
+        Best-effort: a failure to read settings or the policy file stamps
+        conservative values (enabled=False / rules=0) rather than breaking
+        tools/list — the block is diagnostic metadata, not enforcement.
+        """
+        now = time.monotonic()
+        if (
+            self._policy_cache is not None
+            and now - self._policy_cache[0] < _OVERRIDES_TTL_SECONDS
+        ):
+            return self._policy_cache[1]
+        from ._version import is_embedded, is_running_in_addon
+
+        # Today this middleware is registered only for embedded connections.
+        # Keep the deployment branches because the middleware is also useful
+        # in direct-server tests and may be registered by another integration;
+        # the metadata must describe the server that actually answered.
+        block: dict[str, Any] = {
+            "enabled": False,
+            "live": bool(self._policy_live()) if self._policy_live else False,
+            "rules": 0,
+            "deployment": (
+                "embedded"
+                if is_embedded()
+                else ("addon" if is_running_in_addon() else "standalone")
+            ),
+        }
+        try:
+            from .config import get_global_settings
+
+            block["enabled"] = bool(get_global_settings().enable_tool_security_policies)
+        except Exception:
+            logger.debug("policy stamp: settings read failed", exc_info=True)
+        try:
+            from .policy.persistence import load_policy
+            from .utils.data_paths import get_data_dir
+
+            block["rules"] = len(load_policy(get_data_dir()).rules)
+        except Exception:
+            logger.debug("policy stamp: policy read failed", exc_info=True)
+        self._policy_cache = (now, block)
+        return block
+
     async def on_list_tools(
         self,
         context: MiddlewareContext[mt.ListToolsRequest],
         call_next: CallNext[mt.ListToolsRequest, Sequence[Tool]],
     ) -> Sequence[Tool]:
         """Stamp ``_meta.ha_mcp`` on every tool in the list result."""
+        from .transforms.compact_params import compact_params
+
         tools = await call_next(context)
         overrides, pinned = self._current_settings()
+        policy_block = self._policy_block()
 
         stamped: list[Tool] = []
         for tool in tools:
@@ -209,6 +286,8 @@ class LlmExposureMiddleware(Middleware):
                 tool.name, tool.tags or set(), overrides
             )
             namespace[META_PINNED_KEY] = tool.name in pinned
+            namespace[META_PARAMS_KEY] = compact_params(tool.parameters)
+            namespace[META_POLICY_KEY] = policy_block
             meta[META_NAMESPACE] = namespace
             stamped.append(tool.model_copy(update={"meta": meta}))
         return stamped

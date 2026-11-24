@@ -7,12 +7,20 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from anyio.to_thread import run_sync as run_in_thread
 from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ..utils.config_write_lock import config_write_guard
 from .approval_queue import ApprovalQueue
-from .model import Policy
+from .decision_pin import clear_pin, is_pin_set, pin_status, set_pin, validate_pin
+from .model import (
+    ALLOW_LIST_OMITTED_MESSAGE,
+    Policy,
+    drops_allow_list,
+    gates_differ,
+)
 from .persistence import load_policy, save_policy
 from .value_sources import (
     all_value_sources_for,
@@ -30,7 +38,7 @@ def _is_write_or_destructive(tool: Any) -> bool:
     ann = getattr(tool, "annotations", None)
     # No annotations = treat as potentially write (safe default for the
     # UI, matches the runtime gate which doesn't skip read-only).
-    return ann is None or getattr(ann, "readOnlyHint", None) is not True
+    return ann is None or ann.read_only_hint is not True
 
 
 def _extract_arg_paths(parameters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -63,17 +71,24 @@ def _extract_arg_paths(parameters: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def policy_file_corrupt_response(exc: ValueError) -> JSONResponse:
+    """The response for a corrupt or schema-invalid stored tool_policy.json.
+
+    Shared by GET and PUT here and in the sidecar: the body names the problem
+    and flags it (the page adds its repair hint on load), and the log records
+    it for whoever reads the server log rather than the page.
+    """
+    logger.warning("tool_policy.json could not be read: %s", exc)
+    return JSONResponse(
+        {"error": str(exc), "policy_file_corrupt": True}, status_code=500
+    )
+
+
 async def _get_config(data_dir: Path) -> JSONResponse:
     try:
         return JSONResponse(load_policy(data_dir).model_dump(mode="json"))
     except ValueError as e:
-        # Surface a corrupt or schema-invalid tool_policy.json to the
-        # UI so the user has a visible repair path; without this the
-        # tab would just spinner forever on an opaque 500.
-        return JSONResponse(
-            {"error": str(e), "policy_file_corrupt": True},
-            status_code=500,
-        )
+        return policy_file_corrupt_response(e)
 
 
 async def _put_config(
@@ -86,24 +101,55 @@ async def _put_config(
     # Optimistic concurrency: reject if the on-disk version moved
     # between this caller's GET and PUT. Returns the current policy
     # so the client can rebase if it wants to retry.
-    current = load_policy(data_dir)
-    if new_policy.version != current.version:
-        return JSONResponse(
-            {
-                "error": "policy version mismatch — reload before saving",
-                "current_version": current.version,
-                "current_policy": current.model_dump(mode="json"),
-            },
-            status_code=409,
-        )
-    save_policy(data_dir, new_policy)
-    # Drop the remember-cache only when rules actually changed.
-    # Editing just wait_seconds / approval_ttl_minutes shouldn't
-    # invalidate in-flight remembered approvals; only a rule change
-    # could make a previously-approved call now want a different
-    # outcome.
-    if current.rules != new_policy.rules:
-        queue.clear_remember_cache()
+    # Serialize the version-check + save against the developer tool
+    # (set_policy / set_tool) AND against other processes (the stdio
+    # sidecar runs this same handler in its own process) so a concurrent
+    # writer can't slip between the read and the write and lose an update.
+    async with config_write_guard():
+        try:
+            current = load_policy(data_dir)
+        except ValueError as e:
+            # No version to compare against, so the write is refused too.
+            return policy_file_corrupt_response(e)
+        if drops_allow_list(new_policy, current):
+            return JSONResponse({"error": ALLOW_LIST_OMITTED_MESSAGE}, status_code=400)
+        # Inside the guard: DELETE /api/policy/decision-pin clears the PIN
+        # under this same lock, and when the stored policy already has the
+        # switch off it does so without bumping the version. Checked before
+        # the lock, that delete could land in between and this write would
+        # then persist the switch with no PIN behind it -- the version check
+        # would not notice, because nothing about the policy changed.
+        if new_policy.event_decisions_enabled and not is_pin_set(data_dir):
+            # Enabling without a PIN would advertise a channel that decides
+            # nothing (the listener refuses every event without one), so the
+            # tab would show a switch the server does not honour.
+            return JSONResponse(
+                {
+                    "error": (
+                        "set an approval PIN before allowing approve/deny over "
+                        "the Home Assistant event bus"
+                    ),
+                    "pin_required": True,
+                },
+                status_code=400,
+            )
+        if new_policy.version != current.version:
+            return JSONResponse(
+                {
+                    "error": "policy version mismatch — reload before saving",
+                    "current_version": current.version,
+                    "current_policy": current.model_dump(mode="json"),
+                },
+                status_code=409,
+            )
+        save_policy(data_dir, new_policy)
+        # Drop the remember-cache only when the gates actually changed.
+        # Editing just wait_seconds / approval_ttl_minutes shouldn't
+        # invalidate in-flight remembered approvals; only a rule or
+        # rule_effect change could make a previously-approved call now want
+        # a different outcome.
+        if gates_differ(current, new_policy):
+            queue.clear_remember_cache()
     return JSONResponse({"saved": True, "version": new_policy.version + 1})
 
 
@@ -127,7 +173,7 @@ async def _get_pending(queue: ApprovalQueue) -> JSONResponse:
 async def _post_approve(queue: ApprovalQueue, request: Request) -> JSONResponse:
     try:
         body = await request.json()
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
@@ -155,7 +201,7 @@ async def _post_approve(queue: ApprovalQueue, request: Request) -> JSONResponse:
 async def _post_deny(queue: ApprovalQueue, request: Request) -> JSONResponse:
     try:
         body = await request.json()
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
@@ -171,6 +217,124 @@ async def _post_deny(queue: ApprovalQueue, request: Request) -> JSONResponse:
             status_code=409,
         )
     return JSONResponse({"denied": True})
+
+
+async def _get_decision_pin(data_dir: Path) -> JSONResponse:
+    """Whether a PIN exists, and when it was last set. Never the PIN itself."""
+    return JSONResponse(pin_status(data_dir))
+
+
+async def _post_decision_pin(data_dir: Path, request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except ValueError, TypeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    try:
+        pin = validate_pin(body.get("pin"))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    async with config_write_guard():
+        # Off the event loop: deriving the digest is 200k PBKDF2 rounds --
+        # a quarter of a second of pure CPU by design -- and the file write
+        # blocks on top of that. Verification already runs in a worker; this
+        # is the other half. The guard stays outside, so the write is still
+        # serialised against the policy writers it shares a lock with.
+        try:
+            await run_in_thread(set_pin, data_dir, pin)
+        except OSError as e:
+            logger.exception("approval PIN could not be stored")
+            return JSONResponse(
+                {
+                    "error": f"could not store the approval PIN: {e}",
+                    "storage_failed": True,
+                },
+                status_code=500,
+            )
+    logger.info("approval PIN set (event-bus decisions)")
+    return JSONResponse(await run_in_thread(pin_status, data_dir))
+
+
+async def _delete_decision_pin(data_dir: Path) -> JSONResponse:
+    """Remove the PIN, and with it the switch that depends on it.
+
+    Leaving ``event_decisions_enabled`` on while the PIN is gone would
+    leave the tab claiming a channel that now refuses every event, so the
+    two are cleared together rather than drifting apart.
+
+    Which is why the policy is read BEFORE anything is deleted: a corrupt
+    policy file raises, and raising after the delete would remove the PIN
+    and report a 500, leaving the caller to guess what happened. Both
+    remaining failures are reported for what they are -- the delete itself
+    failing changes nothing, while a failing save leaves the PIN gone and
+    the toggle still persisted, which the user has to know about because
+    the tab would otherwise show a channel that no longer has a PIN.
+    """
+    async with config_write_guard():
+        try:
+            policy = load_policy(data_dir)
+        except ValueError as e:
+            logger.exception(
+                "approval PIN not removed: the policy file could not be read"
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"the policy file must be readable before the PIN can "
+                        f"be removed: {e}"
+                    ),
+                    "policy_file_corrupt": True,
+                },
+                status_code=500,
+            )
+        disabled = policy.event_decisions_enabled
+        try:
+            existed = clear_pin(data_dir)
+        except OSError as e:
+            logger.exception("approval PIN could not be removed")
+            return JSONResponse(
+                {
+                    "error": f"could not remove the approval PIN: {e}",
+                    "storage_failed": True,
+                },
+                status_code=500,
+            )
+        if disabled:
+            try:
+                save_policy(
+                    data_dir,
+                    policy.model_copy(update={"event_decisions_enabled": False}),
+                )
+            except OSError as e:
+                logger.exception(
+                    "approval PIN removed, but the event-decisions toggle "
+                    "could not be switched off with it"
+                )
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"the PIN was removed, but switching off deciding "
+                            f"over the event bus failed: {e}. The channel is "
+                            f"closed either way -- every event is refused "
+                            f"without a PIN -- but the saved setting still "
+                            f"says it is on. Save the global settings again "
+                            f"to correct it."
+                        ),
+                        "pin_removed": True,
+                        "event_decisions_disabled": False,
+                        "storage_failed": True,
+                    },
+                    status_code=500,
+                )
+    if existed:
+        logger.info(
+            "approval PIN removed%s",
+            "; deciding from the event bus was switched off with it"
+            if disabled
+            else "",
+        )
+    return JSONResponse({"set": False, "event_decisions_disabled": disabled})
 
 
 async def _get_tool_schema(server: Any | None, request: Request) -> JSONResponse:
@@ -190,12 +354,10 @@ async def _get_tool_schema(server: Any | None, request: Request) -> JSONResponse
             {"error": "tool schema introspection unavailable in this mode"},
             503,
         )
-    # `local_provider._list_tools()` is a private FastMCP API but the
-    # public ``mcp.list_tools()`` filters out tools the operator has
-    # disabled via the Tools tab — the same disabled tools the user
-    # may still want to author gating rules for.
+    # The provider's public list includes disabled tools, unlike the server's
+    # client-facing list. Operators can still author rules for disabled tools.
     try:
-        tools = await server.mcp.local_provider._list_tools()
+        tools = await server.mcp.local_provider.list_tools()
     except Exception as e:
         logger.exception("tool-schema: failed to list tools")
         return JSONResponse({"error": f"tool list failed: {e}"}, 500)
@@ -248,6 +410,33 @@ async def _get_value_source(server: Any | None, request: Request) -> JSONRespons
     return JSONResponse({"source": source, "values": values})
 
 
+def build_decision_pin_handlers(
+    *, data_dir: Path
+) -> dict[str, Callable[[Request], Any]]:
+    """The PIN endpoints, which need no approval queue.
+
+    Split out because the sidecar's stub handler set serves these for real
+    while 503-ing everything that touches the in-memory queue: the PIN is a
+    file in the data dir, and the config PUT next to it refuses to enable
+    event-bus decisions without one.
+    """
+
+    async def get_decision_pin(_: Request) -> JSONResponse:
+        return await _get_decision_pin(data_dir)
+
+    async def post_decision_pin(request: Request) -> JSONResponse:
+        return await _post_decision_pin(data_dir, request)
+
+    async def delete_decision_pin(_: Request) -> JSONResponse:
+        return await _delete_decision_pin(data_dir)
+
+    return {
+        "policy_get_decision_pin": get_decision_pin,
+        "policy_post_decision_pin": post_decision_pin,
+        "policy_delete_decision_pin": delete_decision_pin,
+    }
+
+
 def build_policy_handlers(
     *,
     data_dir: Path,
@@ -284,4 +473,5 @@ def build_policy_handlers(
         "policy_post_deny": post_deny,
         "policy_get_tool_schema": get_tool_schema,
         "policy_get_value_source": get_value_source,
+        **build_decision_pin_handlers(data_dir=data_dir),
     }

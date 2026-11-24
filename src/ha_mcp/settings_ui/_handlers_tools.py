@@ -18,8 +18,16 @@ from .._version import is_embedded
 from ..errors import ErrorCode, create_error_response
 from ..llm_exposure import LLM_API_CONFIG_KEY
 from ..transforms import DEFAULT_PINNED_TOOLS
+from ..utils.config_write_lock import config_write_guard
 from . import _persistence
-from ._tools_meta import _VALID_STATES, BPS_MANDATORY_TOOLS, _get_tool_metadata
+from ._tools_meta import (
+    _VALID_STATES,
+    BPS_MANDATORY_TOOLS,
+    _get_tool_metadata,
+    gate_is_beta,
+    ignored_disabled_tools,
+    tool_config_warnings,
+)
 
 if TYPE_CHECKING:
     from ..server import HomeAssistantSmartMCPServer
@@ -81,13 +89,45 @@ def _bps_locked_tools() -> list[str]:
         if not (settings.enable_mandatory_bps and settings.enable_strict_mandatory_bps):
             return []
     except Exception:
-        logger.warning(
+        logger.exception(
             "settings lookup failed while computing BPS-locked tools; "
             "locking %s conservatively",
             ", ".join(sorted(BPS_MANDATORY_TOOLS)),
-            exc_info=True,
         )
     return sorted(BPS_MANDATORY_TOOLS)
+
+
+def _stub_gate_is_beta(tool: dict[str, Any]) -> bool:
+    """Whether a tools-payload row is a stub gated by a BETA feature flag.
+
+    ``_render_stub`` stamps ``disabled_by_beta``, but the sidecar serves
+    rows from ``tool_metadata.json``, which an older build may have written
+    without the field. Fall back to the flag registry rather than treating
+    a missing field as "not beta" — that would silently flip a beta stub's
+    LLM-API exposure from hidden to exposed on a stale cache.
+    """
+    gate = tool.get("disabled_by")
+    if not gate:
+        return False
+    declared = tool.get("disabled_by_beta")
+    if declared is None:
+        return gate_is_beta(str(gate))
+    return bool(declared)
+
+
+def _ignored_disable_diagnostics(config: dict[str, Any]) -> dict[str, Any]:
+    """Allow the Tools page to retain its conservative BPS lock on lookup errors."""
+    from ..config import get_global_settings
+
+    try:
+        settings = get_global_settings()
+        return {
+            "ignored_disabled_tools": ignored_disabled_tools(config, settings),
+            "tool_config_warnings": tool_config_warnings(config, settings),
+        }
+    except Exception:
+        logger.exception("Failed to read settings for mandatory-disable diagnostics")
+        return {"ignored_disabled_tools": None, "tool_config_warnings": None}
 
 
 def _env_pinned_conflicts(
@@ -144,15 +184,17 @@ async def _get_tools(
     # Feature-gated stub rows carry their primary tag but NOT the "beta"
     # tag the registered tool declares (_render_stub renders from
     # FEATURE_GATED_TOOLS metadata, whose tags are never empty) — append
-    # it whenever disabled_by is set so the toggle renders
-    # hidden-by-default, matching what the stamp will say once the flag
-    # turns the real tool on. Every feature-gated tool is beta by
-    # definition. (Review finding: a previous `or`-fallback here was dead
-    # code, so beta stubs rendered as exposed.)
+    # it for BETA-gated stubs so the toggle renders hidden-by-default,
+    # matching what the stamp will say once the flag turns the real tool
+    # on. (Review finding: a previous `or`-fallback here was dead code, so
+    # beta stubs rendered as exposed.) Gated no longer implies beta —
+    # ha_manage_security_policy (#2148) is gated by a non-beta safety
+    # toggle and declares no "beta" tag, so its stub must not gain one
+    # either or the two renderings would disagree.
     llm_effective = {
         t["name"]: effective_llm_api_exposed(
             t["name"],
-            [*(t.get("tags") or []), *(["beta"] if t.get("disabled_by") else [])],
+            [*(t.get("tags") or []), *(["beta"] if _stub_gate_is_beta(t) else [])],
             llm_overrides,
         )
         for t in tools
@@ -163,6 +205,7 @@ async def _get_tools(
             "tools": tools,
             "states": states,
             "env_pinned": pinned,
+            **_ignored_disable_diagnostics(config),
             "read_only_exempt": sorted(READ_ONLY_EXEMPT_TOOLS),
             "llm_api": llm_effective,
             "llm_api_overrides": llm_overrides,
@@ -184,7 +227,7 @@ async def _save_tools(
 ) -> JSONResponse:
     try:
         body = await request.json()
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return JSONResponse(
             create_error_response(
                 ErrorCode.VALIDATION_INVALID_JSON,
@@ -264,60 +307,66 @@ async def _save_tools(
         )
     llm_api_overrides = _coerce_llm_overrides(raw_llm_api)
 
-    config = _persistence.load_tool_config()
+    # Serialize the load-modify-save against the developer tool (set_tool
+    # runs its RMW in a worker thread, in parallel with this loop) AND
+    # against other processes (the stdio sidecar runs this same handler in
+    # its own process) so neither loses the other's update.
+    async with config_write_guard():
+        config = _persistence.load_tool_config()
 
-    # BPS-dependency guard (#1886): reject disabling a BPS-locked tool
-    # while strict best-practices mode is on. Mirrors the env-pinned
-    # semantics above — only a *change to* "disabled" is rejected, so a
-    # payload echoing an already-persisted disabled state (reachable via
-    # a hand-edited tool_config.json) still saves and is handled by
-    # apply_tool_visibility's strip-and-warn at startup.
-    prior_states = config.get("tools", {})
-    bps_conflicts = sorted(
-        name
-        for name in _bps_locked_tools()
-        if states.get(name) == "disabled" and prior_states.get(name) != "disabled"
-    )
-    if bps_conflicts:
-        return JSONResponse(
-            create_error_response(
-                ErrorCode.VALIDATION_INVALID_PARAMETER,
-                f"Refusing to disable {', '.join(bps_conflicts)} while "
-                "strict best-practices mode "
-                "(enable_strict_mandatory_bps) is on — strict mode "
-                "publishes its acknowledgment key only through that "
-                "tool, so disabling it would block every gated write.",
-                suggestions=[
-                    "Turn off 'Strict best-practices mode' in the Server "
-                    "Settings tab first, then disable the tool.",
-                ],
-                context={"rejected": bps_conflicts},
-            ),
-            status_code=409,
+        # BPS-dependency guard (#1886): reject disabling a BPS-locked tool
+        # while strict best-practices mode is on. Mirrors the env-pinned
+        # semantics above — only a *change to* "disabled" is rejected, so a
+        # payload echoing an already-persisted disabled state (reachable via
+        # a hand-edited tool_config.json) still saves and is handled by
+        # apply_tool_visibility's strip-and-warn at startup.
+        prior_states = config.get("tools", {})
+        bps_conflicts = sorted(
+            name
+            for name in _bps_locked_tools()
+            if states.get(name) == "disabled" and prior_states.get(name) != "disabled"
         )
+        if bps_conflicts:
+            return JSONResponse(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Refusing to disable {', '.join(bps_conflicts)} while "
+                    "strict best-practices mode "
+                    "(enable_strict_mandatory_bps) is on — strict mode "
+                    "publishes its acknowledgment key only through that "
+                    "tool, so disabling it would block every gated write.",
+                    suggestions=[
+                        "Turn off 'Strict best-practices mode' in the Server "
+                        "Settings tab first, then disable the tool.",
+                    ],
+                    context={"rejected": bps_conflicts},
+                ),
+                status_code=409,
+            )
 
-    # The enable/disable/pin half still needs a restart to apply
-    # (visibility is wired at server build); the LLM-API exposure half
-    # applies live (stamped per tools/list). Only demand a restart when
-    # the half that needs one actually changed. Compare with the SAME
-    # default-pinned padding _get_tools applies to its response — the JS
-    # posts that padded map back verbatim, so an unpadded compare would
-    # flag every first save as a states change (live-found on #1745).
-    states_changed = _padded_pins(config.get("tools", {})) != _padded_pins(states)
-    config["tools"] = states
-    config[LLM_API_CONFIG_KEY] = llm_api_overrides
-    if not _persistence.save_tool_config(config):
-        return JSONResponse(
-            create_error_response(
-                ErrorCode.INTERNAL_ERROR,
-                "Failed to persist tool config to disk",
-                suggestions=[
-                    "Set HA_MCP_CONFIG_DIR to a writable path (read-only filesystem?)",
-                    "Check the server logs for the underlying OSError",
-                ],
-            ),
-            status_code=500,
-        )
+        # The enable/disable/pin half still needs a restart to apply
+        # (visibility is wired at server build); the LLM-API exposure half
+        # applies live (stamped per tools/list). Only demand a restart when
+        # the half that needs one actually changed. Compare with the SAME
+        # default-pinned padding _get_tools applies to its response — the JS
+        # posts that padded map back verbatim, so an unpadded compare would
+        # flag every first save as a states change (live-found on #1745).
+        states_changed = _padded_pins(config.get("tools", {})) != _padded_pins(states)
+        config["tools"] = states
+        config[LLM_API_CONFIG_KEY] = llm_api_overrides
+        if not _persistence.save_tool_config(config):
+            return JSONResponse(
+                create_error_response(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Failed to persist tool config to disk",
+                    suggestions=[
+                        "Set HA_MCP_CONFIG_DIR to a writable path "
+                        + "(read-only filesystem?)",
+                        "Check the server logs for the underlying OSError",
+                    ],
+                ),
+                status_code=500,
+            )
 
     disabled_count = sum(1 for s in states.values() if s == "disabled")
     pinned_count = sum(1 for s in states.values() if s == "pinned")

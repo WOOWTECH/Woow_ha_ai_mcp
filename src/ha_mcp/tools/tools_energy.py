@@ -1,41 +1,32 @@
-"""
-Energy Dashboard preference management tools for Home Assistant.
+"""Energy preferences through native Core APIs and optional Core schema validation.
 
-This module provides a single tool to read and write Home Assistant's Energy
-Dashboard configuration through the ``energy/get_prefs`` / ``energy/save_prefs``
-WebSocket commands. The underlying API has destructive full-replace semantics
-per top-level key (``energy_sources``, ``device_consumption``,
-``device_consumption_water``) — sending a key with a partial list silently
-deletes everything else the user had configured. Optimistic locking via
-``config_hash`` prevents concurrent-modification data loss; a local shape
-check catches the most common agent-side errors; and a server-side
-``energy/validate`` call after every write surfaces residual issues
-(missing stats, wrong unit classes, etc.) in the response.
-
-Note: ``energy/validate`` in Home Assistant Core takes no payload — it
-validates the currently-persisted config. Pre-write validation of an
-unsubmitted payload is therefore not possible; this tool validates the
-post-save state instead.
-
-Note: On a fresh Home Assistant instance that has never had the Energy
-Dashboard configured, ``energy/get_prefs`` returns
-``ERR_NOT_FOUND "No prefs"`` rather than an empty default. The tool
-transparently maps that case to the documented default preferences
-structure (all three top-level keys present, empty lists) so agents
-get uniform behavior on fresh and configured instances alike.
+Core owns payload validation, defaults and saved state. HA-MCP owns mutation
+previews, duplicate protection and optimistic locking. Semantic validation is
+post-save because energy/validate only examines persisted preferences.
 """
 
-import json
 import logging
 from collections.abc import Callable
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
 
 from ..errors import ErrorCode, create_error_response
 from ..utils.config_hash import compute_config_hash
+from .coercion import JSON_STRING_COERCION
+from .core_contract import (
+    command_payload,
+    include_core_contract,
+    validate_energy_proposal,
+)
+from .energy_preferences import (
+    compute_per_key_hashes,
+    get_energy_prefs,
+    include_energy_statistics,
+)
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
@@ -43,321 +34,34 @@ from .helpers import (
     register_tool_methods,
     validate_identifier_not_empty,
 )
-from .util_helpers import JSON_STRING_COERCION
+from .tool_hints import write_hints
 
 logger = logging.getLogger(__name__)
 
 
-# Top-level keys in the energy prefs payload. Each is an independent
-# full-replace slot in ``energy/save_prefs``. ``_PrefsKey`` is the
-# corresponding ``Literal`` alias so MCP-wire callers (Pydantic-validated)
-# get typo-rejection at the boundary; runtime guards in `_set_prefs` cover
-# the unit-test path that bypasses Pydantic.
-_PrefsKey = Literal["energy_sources", "device_consumption", "device_consumption_water"]
-_PREFS_TOP_LEVEL_KEYS: tuple[_PrefsKey, ...] = (
-    "energy_sources",
-    "device_consumption",
-    "device_consumption_water",
-)
+def _flatten_validation_errors(raw: Any) -> list[dict[str, Any]]:
+    """Add paths for readability while preserving native issue objects as details."""
 
-# Energy source ``type`` values accepted by HA Core's ``SourceType`` union
-# (homeassistant/components/energy/data.py). ``_EnergySourceType`` names the
-# domain (mirroring the ``_PrefsKey`` pattern above) and ``_ENERGY_SOURCE_TYPES``
-# is its ordered realization — the single source of truth for the local shape
-# check. A type missing here is spuriously rejected even though
-# ``energy/save_prefs`` would accept it; when HA Core adds a source type, add it
-# in both places. Ordered (not a ``set``) to match the upstream union and to
-# keep error messages deterministic. See issue #1530.
-_EnergySourceType = Literal["grid", "solar", "battery", "gas", "water"]
-_ENERGY_SOURCE_TYPES: tuple[_EnergySourceType, ...] = (
-    "grid",
-    "solar",
-    "battery",
-    "gas",
-    "water",
-)
+    def walk(value: Any, path: str) -> list[dict[str, Any]]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [
+                issue
+                for index, item in enumerate(value)
+                for issue in walk(item, f"{path}[{index}]")
+            ]
+        if isinstance(value, dict) and not any(
+            key in value for key in ("type", "message", "issue_type")
+        ):
+            return [
+                issue
+                for key, item in value.items()
+                for issue in walk(item, f"{path}.{key}" if path else key)
+            ]
+        return [{"path": path, "message": str(value), "details": value}]
 
-# Non-grid source types. Each requires a ``stat_energy_from`` consumption
-# statistic and is de-duplicated by this tool on ``(type, stat_energy_from)``
-# (used for both the shape check's required-field rule and
-# ``_append_unique_source`` de-duplication). ``grid`` is excluded: its
-# ``stat_energy_from`` is optional and a hub can legitimately carry multiple grid
-# variants, so it has no single uniqueness key.
-_STAT_FROM_SOURCE_TYPES: frozenset[str] = frozenset(
-    t for t in _ENERGY_SOURCE_TYPES if t != "grid"
-)
-
-
-def _default_prefs() -> dict[str, Any]:
-    """Return the default empty prefs structure used by HA Core.
-
-    Mirrors ``EnergyManager.default_preferences()`` in
-    ``homeassistant/components/energy/data.py``. A Home Assistant instance
-    that has never had the Energy Dashboard configured returns
-    ``ERR_NOT_FOUND "No prefs"`` from ``energy/get_prefs``; this helper
-    provides the canonical empty structure so the tool can transparently
-    treat the two cases (never-configured vs. configured-but-empty) the
-    same way.
-    """
-    return {
-        "energy_sources": [],
-        "device_consumption": [],
-        "device_consumption_water": [],
-    }
-
-
-def _compute_per_key_hashes(prefs: dict[str, Any]) -> dict[_PrefsKey, str]:
-    """Per-top-level-key hashes for partial-update optimistic locking.
-
-    Each top-level key is wrapped in its own single-key dict before hashing,
-    so the per-key hash captures both the key name and its value — an agent
-    cannot accidentally use, say, an ``energy_sources`` hash to authorise a
-    ``device_consumption`` write. ``prefs.get(key, [])`` mirrors the
-    "missing top-level key = empty list" semantics codified by
-    ``_default_prefs``.
-    """
-    return {
-        key: compute_config_hash({key: prefs.get(key, [])})
-        for key in _PREFS_TOP_LEVEL_KEYS
-    }
-
-
-def _merge_submitted_keys(
-    base: dict[str, Any], config: dict[str, Any]
-) -> dict[str, Any]:
-    """Return a copy of ``base`` with each top-level key present in
-    ``config`` merged in (full-replace per key, matching the
-    ``energy/save_prefs`` semantics).
-
-    Shared by ``_set_prefs``'s save-payload construction (step 3) and its
-    effective-new-state hash computation (step 5) — both merge only the
-    top-level keys actually submitted in ``config`` over a different base
-    dict (the save-payload envelope vs. the current prefs snapshot).
-    """
-    merged = dict(base)
-    for key in _PREFS_TOP_LEVEL_KEYS:
-        if key in config:
-            merged[key] = config[key]
-    return merged
-
-
-def _is_no_prefs_error(error_msg: str) -> bool:
-    """Return True if an error string from send_websocket_message indicates
-    ``ERR_NOT_FOUND "No prefs"`` from HA Core's energy/get_prefs handler.
-
-    HA Core wraps the error as ``f"Command failed: {message}"``; the
-    underlying sentinel we key on is the literal ``"No prefs"`` message
-    emitted by ``ws_get_prefs`` when ``manager.data is None``.
-    """
-    return error_msg.endswith("No prefs")
-
-
-def _flatten_validation_errors(raw: Any) -> list[dict[str, str]]:
-    """Convert the raw ``energy/validate`` response into a flat error list.
-
-    The raw response mirrors the prefs structure: a dict with the three
-    top-level keys, each mapping to a list of per-entry error lists (empty
-    inner list = that entry is valid). This function walks that structure and
-    returns a flat list of ``{"path", "message"}`` dicts, suitable for agent
-    consumption.
-
-    A successful validation returns an empty list.
-    """
-    if not isinstance(raw, dict):
-        return []
-
-    errors: list[dict[str, str]] = []
-    for key in _PREFS_TOP_LEVEL_KEYS:
-        entries = raw.get(key, [])
-        if not isinstance(entries, list):
-            continue
-        for idx, entry_errors in enumerate(entries):
-            if not entry_errors:
-                continue
-            if isinstance(entry_errors, list):
-                errors.extend(
-                    {"path": f"{key}[{idx}]", "message": str(msg)}
-                    for msg in entry_errors
-                )
-            elif isinstance(entry_errors, dict):
-                for field, msgs in entry_errors.items():
-                    msg_list = msgs if isinstance(msgs, list) else [msgs]
-                    errors.extend(
-                        {"path": f"{key}[{idx}].{field}", "message": str(msg)}
-                        for msg in msg_list
-                    )
-    return errors
-
-
-def _shape_check_energy_source_entry(
-    idx: int, entry: dict[str, Any]
-) -> list[dict[str, str]]:
-    """Validate a single ``energy_sources`` entry: ``type`` presence/validity
-    and the type-specific ``stat_energy_from`` requirement.
-
-    Split out of ``_shape_check`` to keep its per-entry dispatch flat; see
-    that function's docstring for the overall shape-check contract.
-    """
-    errors: list[dict[str, str]] = []
-    valid_types = "|".join(_ENERGY_SOURCE_TYPES)
-    entry_type = entry.get("type")
-    if entry_type is None:
-        errors.append(
-            {
-                "path": f"energy_sources[{idx}]",
-                "message": f"energy_sources entries require 'type' ({valid_types})",
-            }
-        )
-    elif entry_type not in _ENERGY_SOURCE_TYPES:
-        errors.append(
-            {
-                "path": f"energy_sources[{idx}].type",
-                "message": f"invalid type '{entry_type}' (must be one of {valid_types})",
-            }
-        )
-    elif entry_type in _STAT_FROM_SOURCE_TYPES and "stat_energy_from" not in entry:
-        errors.append(
-            {
-                "path": f"energy_sources[{idx}]",
-                "message": f"{entry_type} entries require 'stat_energy_from'",
-            }
-        )
-    return errors
-
-
-def _shape_check_consumption_entry(
-    key: str, idx: int, entry: dict[str, Any]
-) -> list[dict[str, str]]:
-    """Validate a single ``device_consumption`` / ``device_consumption_water``
-    entry: the ``stat_consumption`` requirement shared by both lists.
-
-    Split out of ``_shape_check`` to keep its per-entry dispatch flat; see
-    that function's docstring for the overall shape-check contract.
-    """
-    if "stat_consumption" not in entry:
-        return [
-            {
-                "path": f"{key}[{idx}]",
-                "message": f"{key} entries require 'stat_consumption'",
-            }
-        ]
-    return []
-
-
-def _shape_check_key_entries(
-    key: str, value: list[Any], allowed_indices: set[int] | None
-) -> list[dict[str, str]]:
-    """Validate all (or ``allowed_indices``-scoped) entries of one top-level
-    key's list: dict-shape and the type-specific required fields.
-
-    Split out of ``_shape_check`` to keep its top-level key loop flat; see
-    that function's docstring for the overall shape-check contract.
-    """
-    errors: list[dict[str, str]] = []
-    for idx, entry in enumerate(value):
-        if allowed_indices is not None and idx not in allowed_indices:
-            continue
-        if not isinstance(entry, dict):
-            errors.append(
-                {
-                    "path": f"{key}[{idx}]",
-                    "message": "entry must be a dict",
-                }
-            )
-            continue
-        if key == "energy_sources":
-            errors.extend(_shape_check_energy_source_entry(idx, entry))
-        if key in ("device_consumption", "device_consumption_water"):
-            errors.extend(_shape_check_consumption_entry(key, idx, entry))
-    return errors
-
-
-def _shape_check(
-    config: dict[str, Any],
-    validate_only: dict[str, set[int]] | None = None,
-) -> list[dict[str, str]]:
-    """Validate config shape locally before sending to the server.
-
-    Validates that top-level keys have the expected list-of-dicts shape and
-    that required identifying fields are present. Does NOT validate semantic
-    correctness (stat IDs existing, units matching, etc.) — that's surfaced
-    by the post-save server-side ``energy/validate`` call.
-
-    ``validate_only`` scopes the per-entry check. ``None`` (default) validates
-    every entry under every present top-level key — the original contract.
-    A dict scopes the check to the listed keys and, within each, only the
-    listed indices: top-level keys absent from the dict are skipped entirely,
-    indices outside each key's set are skipped per-entry. The "must be a
-    list" structural check still fires for any present-and-listed key with a
-    non-list value, so ``validate_only`` cannot be used to bypass structural
-    sanity. A dict with an empty set for a key (``{key: set()}``) skips the
-    per-entry pass for that key while preserving the structural check —
-    this is what convenience-mode write paths pass for remove operations
-    (no new entries to validate, but the list shape is still checked). An
-    empty dict (``{}``) skips all keys entirely. See issue #1086 for the
-    asymmetric over-validation problem this addresses.
-    """
-    errors: list[dict[str, str]] = []
-
-    if not isinstance(config, dict):
-        return [{"path": "config", "message": "must be a dict"}]
-
-    for key in _PREFS_TOP_LEVEL_KEYS:
-        if key not in config:
-            continue
-        if validate_only is not None and key not in validate_only:
-            continue
-        value = config[key]
-        if not isinstance(value, list):
-            errors.append({"path": key, "message": "must be a list"})
-            continue
-        allowed_indices: set[int] | None = (
-            validate_only[key] if validate_only is not None else None
-        )
-        errors.extend(_shape_check_key_entries(key, value, allowed_indices))
-
-    return errors
-
-
-def _appended_tail_indices(existing: list[Any], new: list[Any]) -> set[int]:
-    """Return the indices in ``new`` that lie past the end of ``existing``.
-
-    Per issue #1086, this builds the ``validate_only`` index set scoped to the
-    appended tail of an append-only / shrink-only mutation, so pre-existing
-    HA-validated siblings are not re-checked on every add/remove:
-
-    - Append-only mutators (``_add_*``): returns indices of the new entries.
-    - Shrink-only mutators (``_remove_*``): returns an empty set — nothing
-      new to validate, and the surviving entries already passed HA validation.
-
-    Refuses in-place mutators where ``len(new) == len(existing)`` but the
-    contents differ — the appended-tail formula would yield an empty index
-    set on a list whose entries actually changed, silently bypassing
-    per-entry validation. Add explicit handling (e.g. an
-    ``_indices_of_modified_entries`` helper) before introducing such a
-    mutator; do not extend this one.
-    """
-    if len(new) == len(existing) and new != existing:
-        raise_tool_error(
-            create_error_response(
-                ErrorCode.INTERNAL_ERROR,
-                "_appended_tail_indices: in-place mutation detected "
-                "(same length, different content) — the appended-tail "
-                "validation heuristic only covers append-only / shrink-only "
-                "mutators. Add explicit per-entry validation handling for "
-                "in-place mutators before reusing this helper.",
-                context={
-                    "existing_len": len(existing),
-                    "new_len": len(new),
-                },
-                suggestions=[
-                    "If introducing a _replace_* / _update_* mutator, "
-                    "compute the indices of modified entries explicitly "
-                    "and pass those to _shape_check via validate_only.",
-                ],
-            )
-        )
-    return set(range(len(existing), len(new)))
+    return walk(raw, "")
 
 
 class EnergyTools:
@@ -369,12 +73,12 @@ class EnergyTools:
     @tool(
         name="ha_manage_energy_prefs",
         tags={"Energy"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "idempotentHint": False,
-            "title": "Manage Energy Dashboard Preferences",
-        },
+        annotations=write_hints(
+            "Manage Energy Dashboard Preferences",
+            destructive=True,
+            idempotent=False,
+            open_world=False,
+        ),
     )
     @log_tool_usage
     async def ha_manage_energy_prefs(
@@ -384,11 +88,7 @@ class EnergyTools:
             Field(
                 description=(
                     "Operation mode. Primitives: 'get' reads the current prefs; "
-                    "'set' writes a full prefs payload (per-top-level-key "
-                    "full-replace). Convenience modes: 'add_device' / "
-                    "'remove_device' / 'add_source' perform a single read-"
-                    "modify-write atomically — no config_hash from the caller, "
-                    "the tool fetches it fresh internally."
+                    "'set' writes a full prefs payload."
                 )
             ),
         ],
@@ -400,8 +100,7 @@ class EnergyTools:
                     "Full prefs payload for mode='set'. Must contain the "
                     "top-level keys you intend to replace: 'energy_sources', "
                     "'device_consumption', 'device_consumption_water'. Any "
-                    "top-level key present in this payload REPLACES the "
-                    "existing list entirely; any omitted key is preserved. "
+                    "omitted key is preserved. "
                     "Call with mode='get' first, mutate the returned config, "
                     "then pass the whole object back. Ignored by convenience "
                     "modes."
@@ -410,18 +109,16 @@ class EnergyTools:
             ),
         ] = None,
         config_hash: Annotated[
-            str | dict[_PrefsKey, str] | None,
+            str | dict[str, str] | None,
             Field(
                 description=(
-                    "Hash from a previous mode='get' call. REQUIRED for "
-                    "mode='set' unless dry_run=True. Two forms: str (full-"
-                    "blob lock) or dict (per-key lock, taken from the "
-                    "config_hash_per_key field of mode='get'). Pass the dict "
-                    "form as a native object, NOT a JSON-encoded string — a "
-                    "stringified dict is treated as a full-blob token and will "
-                    "report RESOURCE_LOCKED; clients that can only send strings "
-                    "should use the str full-blob form. See the tool docstring "
-                    "for fail-closed semantics. Ignored by convenience modes."
+                    "Hash from a previous mode='get' call. REQUIRED for mode='set' unless "
+                    "dry_run=True. Two forms: str (full-blob lock) or dict (per-key lock, "
+                    "taken from the config_hash_per_key field of mode='get'). Pass the dict"
+                    " form as a native object, NOT a JSON-encoded string — a stringified "
+                    "dict is treated as a full-blob token and will report RESOURCE_LOCKED; "
+                    "clients that can only send strings should use the str full-blob form. "
+                    "Ignored by convenience modes."
                 ),
                 default=None,
             ),
@@ -430,18 +127,10 @@ class EnergyTools:
             bool,
             Field(
                 description=(
-                    "If True, no write is performed. For mode='set': runs a "
-                    "local shape check on the proposed config AND calls the "
-                    "server's energy/validate against the CURRENT persisted "
-                    "state (Home Assistant's validate endpoint cannot validate "
-                    "an unsubmitted payload). For convenience modes: simulates "
-                    "the mutation against a fresh read and reports what would "
-                    "change without writing — but still raises "
-                    "RESOURCE_ALREADY_EXISTS (duplicate add_device, or duplicate "
-                    "add_source for solar/battery/gas/water), RESOURCE_NOT_FOUND "
-                    "(missing remove_device), or VALIDATION_FAILED (post-mutator "
-                    "shape error) when the proposed mutation is not applicable. "
-                    "Default False."
+                    "If True, preview without saving. With the component, validates "
+                    "the complete proposal through Core's registered save schema. "
+                    "Without that capability, explicitly reports proposal validation "
+                    "unavailable. Semantic energy/validate checks persisted state only."
                 ),
                 default=False,
             ),
@@ -460,10 +149,7 @@ class EnergyTools:
         name: Annotated[
             str | None,
             Field(
-                description=(
-                    "Optional display name for mode='add_device'. Only used "
-                    "when adding a new device entry; ignored otherwise."
-                ),
+                description=("Display name for mode='add_device'; ignored otherwise."),
                 default=None,
             ),
         ] = None,
@@ -471,13 +157,11 @@ class EnergyTools:
             str | None,
             Field(
                 description=(
-                    "Optional 'parent' statistic for mode='add_device'. Set "
-                    "this to a statistic that already INCLUDES this device's "
-                    "consumption (e.g., a whole-home or circuit-level meter "
-                    "that this device feeds into). The Energy Dashboard will "
-                    "subtract this device's reading from the parent so the "
-                    "parent's contribution is not double-counted. Ignored "
-                    "otherwise."
+                    "'Parent' statistic for mode='add_device'. Set this to a statistic that"
+                    " already INCLUDES this device's consumption (e.g., a whole-home or "
+                    "circuit-level meter that this device feeds into). The Energy Dashboard"
+                    " will subtract this device's reading from the parent so the parent's "
+                    "contribution is not double-counted. Ignored otherwise."
                 ),
                 default=None,
             ),
@@ -487,8 +171,7 @@ class EnergyTools:
             Field(
                 description=(
                     "If True, mode='add_device' / 'remove_device' targets "
-                    "'device_consumption_water' instead of 'device_consumption'. "
-                    "Default False."
+                    "'device_consumption_water' instead of 'device_consumption'."
                 ),
                 default=False,
             ),
@@ -498,35 +181,34 @@ class EnergyTools:
             JSON_STRING_COERCION,
             Field(
                 description=(
-                    "Single energy_sources entry for mode='add_source'. Must "
-                    "contain 'type' (one of grid|solar|battery|gas|water) and "
-                    "the type-specific required fields (e.g. "
-                    "solar/battery/gas/water require 'stat_energy_from'). Every "
-                    "source type also accepts an optional 'name' (display label "
-                    "in the energy graphs); battery additionally accepts "
-                    "'stat_soc' (state-of-charge statistic). Note: HA Core's "
-                    "voluptuous schema for grid sources requires the full field "
-                    "set (cost_adjustment_day, stat_energy_to, stat_cost, "
-                    "entity_energy_price, number_energy_price, "
-                    "entity_energy_price_export, number_energy_price_export, "
-                    "stat_compensation) — the local shape check is narrower, "
-                    "so a minimal {'type': 'grid'} passes locally but "
-                    "surfaces in post_save_validation_errors after writing. "
-                    "Pass the unused fields as None to satisfy the server. "
-                    "Required for mode='add_source'; ignored otherwise."
+                    "Single native energy_sources entry for mode='add_source'. "
+                    "Use mode='get', include_schema=True to inspect the running "
+                    "Core's fields and requirements; dry_run=True validates without saving."
                 ),
                 default=None,
             ),
         ] = None,
+        include_schema: Annotated[
+            bool,
+            Field(
+                description="With mode='get', describe the running Core's save schema. Unavailable without the component."
+            ),
+        ] = False,
+        include_statistics: Annotated[
+            bool,
+            Field(
+                description="With mode='get', include native recorder metadata and resolved output units for all configured statistic references. Ignored for other modes."
+            ),
+        ] = False,
     ) -> dict[str, Any]:
-        """
-        Manage the Home Assistant Energy Dashboard preferences.
+        """Manage the Home Assistant Energy Dashboard preferences: grid / solar /
+        battery / gas / water energy sources, device consumption sensors for
+        electricity and water, and cost tariffs.
 
-        The Energy Dashboard configuration (grid/solar/battery/gas/water energy
-        sources, individual device consumption sensors for electricity and
-        water, cost tariffs) is stored in ``.storage/energy`` and not otherwise
-        reachable via REST, services, or helper flows — this tool is the only
-        way for agents to inspect or modify it.
+        WHEN NOT TO USE:
+        - To create the underlying statistics themselves — they must already
+          exist as HA entities before being referenced here; create them via
+          the relevant integration's config flow first.
 
         WHEN TO USE:
         - mode='get' / 'set': inspect or replace the full Energy Dashboard
@@ -534,66 +216,49 @@ class EnergyTools:
           top-level keys at once.
         - mode='add_device' / 'remove_device': add or remove a single
           device-consumption entry. The tool performs a fresh read-modify-write
-          internally; the caller does NOT manage config_hash. Use ``water=True``
-          to target the water meter list instead of electricity.
-        - mode='add_source': append a single entry to ``energy_sources`` (grid,
-          solar, battery, gas, or water). Same atomic read-modify-write
-          semantics.
+          internally.
+        - mode='add_source': append a single entry to ``energy_sources``.
+          Same internal read-modify-write.
 
-        WHEN NOT TO USE:
-        - To create the underlying statistics themselves — they must already
-          exist as HA entities before being referenced here; create them via
-          the relevant integration's config flow first.
+        RELATED TOOLS: Use ha_get_history(source="statistics") with the returned
+        statistic IDs for consumption, totals, and trends. Metadata comes directly
+        from the running Core, including stored and display units.
 
         CAVEATS:
         - ``energy/save_prefs`` has per-key FULL-REPLACE semantics. Passing
           ``{"device_consumption": [<one entry>]}`` deletes every other device
-          the user had configured — silently, with no error. mode='set'
-          requires a fresh ``config_hash`` for optimistic locking; convenience
-          modes hide this entirely.
-        - ``config_hash`` accepts both a single ``str`` (full-blob lock) and
-          a ``dict[_PrefsKey, str]`` keyed by top-level keys (per-key lock,
-          taken from the ``config_hash_per_key`` field of the mode='get'
-          response). The per-key form lets an agent submit only the top-
-          level key it wants to change — set-equality between ``config``
-          keys and dict keys is enforced, and any key outside the canonical
-          set (typo, etc.) on either side is rejected with
-          ``VALIDATION_FAILED`` rather than silently dropped (so an empty
-          submission cannot succeed as a no-op). A per-key submission
-          still fully replaces that key's value as the save endpoint
-          requires. Mismatch on any locked key returns ``RESOURCE_LOCKED``
-          with the offending keys in the response's top-level
-          ``mismatched_keys`` (``create_error_response`` flattens the
-          ``context`` dict onto the response root).
-        - ``dry_run=True`` skips the hash check entirely for both forms;
-          the per-key form is therefore silently accepted on dry runs even
-          if its keys would mismatch the current state.
-        - A local shape check runs before every write; malformed payloads
-          are rejected with a ``shape_errors`` list.
+          the user had configured — silently, with no error.
+        - The per-key ``config_hash`` form lets an agent submit only the
+          top-level key it wants to change: ``config`` keys must equal the dict
+          keys, and a per-key submission still fully replaces
+          that key's value. A mismatch on any locked key returns
+          ``RESOURCE_LOCKED`` with the offending keys in ``mismatched_keys``.
+        - ``dry_run=True`` skips the hash check entirely for both forms.
+        - Writes need an administrator token; Home Assistant rejects the save
+          otherwise.
         - After a successful write, the tool calls ``energy/validate`` and
-          returns any residual issues as ``post_save_validation_errors`` in
-          the response. These reflect semantic problems (missing stats, unit
-          mismatches) that shape checks can't catch; the save persists
-          regardless — correct the config and write again if needed.
-        - The underlying save endpoint is admin-only. Non-admin tokens will
-          receive an authorization error from Home Assistant.
-        - Convenience modes are NOT idempotent: 'add_device' on an existing
-          ``stat_consumption`` returns RESOURCE_ALREADY_EXISTS; 'remove_device'
-          on a missing entry returns RESOURCE_NOT_FOUND. 'add_source' rejects
-          duplicates by ``(type, stat_energy_from)`` for solar/battery/gas/water
-          (RESOURCE_ALREADY_EXISTS); grid entries are appended without a
-          duplicate check (multiple grid variants are legitimate, and grid
-          has no single canonical uniqueness key) — the caller is responsible
-          for de-duplicating grid sources.
-        - Convenience modes do NOT bypass the local shape check on dry_run:
-          ``dry_run=True`` still raises ``RESOURCE_ALREADY_EXISTS``
-          (duplicate add_device / add_source), ``RESOURCE_NOT_FOUND``
-          (missing remove_device), or ``VALIDATION_FAILED`` (post-mutator
-          shape error) when the proposed mutation is not applicable. The
-          mutator and shape check both run before the dry-run short-circuit.
+          returns residual issues (missing stats, unit mismatches) as
+          ``post_save_validation_errors``; the save persists regardless —
+          correct the config and write again if needed.
+        - 'add_source' rejects duplicates by ``(type, stat_energy_from)`` for
+          solar/battery/gas/water; grid entries are appended without a duplicate
+          check (multiple grid variants are legitimate), so the caller
+          de-duplicates grid sources.
+
+        EXAMPLES:
+        - ha_manage_energy_prefs(mode="get", include_schema=True)
+        - Preview a device: ha_manage_energy_prefs(mode="add_device", stat_consumption="sensor.fridge_energy", dry_run=True)
+        - Remove a device: ha_manage_energy_prefs(mode="remove_device", stat_consumption="sensor.fridge_energy")
         """
         if mode == "get":
-            return await self._get_prefs()
+            result = await self._get_prefs()
+            if include_schema:
+                await include_core_contract(self._client, result, "energy/save_prefs")
+            return (
+                await include_energy_statistics(self._client, result)
+                if include_statistics
+                else result
+            )
 
         if mode == "add_device":
             return await self._add_device(
@@ -650,201 +315,52 @@ class EnergyTools:
     # ------------------------------------------------------------------
 
     async def _get_prefs(self) -> dict[str, Any]:
-        """Fetch current prefs and return them with a config_hash.
-
-        On a Home Assistant instance that has never had the Energy Dashboard
-        configured, ``energy/get_prefs`` returns ``ERR_NOT_FOUND "No prefs"``
-        rather than an empty default. This method maps that case to the
-        documented default preferences structure so the tool works uniformly
-        on fresh installations.
-        """
-        try:
-            result = await self._client.send_websocket_message(
-                {
-                    "type": "energy/get_prefs",
-                }
-            )
-
-            if not result.get("success"):
-                error_msg = str(result.get("error", ""))
-                if _is_no_prefs_error(error_msg):
-                    prefs = _default_prefs()
-                    return {
-                        "success": True,
-                        "mode": "get",
-                        "config": prefs,
-                        "config_hash": compute_config_hash(prefs),
-                        "config_hash_per_key": _compute_per_key_hashes(prefs),
-                        "note": (
-                            "Energy Dashboard has never been configured on "
-                            "this instance; returning empty default."
-                        ),
-                    }
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        f"Failed to get energy prefs: {result.get('error', 'Unknown error')}",
-                        context={"mode": "get"},
-                    )
-                )
-
-            prefs = result.get("result") or _default_prefs()
-            return {
-                "success": True,
-                "mode": "get",
-                "config": prefs,
-                "config_hash": compute_config_hash(prefs),
-                "config_hash_per_key": _compute_per_key_hashes(prefs),
-            }
-
-        except ToolError:
-            raise
-        except Exception as e:
-            logger.error(f"Error getting energy prefs: {e}")
-            exception_to_structured_error(
-                e,
-                context={"mode": "get"},
-                suggestions=[
-                    "Check Home Assistant connection",
-                    "Verify WebSocket connection is active",
-                ],
-            )
-            return None  # unreachable: exception_to_structured_error always raises
+        return await get_energy_prefs(self._client)
 
     async def _dry_run(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Shape-check the proposed config and fetch current-state validate.
-
-        Returns both error lists clearly labelled so agents can distinguish
-        problems they're about to introduce (shape_errors) from pre-existing
-        issues in the persisted state (current_state_validation_errors).
-        """
-        try:
-            shape_errors = _shape_check(config)
-
-            validate_result = await self._client.send_websocket_message(
-                {
-                    "type": "energy/validate",
-                }
+        """Preview the actual native schema and label persisted-state checks separately."""
+        validation = await validate_energy_proposal(self._client, config)
+        current_errors, failure, native_validation = await self._post_save_validate()
+        result: dict[str, Any] = {
+            "success": True,
+            "mode": "set",
+            "dry_run": True,
+            "proposal_validation": validation,
+            "current_state_validation_errors": current_errors,
+            "current_state_validation": native_validation,
+            "message": "No preferences saved. Semantic checks describe the current persisted state only.",
+        }
+        if validation["status"] != "validated":
+            result["partial"] = True
+            result["warnings"] = [validation["reason"]]
+        if failure:
+            result["partial"] = True
+            result.setdefault("warnings", []).append(
+                f"Current-state validation failed: {failure}"
             )
-            validate_warning: str | None = None
-            if validate_result.get("success"):
-                current_state_errors = _flatten_validation_errors(
-                    validate_result.get("result", {})
-                )
-            else:
-                validate_error = validate_result.get("error") or "unknown error"
-                logger.warning(
-                    f"energy/validate (current state) failed: {validate_error}"
-                )
-                current_state_errors = []
-                validate_warning = (
-                    f"energy/validate failed: {validate_error} — "
-                    "current-state validation skipped"
-                )
-
-            response: dict[str, Any] = {
-                "success": len(shape_errors) == 0,
-                "mode": "set",
-                "dry_run": True,
-                "shape_errors": shape_errors,
-                "current_state_validation_errors": current_state_errors,
-                "message": (
-                    "Shape OK. Note: HA's energy/validate cannot validate an "
-                    "unsubmitted payload — current_state_validation_errors "
-                    "reflects the CURRENT persisted config, not your proposal. "
-                    "Semantic issues in the proposed config (missing stats, "
-                    "wrong units) will surface in post_save_validation_errors "
-                    "after an actual mode='set' write."
-                    if not shape_errors
-                    else f"{len(shape_errors)} shape error(s) — fix before writing."
-                ),
-            }
-            if validate_warning is not None:
-                response["partial"] = True
-                response.setdefault("warnings", []).append(validate_warning)
-            return response
-
-        except ToolError:
-            raise
-        except Exception as e:
-            logger.error(f"Error in energy prefs dry_run: {e}")
-            exception_to_structured_error(
-                e,
-                context={"mode": "set", "dry_run": True},
-                suggestions=[
-                    "Check Home Assistant connection",
-                    "Verify config shape matches energy/get_prefs response",
-                ],
-            )
-            return None  # unreachable: exception_to_structured_error always raises
+        return result
 
     async def _set_prefs(
         self,
         config: dict[str, Any],
-        config_hash: str | dict[_PrefsKey, str],
-        *,
-        current_prefs: dict[str, Any] | None = None,
-        validate_only: dict[str, set[int]] | None = None,
+        config_hash: str | dict[str, str] | None,
     ) -> dict[str, Any]:
-        """Shape-check → hash-check → save → post-save validate.
+        """Hash-check, submit to Core, then report authoritative saved state.
 
-        Shape errors and hash mismatch fail closed. Post-save validation
-        errors are reported in the response as a non-fatal warning; the
-        save already succeeded.
-
-        ``config_hash`` accepts two forms. A ``str`` locks against the
-        full prefs blob (the original optimistic-locking contract). A
-        ``dict[_PrefsKey, str]`` keyed by top-level keys locks each
-        submitted key individually — set-equality between ``config`` and
-        dict keys is enforced, and unknown keys on either side are
-        rejected (``VALIDATION_FAILED``) so an empty submission cannot
-        coincide as a no-op success. See the tool docstring for the full
-        agent-facing contract.
-
-        ``current_prefs`` is an optional caller-supplied snapshot. When
-        provided, the internal re-read is skipped — the convenience-mode
-        path uses this to avoid a second ``energy/get_prefs`` round trip
-        per attempt (the snapshot was already fetched by ``_mutate_atomic``).
-        Convenience modes always pass a ``str`` hash; the dict form is
-        only reachable via direct mode='set' callers. The hash check still
-        runs against the provided snapshot as a defensive guard.
-
-        ``validate_only`` is forwarded to ``_shape_check`` and lets a caller
-        scope the per-entry check to specific top-level keys / indices.
-        Convenience-mode writes pass the appended tail indices so
-        pre-existing (HA-validated) entries are not re-validated against the
-        local schema — see issue #1086.
+        Core validates every submitted entry. Existing siblings are never checked
+        against a narrower local schema. A ``config_hash`` from an earlier read
+        is checked against the current prefs; the per-key form locks exactly the
+        submitted keys. The convenience modes read, edit and save within one
+        call and pass none.
         """
         try:
-            # 1. Shape check (fast local, fail closed)
-            shape_errors = _shape_check(config, validate_only=validate_only)
-            if shape_errors:
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.VALIDATION_FAILED,
-                        f"Config shape invalid: {len(shape_errors)} error(s)",
-                        context={
-                            "mode": "set",
-                            "shape_errors": shape_errors,
-                        },
-                        suggestions=[
-                            "Fix the listed errors and retry",
-                            "Call with dry_run=True to re-check without writing",
-                        ],
-                    )
-                )
-
-            # 2. Snapshot acquisition. Convenience modes pass their
-            # already-fetched snapshot in to skip the re-read; external
-            # mode='set' callers fall through to a fresh read here. Map
-            # "No prefs" (never configured) to empty default so the
-            # hash-check works on fresh installations too.
-            current_prefs = await self._resolve_current_prefs(current_prefs)
-
-            self._check_config_hash(config, config_hash, current_prefs)
+            command_payload("energy/save_prefs", config)
+            if config_hash is not None:
+                current_prefs: dict[str, Any] = (await self._get_prefs())["config"]
+                self._check_config_hash(config, config_hash, current_prefs)
 
             # 3. Save
-            save_payload = _merge_submitted_keys({"type": "energy/save_prefs"}, config)
+            save_payload = command_payload("energy/save_prefs", config)
 
             save_result = await self._client.send_websocket_message(save_payload)
             if not save_result.get("success"):
@@ -864,19 +380,23 @@ class EnergyTools:
             (
                 post_save_errors,
                 post_save_validate_error,
+                native_validation,
             ) = await self._post_save_validate()
 
-            # 5. Compute new hash from the effective new state (current
-            # merged with the submitted keys; save_prefs does not echo it
-            # back).
-            new_prefs = _merge_submitted_keys(current_prefs, config)
+            # Core returns its full normalized preferences, including defaults
+            # and coercions. Never predict the persisted state from the request.
+            new_prefs = save_result.get("result")
+            if not isinstance(new_prefs, dict):
+                new_prefs = (await self._get_prefs())["config"]
             new_hash = compute_config_hash(new_prefs)
 
             response: dict[str, Any] = {
                 "success": True,
                 "mode": "set",
+                "post_save_validation": native_validation,
+                "config": new_prefs,
                 "config_hash": new_hash,
-                "config_hash_per_key": _compute_per_key_hashes(new_prefs),
+                "config_hash_per_key": compute_per_key_hashes(new_prefs),
                 "message": "Energy prefs updated.",
             }
             if post_save_errors:
@@ -898,7 +418,7 @@ class EnergyTools:
         except ToolError:
             raise
         except Exception as e:
-            logger.error(f"Error setting energy prefs: {e}")
+            logger.error("Error setting energy prefs", exc_info=True)
             exception_to_structured_error(
                 e,
                 context={"mode": "set"},
@@ -910,87 +430,22 @@ class EnergyTools:
             )
             return None  # unreachable: exception_to_structured_error always raises
 
-    async def _resolve_current_prefs(
-        self, current_prefs: dict[str, Any] | None
-    ) -> dict[str, Any]:
-        """Return ``current_prefs`` if supplied, else fetch a fresh snapshot.
-
-        Extracted from ``_set_prefs`` step 2 (snapshot acquisition).
-        Convenience modes pass their already-fetched snapshot in to skip
-        the re-read; external mode='set' callers fall through to a fresh
-        read here. Maps "No prefs" (never configured) to the empty default
-        so the hash-check works on fresh installations too.
-        """
-        if current_prefs is not None:
-            return current_prefs
-
-        current_result = await self._client.send_websocket_message(
-            {
-                "type": "energy/get_prefs",
-            }
-        )
-        if current_result.get("success"):
-            result: dict[str, Any] = current_result.get("result") or _default_prefs()
-            return result
-
-        error = current_result.get("error") or "Unknown error"
-        if _is_no_prefs_error(str(error)):
-            return _default_prefs()
-
-        raise_tool_error(
-            create_error_response(
-                ErrorCode.SERVICE_CALL_FAILED,
-                f"Failed to re-read prefs for hash check: {error}",
-                context={"mode": "set"},
-            )
-        )
-        # unreachable; appeases type checkers
-        return {}
-
     @staticmethod
     def _check_config_hash(
         config: dict[str, Any],
-        config_hash: str | dict[_PrefsKey, str],
+        config_hash: str | dict[str, str],
         current_prefs: dict[str, Any],
     ) -> None:
         """Verify ``config_hash`` against ``current_prefs``; raises
         ``ToolError`` on mismatch or malformed per-key input.
 
         Extracted from ``_set_prefs`` step 2 (hash check). Handles both
-        hash forms: a ``dict[_PrefsKey, str]`` (per-key lock) and a plain
+        hash forms: a ``dict[str, str]`` (per-key lock) and a plain
         ``str`` (full-blob lock). See the ``_set_prefs`` docstring, and the
         ``ha_manage_energy_prefs`` tool docstring, for the full agent-facing
         contract this enforces.
         """
         if isinstance(config_hash, dict):
-            # Per-key form: validate (and hence allow saving) only the
-            # top-level keys whose hashes were supplied. Fail-closed on
-            # unknown keys (no silent-drop) so a typo in both 'config'
-            # and 'config_hash' cannot coincide as an empty no-op
-            # success at the save endpoint.
-            _valid = set(_PREFS_TOP_LEVEL_KEYS)
-            invalid_config_keys = sorted(set(config) - _valid)
-            invalid_hash_keys = sorted(set(config_hash) - _valid)
-            if invalid_config_keys or invalid_hash_keys:
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.VALIDATION_FAILED,
-                        "Unknown top-level key(s) in 'config' or "
-                        "'config_hash' (per-key form)",
-                        context={
-                            "mode": "set",
-                            "invalid_config_keys": invalid_config_keys,
-                            "invalid_hash_keys": invalid_hash_keys,
-                            "valid_keys": list(_PREFS_TOP_LEVEL_KEYS),
-                        },
-                        suggestions=[
-                            "Use only 'energy_sources', "
-                            "'device_consumption', or "
-                            "'device_consumption_water'",
-                        ],
-                    )
-                )
-
             submitted_keys = set(config)
             hashed_keys = set(config_hash)
             if not submitted_keys:
@@ -1027,16 +482,15 @@ class EnergyTools:
                     )
                 )
 
-            # ``submitted_keys`` was validated against
-            # ``_PREFS_TOP_LEVEL_KEYS`` above, so each ``key`` is in
-            # fact a ``_PrefsKey``. Mypy can't narrow ``str`` from
-            # ``sorted(set[str])`` automatically, hence the explicit
-            # ``cast`` at the dict subscript.
             mismatched_keys = [
                 key
                 for key in sorted(submitted_keys)
-                if config_hash[cast(_PrefsKey, key)]
-                != compute_config_hash({key: current_prefs.get(key, [])})
+                if config_hash[key]
+                != (
+                    compute_config_hash({key: current_prefs[key]})
+                    if key in current_prefs
+                    else None
+                )
             ]
             if mismatched_keys:
                 raise_tool_error(
@@ -1072,7 +526,7 @@ class EnergyTools:
                     )
                 )
 
-    async def _post_save_validate(self) -> tuple[list[dict[str, str]], str | None]:
+    async def _post_save_validate(self) -> tuple[list[dict[str, Any]], str | None, Any]:
         """Call ``energy/validate`` after a save and return
         ``(errors, failure_message)``.
 
@@ -1084,18 +538,16 @@ class EnergyTools:
         and a failure message when the validate call itself fails
         (transport/timeout, etc.).
         """
-        post_save_errors: list[dict[str, str]] = []
+        post_save_errors: list[dict[str, Any]] = []
+        native_validation: Any = None
         post_save_validate_error: str | None = None
         try:
             validate_result = await self._client.send_websocket_message(
-                {
-                    "type": "energy/validate",
-                }
+                {"type": "energy/validate"}
             )
             if validate_result.get("success"):
-                post_save_errors = _flatten_validation_errors(
-                    validate_result.get("result", {})
-                )
+                native_validation = validate_result.get("result")
+                post_save_errors = _flatten_validation_errors(native_validation)
             else:
                 post_save_validate_error = (
                     validate_result.get("error") or "unknown error"
@@ -1106,9 +558,9 @@ class EnergyTools:
         except Exception as e:
             # Post-save validate failure is non-fatal — the save itself
             # succeeded. Log and continue.
-            logger.warning(f"Post-save energy/validate failed: {e}")
+            logger.warning("Post-save energy/validate failed", exc_info=True)
             post_save_validate_error = str(e)
-        return post_save_errors, post_save_validate_error
+        return post_save_errors, post_save_validate_error, native_validation
 
     # ------------------------------------------------------------------
     # Convenience modes — atomic read-modify-write (no caller hash)
@@ -1123,12 +575,10 @@ class EnergyTools:
         water: bool,
         dry_run: bool,
     ) -> dict[str, Any]:
-        """Atomically add a device-consumption entry.
+        """Add a device-consumption entry using a fresh snapshot.
 
         Reads current prefs, checks for duplicate ``stat_consumption`` in the
-        target list, appends the new entry, and writes back with the freshly
-        captured ``config_hash``. On hash conflict (concurrent modification),
-        retries once before failing.
+        target list, appends the new entry and writes the list back.
         """
         if stat_consumption is None:
             raise_tool_error(
@@ -1144,7 +594,7 @@ class EnergyTools:
         # Empty/whitespace stat_consumption would write a ``{"stat_consumption": ""}``
         # entry to energy prefs storage — a phantom row keyed on an empty
         # sensor reference. Same multi-modal-destructive class as
-        # ``ha_manage_addon`` slug guard.
+        # ``ha_manage_app`` slug guard.
         validate_identifier_not_empty(
             stat_consumption,
             "stat_consumption",
@@ -1179,7 +629,7 @@ class EnergyTools:
         water: bool,
         dry_run: bool,
     ) -> dict[str, Any]:
-        """Atomically remove a device-consumption entry by ``stat_consumption``."""
+        """Remove a device-consumption entry by ``stat_consumption``."""
         if stat_consumption is None:
             raise_tool_error(
                 create_error_response(
@@ -1224,21 +674,7 @@ class EnergyTools:
         source: dict[str, Any] | None,
         dry_run: bool,
     ) -> dict[str, Any]:
-        """Atomically append an entry to ``energy_sources``.
-
-        The ``source`` dict is wrapped into a synthetic single-entry config
-        for ``_shape_check`` reuse, which validates the type-specific
-        required fields (e.g. ``stat_energy_from`` for solar/battery/gas/water).
-
-        Duplicate semantics are asymmetric to ``_add_device`` because
-        ``energy_sources`` does not expose a single uniqueness key across
-        types: solar/battery/gas/water are keyed on ``stat_energy_from``, but
-        ``grid`` entries can legitimately have multiple variants
-        (different tariffs, multiple meters) where ``stat_energy_from``
-        alone does not identify duplicates. We therefore reject duplicates
-        by ``(type, stat_energy_from)`` for solar/battery/gas/water only and
-        leave grid de-duplication to the caller.
-        """
+        """Append a native source payload, keeping the wrapper's duplicate guard."""
         if source is None:
             raise_tool_error(
                 create_error_response(
@@ -1247,33 +683,6 @@ class EnergyTools:
                     context={"mode": "add_source"},
                     suggestions=[
                         "Pass source={'type': 'grid'|'solar'|'battery'|'gas'|'water', ...}",
-                    ],
-                )
-            )
-
-        # Reuse _shape_check by wrapping the single entry in the expected
-        # top-level-list shape.
-        wrapped = {"energy_sources": [source]}
-        shape_errors = _shape_check(wrapped)
-        if shape_errors:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_FAILED,
-                    f"Source shape invalid: {len(shape_errors)} error(s)",
-                    context={
-                        "mode": "add_source",
-                        "shape_errors": shape_errors,
-                    },
-                    suggestions=[
-                        "Fix the listed errors and retry",
-                        "solar/battery/gas/water need 'stat_energy_from'; grid needs "
-                        + "only 'type' for the local check, but HA Core's voluptuous "
-                        + "schema requires the full grid field set "
-                        + "(cost_adjustment_day, stat_energy_to, stat_cost, "
-                        + "entity_energy_price, number_energy_price, "
-                        + "entity_energy_price_export, number_energy_price_export, "
-                        + "stat_compensation) — pass them as None when unused or "
-                        + "the post-save validate will surface them.",
                     ],
                 )
             )
@@ -1333,7 +742,7 @@ class EnergyTools:
         backstop for whatever HA Core flags.
         """
         source_type = new_source.get("type")
-        if source_type in _STAT_FROM_SOURCE_TYPES:
+        if source_type != "grid" and "stat_energy_from" in new_source:
             stat = new_source.get("stat_energy_from")
             for entry in existing:
                 if (
@@ -1401,67 +810,22 @@ class EnergyTools:
         mutator: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
         preview_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Dry-run path for ``_mutate_atomic``.
-
-        Runs the mutator against a fresh read (so duplicate / not-found
-        errors surface), shape-checks the resulting list as a backstop
-        mirroring the real-run path through ``_set_prefs`` — keeps
-        dry_run/real-run shape-equivalent if the entry-construction logic
-        ever changes — then returns ``preview_payload`` plus the new shape
-        without writing. See ``_appended_tail_indices`` for the
-        validate_only contract.
-        """
+        """Preview the mutation and validate the whole resulting native payload."""
         current = await self._get_prefs()
         current_config: dict[str, Any] = current["config"]
         existing_list = list(current_config.get(target_key, []))
         new_list = mutator(existing_list)
 
-        appended_indices = _appended_tail_indices(existing_list, new_list)
-        shape_errors = _shape_check(
-            {target_key: new_list},
-            validate_only={target_key: appended_indices},
-        )
-        if shape_errors:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_FAILED,
-                    f"Resulting {target_key} shape invalid: "
-                    f"{len(shape_errors)} error(s)",
-                    context={
-                        "mode": mode,
-                        "target_key": target_key,
-                        "shape_errors": shape_errors,
-                    },
-                )
-            )
+        preview = await self._dry_run({target_key: new_list})
 
         return {
-            "success": True,
+            **preview,
             "mode": mode,
             "dry_run": True,
             **preview_payload,
             "current_count": len(existing_list),
             "new_count": len(new_list),
         }
-
-    @staticmethod
-    def _is_hash_conflict(exc: ToolError) -> bool:
-        """Return True if ``exc`` is a ``_set_prefs`` ``ToolError`` raised
-        for ``RESOURCE_LOCKED`` (hash mismatch / concurrent modification).
-
-        ``raise_tool_error`` serialises the structured error as JSON in the
-        exception message, so we parse rather than substring-match.
-        """
-        try:
-            parsed = json.loads(str(exc))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return False
-        if not isinstance(parsed, dict):
-            return False
-        err_dict = parsed.get("error")
-        if not isinstance(err_dict, dict):
-            return False
-        return bool(err_dict.get("code") == ErrorCode.RESOURCE_LOCKED.value)
 
     async def _mutate_atomic(
         self,
@@ -1472,26 +836,11 @@ class EnergyTools:
         dry_run: bool,
         preview_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Run convenience-mode read-modify-write with dry-run backstop and hash-conflict retry.
+        """Read the prefs, change one list and save it back in one call.
 
-        Atomicity is with respect to the *entire* prefs snapshot, not just
-        ``target_key``: ``_set_prefs`` validates the full ``config_hash``, so
-        this helper retries on any concurrent modification — even one that
-        touched an unrelated top-level key.
-
-        Performs at most two attempts: on RESOURCE_LOCKED from ``_set_prefs``
-        (concurrent modification between read and write), retries once with
-        a fresh read. Other errors propagate immediately.
-
-        For ``dry_run``: runs the mutator against a fresh read (so duplicate /
-        not-found errors surface), shape-checks the resulting list as a
-        backstop matching the real-run path, then returns ``preview_payload``
-        plus the new shape — without writing. Short-circuits before the retry
-        loop since dry_run never writes.
-
-        The convenience path threads the freshly-fetched snapshot into
-        ``_set_prefs`` so the inner ``energy/get_prefs`` re-read is skipped
-        — halving the read cost on the happy path.
+        Dry runs validate the whole mutated proposal without saving. Core has
+        no conditional save, and the read and the save are one round trip
+        apart, so no hash is checked here.
         """
         try:
             if dry_run:
@@ -1502,76 +851,27 @@ class EnergyTools:
                     preview_payload=preview_payload,
                 )
 
-            max_attempts = 2
-            for attempt in range(max_attempts):
-                current = await self._get_prefs()
-                current_config = current["config"]
-                current_hash: str = current["config_hash"]
+            current_config = (await self._get_prefs())["config"]
+            new_list = mutator(list(current_config.get(target_key, [])))
+            set_result = await self._set_prefs({target_key: new_list}, None)
 
-                existing_list = list(current_config.get(target_key, []))
-                new_list = mutator(existing_list)
-
-                partial_config = {target_key: new_list}
-                # Per issue #1086: validate only the appended tail so a
-                # pre-existing HA-validated entry cannot block an unrelated
-                # add/remove. See ``_appended_tail_indices`` for the
-                # validate_only contract.
-                appended_indices = _appended_tail_indices(existing_list, new_list)
-                try:
-                    set_result = await self._set_prefs(
-                        partial_config,
-                        current_hash,
-                        current_prefs=current_config,
-                        validate_only={target_key: appended_indices},
-                    )
-                except ToolError as exc:
-                    # _set_prefs raises ToolError(RESOURCE_LOCKED) on hash mismatch.
-                    # Retry once with a fresh read in case of a benign race.
-                    if self._is_hash_conflict(exc) and attempt + 1 < max_attempts:
-                        logger.warning(
-                            f"{mode} on {target_key}: hash conflict on attempt "
-                            f"{attempt + 1}, retrying"
-                        )
-                        continue
-                    raise
-
-                return {
-                    "success": True,
-                    "mode": mode,
-                    "config_hash": set_result["config_hash"],
-                    "target_key": target_key,
-                    "new_count": len(new_list),
-                    "message": set_result.get("message", f"{mode} succeeded."),
-                    **{
-                        k: v
-                        for k, v in set_result.items()
-                        if k not in self._CONVENIENCE_RESPONSE_OVERRIDES
-                    },
-                }
-
-            # Unreachable as long as every iteration either returns or raises:
-            # the only ``continue`` is gated on ``attempt + 1 < max_attempts``,
-            # which is False on the final iteration — so the bare ``raise``
-            # in the except block always fires there. Surface as an actionable
-            # structured error rather than a bare AssertionError that would
-            # otherwise fall through to ``except Exception`` and lose context.
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.INTERNAL_ERROR,
-                    f"_mutate_atomic({mode}, {target_key}): retry loop exited "
-                    "without a return or raise",
-                    context={"mode": mode, "target_key": target_key},
-                    suggestions=[
-                        "This indicates a bug in the optimistic-concurrency "
-                        "loop logic — please file an issue with the mode and "
-                        "target_key from the context.",
-                    ],
-                )
-            )
+            return {
+                "success": True,
+                "mode": mode,
+                "config_hash": set_result["config_hash"],
+                "target_key": target_key,
+                "new_count": len(new_list),
+                "message": set_result.get("message", f"{mode} succeeded."),
+                **{
+                    k: v
+                    for k, v in set_result.items()
+                    if k not in self._CONVENIENCE_RESPONSE_OVERRIDES
+                },
+            }
 
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Error in {mode} on {target_key}: {e}")
             exception_to_structured_error(
                 e,
@@ -1582,7 +882,6 @@ class EnergyTools:
                 ],
             )
             return None  # unreachable: exception_to_structured_error always raises
-        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
 
 
 def register_energy_tools(mcp: Any, client: Any, **kwargs: Any) -> None:

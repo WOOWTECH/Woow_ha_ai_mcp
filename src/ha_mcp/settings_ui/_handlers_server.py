@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Container
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +28,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .._version import get_version, is_embedded, is_running_in_addon
-from ..config import _reset_global_settings, get_global_settings
+from ..config import get_global_settings, reset_global_settings
 from ..errors import ErrorCode, create_error_response
 from . import _persistence, _supervisor
 
@@ -167,7 +168,7 @@ async def _restart_embedded(server: HomeAssistantSmartMCPServer) -> JSONResponse
 
     try:
         found = await find_server_config_entry(server.client)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # A discovery FAILURE is not "entry not found" — masking a
         # WS/connection hiccup as not-found steers users toward
         # reinstalling a running component. Also: the restart JS
@@ -240,7 +241,7 @@ async def _restart_sibling_addon(
             timeout=5.0, verify=server.settings.verify_ssl
         ) as client:
             resp = await client.post(endpoint)
-    except (httpx.ReadError, httpx.RemoteProtocolError):
+    except httpx.ReadError, httpx.RemoteProtocolError:
         # Connection dropped mid-request — restart is happening.
         # `ConnectError` is deliberately NOT in this tuple: it fires
         # before a connection is established (DNS failure, TCP refused,
@@ -304,7 +305,7 @@ async def _restart_addon(
     # and gets the historical self-restart behavior.
     try:
         payload = await request.json()
-    except (ValueError, json.JSONDecodeError):
+    except ValueError, json.JSONDecodeError:
         payload = None
     target_slug = _parse_restart_slug(payload)
 
@@ -323,6 +324,28 @@ async def _restart_addon(
 # ---- Settings info ----
 
 
+# Keyed by server instance so a replaced worker drops out with its instance;
+# the module-level dict itself survives entry reloads (modules stay cached).
+_WORKER_INSTANCE_IDS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+
+
+def _worker_instance_id(server: HomeAssistantSmartMCPServer) -> str:
+    """Per-worker identity for the restart poll's embedded mode.
+
+    ``_PROCESS_INSTANCE_ID`` proves a process swap, but an embedded restart
+    reloads the config entry INSIDE the surviving HA process — modules stay
+    cached, so the process id never flips and the poll timed out after every
+    successful reload (#2279 feedback). A new server instance is constructed
+    per entry setup, so an id lazily pinned to the instance flips exactly
+    when the reload completes.
+    """
+    wid = _WORKER_INSTANCE_IDS.get(server)
+    if wid is None:
+        wid = uuid.uuid4().hex
+        _WORKER_INSTANCE_IDS[server] = wid
+    return wid
+
+
 async def _settings_info(
     server: HomeAssistantSmartMCPServer | None, is_sidecar: bool, _: Request
 ) -> JSONResponse:
@@ -336,11 +359,10 @@ async def _settings_info(
     # (the value flips across processes).
     addon = False if is_sidecar else is_running_in_addon()
     try:
-        # Executor: get_version's distribution-ownership scan reads
-        # metadata for every installed package — too heavy for the
-        # event loop on an endpoint the restart cycle polls.
+        # Executor: get_version reads package metadata from disk, and the
+        # restart cycle polls this endpoint.
         version = await asyncio.to_thread(get_version)
-    except Exception:  # pragma: no cover — defensive only
+    except Exception:  # pragma: no cover — defensive only  # noqa: BLE001
         logger.warning("get_version() raised; omitting version from info")
         version = None
     # ``deployment_mode`` reuses the bug-report detector so the UI and
@@ -355,6 +377,13 @@ async def _settings_info(
                 "sidecar" if is_sidecar else _detect_installation_method()
             ),
             "instance_id": _PROCESS_INSTANCE_ID,
+            # Embedded restarts swap the server instance, not the process —
+            # the restart poll compares this field in that mode.
+            "worker_id": (
+                _worker_instance_id(server)
+                if server is not None
+                else _PROCESS_INSTANCE_ID
+            ),
             "started_at": _PROCESS_STARTED_AT,
             "version": version,
         }
@@ -589,10 +618,11 @@ async def _write_feature_flag_overrides_file(
     which would silently drop every previously-persisted flag.
     """
     from ..config import _FEATURE_FLAG_OVERRIDE_FILENAME
+    from ..utils.config_write_lock import config_write_guard
     from ..utils.data_paths import get_data_dir
 
     path = get_data_dir() / _FEATURE_FLAG_OVERRIDE_FILENAME
-    async with _persistence._get_override_file_lock():
+    async with config_write_guard():
         existing: dict[str, Any] = {}
         try:
             existing_raw = path.read_text()
@@ -712,7 +742,7 @@ async def _save_feature_flags(
 
     try:
         body = await request.json()
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return JSONResponse(
             create_error_response(
                 ErrorCode.VALIDATION_INVALID_JSON, "Invalid JSON body"
@@ -804,7 +834,7 @@ async def _save_feature_flags(
     # Publish the change so the same process picks it up on the next
     # ``get_global_settings()`` call. ``restart_required=True`` because
     # feature flags gate tool registration / transforms at startup.
-    _reset_global_settings()
+    reset_global_settings()
     return JSONResponse(
         {
             "success": True,

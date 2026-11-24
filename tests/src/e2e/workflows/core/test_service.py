@@ -235,7 +235,7 @@ class TestCallService:
         # Cleanup
         await mcp_client.call_tool(
             "ha_config_remove_automation",
-            {"identifier": automation_entity},
+            {"entity_id": automation_entity},
         )
 
     async def test_call_service_invalid_domain(self, mcp_client):
@@ -376,7 +376,7 @@ async def test_call_service_input_boolean_toggle(mcp_client, cleanup_tracker):
         {
             "helper_type": "input_boolean",
             "name": "Service Test Boolean",
-            "initial": "off",
+            "config": {"initial": "off"},
         },
     )
     create_data = parse_mcp_result(create_result)

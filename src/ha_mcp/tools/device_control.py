@@ -8,11 +8,12 @@ and async operation verification through WebSocket monitoring.
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Any, ClassVar
 
-from fastmcp import Context
-from fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp import Context
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 
 from ..client.rest_client import (
     HomeAssistantClient,
@@ -22,7 +23,11 @@ from ..client.rest_client import (
 from ..client.websocket_client import get_websocket_client
 from ..client.websocket_listener import start_websocket_listener
 from ..config import get_global_settings
-from ..errors import ErrorCode, create_error_response
+from ..errors import (
+    ErrorCode,
+    create_entity_unavailable_after_dispatch_error,
+    create_error_response,
+)
 from ..utils.domain_handlers import get_domain_handler
 from ..utils.operation_manager import (
     fail_pending_operation,
@@ -38,18 +43,30 @@ from .component_api import (
 from .helpers import (
     exception_to_structured_error,
     raise_tool_error,
-    safe_info,
     safe_progress,
 )
-from .util_helpers import _SERVICE_TO_STATE
+from .tools_service import BulkControlOperation
+from .util_helpers import _SERVICE_TO_STATE, is_single_entity_target
 
 logger = logging.getLogger(__name__)
+
+# The bulk row contract is declared once, on the advertised transport schema.
+# Reading its keys back here keeps the runtime batch validator from drifting
+# out of sync with what models are told they may send.
+_BULK_OPERATION_KEYS: frozenset[str] = frozenset(BulkControlOperation.__annotations__)
+
+# The row shape models get wrong most often is a service-style row, so this
+# leads every suggestion list a rejected bulk batch produces.
+_BULK_ROW_SHAPE_SUGGESTION = (
+    "Use entity_id and action (e.g. action='off', not service='turn_off'); "
+    "send no domain or service keys and put action data in parameters"
+)
 
 # The ha_mcp_tools/bulk_call_service WS command (Phase 3, D5a): the BATCH write
 # capability. When the component advertises ``bulk_call_service`` the consumer
 # resolves every op's domain/service server-side (D6), sends one register-before-fire
-# batch frame, and maps the inline-confirmed per-op transitions back into the legacy
-# bulk response shape — no operation-id polling needed. Named once so the routing
+# batch frame, and maps each op's inline result (confirmed or not) back into the
+# legacy bulk response shape — no operation-id polling needed. Named once so the routing
 # helper and its tests agree on the wire string.
 WS_BULK_CALL_SERVICE = "ha_mcp_tools/bulk_call_service"
 
@@ -80,7 +97,7 @@ class DeviceControlTools:
                     logger.warning(
                         "Failed to start WebSocket listener - async verification disabled"
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Error starting WebSocket listener: {e}")
 
     async def control_device_smart(
@@ -88,7 +105,7 @@ class DeviceControlTools:
         entity_id: str,
         action: str,
         parameters: dict[str, Any] | None = None,
-        timeout_seconds: int = 10,
+        timeout_seconds: float = 10,
         validate_first: bool = True,
     ) -> dict[str, Any]:
         """
@@ -120,13 +137,13 @@ class DeviceControlTools:
                         f"Invalid entity ID format: {entity_id}",
                         suggestions=[
                             "Entity ID must be in format 'domain.entity_name'",
-                            "Use smart_entity_search to find correct entity ID",
+                            "Use ha_search to find the correct entity ID",
                         ],
                         context={"entity_id": entity_id, "action": action},
                     )
                 )
 
-            domain = entity_id.split(".")[0]
+            domain = entity_id.split(".", maxsplit=1)[0]
             handler = get_domain_handler(domain)
 
             # Validate entity exists if requested
@@ -194,12 +211,12 @@ class DeviceControlTools:
                     "command_sent": True,
                     "operation_id": operation_id,
                     "status": "pending_verification",
-                    "message": f"Command sent to {entity_id}. Use get_device_operation_status() to verify completion.",
+                    "message": f"Command sent to {entity_id}. Use ha_get_operation_status to verify completion.",
                     "service_call": service_call,
                     "expected_state": expected_state,
                     "timeout_seconds": timeout_seconds,
                     "follow_up": {
-                        "tool": "get_device_operation_status",
+                        "tool": "ha_get_operation_status",
                         "parameters": {
                             "operation_id": operation_id,
                             "timeout_seconds": timeout_seconds,
@@ -210,7 +227,7 @@ class DeviceControlTools:
             except ToolError:
                 fail_pending_operation(operation_id, "Service dispatch failed")
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 fail_pending_operation(operation_id, f"Service dispatch failed: {e}")
                 exception_to_structured_error(
                     e,
@@ -275,7 +292,7 @@ class DeviceControlTools:
                         ErrorCode.ENTITY_NOT_FOUND,
                         f"Entity not found: {entity_id}",
                         suggestions=[
-                            "Use smart_entity_search to find the correct entity",
+                            "Use ha_search to find the correct entity",
                             "Check entity is not disabled in Home Assistant",
                         ],
                         context={"entity_id": entity_id, "action": action},
@@ -301,36 +318,63 @@ class DeviceControlTools:
         action: str,
         parameters: dict[str, Any] | None,
     ) -> tuple[str, dict[str, Any] | None]:
-        service_mapping = {
-            "on": "turn_on",
-            "off": "turn_off",
-            "toggle": "toggle",
-            "open": "open_cover" if domain == "cover" else "turn_on",
-            "close": "close_cover" if domain == "cover" else "turn_off",
-            "set": "turn_on" if domain == "light" else "set_temperature",
-        }
+        if domain == "climate" and action in ("heat", "cool", "auto", "heat_cool"):
+            parameters = dict(parameters or {})
+            parameters["hvac_mode"] = action
+            return "set_hvac_mode", parameters
 
-        service_name = service_mapping.get(action, action)
-
-        if domain == "climate":
-            if action in ["heat", "cool", "auto"]:
-                service_name = "set_hvac_mode"
-                if not parameters:
-                    parameters = {}
-                parameters["hvac_mode"] = action
-            elif action == "set":
-                service_name = "set_temperature"
-
-        elif domain == "media_player":
-            if action in ["play", "pause", "stop"]:
-                service_name = f"media_{action}"
-            elif action == "set":
-                service_name = "volume_set"
-
+        service_name = self._SERVICE_OVERRIDES.get(
+            (domain, action), self._GENERIC_SERVICE_MAP.get(action, action)
+        )
         return service_name, parameters
 
+    # Domain-specific action-to-service mappings; anything not listed
+    # falls through to _GENERIC_SERVICE_MAP, then to the action verbatim.
+    # tests/src/e2e/workflows/device_control/test_action_service_resolution.py
+    # pins every DOMAIN_HANDLERS table entry through this resolver against
+    # a live instance's service list.
+    _SERVICE_OVERRIDES: ClassVar[dict[tuple[str, str], str]] = {
+        ("cover", "open"): "open_cover",
+        ("cover", "close"): "close_cover",
+        ("cover", "stop"): "stop_cover",
+        ("cover", "set"): "set_cover_position",
+        ("light", "set"): "turn_on",
+        # lock.open exists; the generic mapping's turn_on does not.
+        ("lock", "open"): "open",
+        ("climate", "set"): "set_temperature",
+        ("media_player", "play"): "media_play",
+        ("media_player", "pause"): "media_pause",
+        ("media_player", "stop"): "media_stop",
+        ("media_player", "next"): "media_next_track",
+        ("media_player", "previous"): "media_previous_track",
+        ("media_player", "set"): "volume_set",
+        ("alarm_control_panel", "arm_home"): "alarm_arm_home",
+        ("alarm_control_panel", "arm_away"): "alarm_arm_away",
+        ("alarm_control_panel", "arm_night"): "alarm_arm_night",
+        ("alarm_control_panel", "disarm"): "alarm_disarm",
+    }
+
+    _GENERIC_SERVICE_MAP: ClassVar[dict[str, str]] = {
+        "on": "turn_on",
+        "off": "turn_off",
+        "toggle": "toggle",
+        "open": "turn_on",
+        "close": "turn_off",
+        "set": "set_temperature",
+    }
+
+    # Silent allowlist: _add_domain_params copies only these keys into the
+    # service call and drops everything else without an error, and a domain
+    # absent from this table loses every parameter. Extend it when adding
+    # support for a new parameter, or the parameter vanishes at dispatch.
     _DOMAIN_PARAMS: ClassVar[dict[str, list[str]]] = {
-        "light": ["brightness", "color_temp_kelvin", "rgb_color", "effect"],
+        "light": [
+            "brightness",
+            "brightness_pct",
+            "color_temp_kelvin",
+            "rgb_color",
+            "effect",
+        ],
         "climate": ["temperature", "target_temp_high", "target_temp_low", "hvac_mode"],
         "cover": ["position", "tilt_position"],
         "media_player": ["volume_level", "media_content_id", "media_content_type"],
@@ -445,15 +489,15 @@ class DeviceControlTools:
         return expected if expected else None
 
     async def get_device_operation_status(
-        self, operation_id: str, timeout_seconds: int = 10
+        self, operation_id: str, timeout_seconds: float = 10
     ) -> dict[str, Any]:
         """Check status of a device operation, waiting up to ``timeout_seconds`` for completion.
 
         Polls the in-memory operation registry (mutated by the WebSocket
-        listener as state changes arrive) every 0.2s while the operation is
-        pending, up to ``timeout_seconds``. Returns the final structured status
-        — completed/failed/timeout/pending — produced by
-        ``control_device_smart``.
+        listener as state changes arrive) while the operation is pending, at
+        0.2s intervals except for a final shorter poll that lands exactly on
+        the deadline. Returns the final structured status —
+        completed/failed/timeout/pending — produced by ``control_device_smart``.
         """
         operation = get_operation_from_memory(operation_id)
 
@@ -465,7 +509,7 @@ class DeviceControlTools:
                     suggestions=[
                         "Operation may have been cleaned up after completion",
                         "Check operation ID spelling",
-                        "Use control_device_smart to start new operation",
+                        "Use ha_bulk_control to start a new operation",
                     ],
                     context={"operation_id": operation_id},
                 )
@@ -478,9 +522,10 @@ class DeviceControlTools:
         if operation.status.value == "pending" and timeout_seconds > 0:
             deadline = time.monotonic() + timeout_seconds
             while operation.status.value == "pending":
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(min(0.2, remaining))
                 refreshed = get_operation_from_memory(operation_id)
                 if refreshed is None:
                     raise_tool_error(
@@ -490,7 +535,7 @@ class DeviceControlTools:
                             suggestions=[
                                 "Operation may have completed and been purged before "
                                 + "verification finished",
-                                "Use control_device_smart to start new operation",
+                                "Use ha_bulk_control to start a new operation",
                             ],
                             context={"operation_id": operation_id},
                         )
@@ -575,26 +620,133 @@ class DeviceControlTools:
                 "tips": [
                     "Operation will auto-complete when device state changes",
                     "Physical devices may take 1-3 seconds to respond",
-                    "Call this function again to check for updates",
+                    "Call ha_get_operation_status again to check for updates",
                 ],
             }
 
     @staticmethod
+    def _normalize_bulk_parameters(
+        value: Any,
+    ) -> tuple[dict[str, Any] | None, ErrorCode | None, str]:
+        """Normalize a present ``parameters`` value and identify invalid ones.
+
+        Returns ``(parameters, error_code, detail)``. ``detail`` carries the
+        decoder's own reason and offset for a JSON failure — without it the
+        caller can only say "invalid JSON", which does not tell the sender
+        where its string went wrong. It is empty for every other outcome.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                return (
+                    None,
+                    ErrorCode.VALIDATION_INVALID_JSON,
+                    f"{exc.msg} at position {exc.pos}",
+                )
+            except RecursionError:
+                # json.loads recurses per nesting level; a pathologically
+                # nested string must skip the row, not abort the batch.
+                return (
+                    None,
+                    ErrorCode.VALIDATION_INVALID_JSON,
+                    "JSON nested too deeply",
+                )
+        if not isinstance(value, dict):
+            # A present-but-null value is malformed, same as timeout_seconds
+            # and validate_first; an absent key never reaches this helper.
+            return None, ErrorCode.VALIDATION_INVALID_PARAMETER, ""
+        return value, None, ""
+
+    @staticmethod
+    def _normalize_bulk_timeout(value: Any) -> float | None:
+        """Normalize a non-negative finite timeout, or ``None`` when invalid.
+
+        Bools are rejected before ``float()`` sees them: ``float(True)`` is 1.0,
+        which would silently accept ``timeout_seconds: true`` as a one-second
+        wait. Strings are rejected for the same reason — the advertised schema
+        is ``strict``, so coercing ``"10"`` here would silently accept what the
+        schema tells the model is invalid. ``None`` is invalid here too — the
+        caller only calls this when the key is present, and a present-but-null
+        timeout is a malformed row.
+        """
+        if isinstance(value, (bool, str)) or value is None:
+            return None
+        try:
+            timeout = float(value)
+        except TypeError, ValueError, OverflowError:
+            # OverflowError: an int too large for float must skip the row,
+            # not abort the batch through the generic exception handler.
+            return None
+        return timeout if math.isfinite(timeout) and timeout >= 0 else None
+
+    @staticmethod
+    def _normalized_bulk_operation(
+        operation: dict[str, Any],
+        parameters: dict[str, Any] | None,
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        """Return one normalized valid bulk operation."""
+        normalized = dict(operation)
+        if parameters is not None:
+            normalized["parameters"] = parameters
+        if timeout is not None:
+            normalized["timeout_seconds"] = timeout
+        return normalized
+
+    @staticmethod
+    def _skip_bulk_operation(
+        skipped_operations: list[dict[str, Any]],
+        op: Any,
+        code: ErrorCode,
+        error: str,
+        context: dict[str, Any],
+        suggestions: list[str] | None = None,
+    ) -> None:
+        """Log one rejected bulk row and record its structured skip entry.
+
+        ``create_error_response`` lifts every ``context`` key to the top level,
+        so ``index`` needs no separate write; ``operation`` is not a context
+        key and is attached here so callers can see the row they sent.
+        """
+        logger.warning(f"Bulk control: {error}")
+        err_response = create_error_response(
+            code, error, suggestions=suggestions, context=context
+        )
+        err_response["operation"] = op
+        skipped_operations.append(err_response)
+
+    @classmethod
     def _validate_bulk_operations(
-        operations: list[dict[str, Any]],
+        cls,
+        operations: list[Any],
         skipped_operations: list[dict[str, Any]],
     ) -> list[tuple[int, dict[str, Any], str, str]]:
         valid: list[tuple[int, dict[str, Any], str, str]] = []
         for i, op in enumerate(operations):
             if not isinstance(op, dict):
-                error = f"Operation at index {i} is not a dict: {type(op).__name__}"
-                logger.warning(f"Bulk control: {error}")
-                err_response = create_error_response(
-                    ErrorCode.VALIDATION_MISSING_PARAMETER, error, context={"index": i}
+                cls._skip_bulk_operation(
+                    skipped_operations,
+                    op,
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Operation at index {i} is not a dict: {type(op).__name__}",
+                    {"index": i},
                 )
-                err_response["index"] = i
-                err_response["operation"] = op
-                skipped_operations.append(err_response)
+                continue
+
+            # str() before sorting: a direct Python caller can pass non-string
+            # keys, and mixed key types make sorted()/join() raise mid-batch.
+            obsolete_keys = sorted(str(key) for key in set(op) - _BULK_OPERATION_KEYS)
+            if obsolete_keys:
+                key_list = ", ".join(obsolete_keys)
+                cls._skip_bulk_operation(
+                    skipped_operations,
+                    op,
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Operation at index {i} contains unsupported key(s): {key_list}",
+                    {"index": i, "unsupported_keys": obsolete_keys},
+                    suggestions=[_BULK_ROW_SHAPE_SUGGESTION],
+                )
                 continue
 
             entity_id = op.get("entity_id")
@@ -602,21 +754,80 @@ class DeviceControlTools:
             missing = [f for f in ("entity_id", "action") if not op.get(f)]
 
             if missing:
-                error = f"Operation at index {i} missing required fields: {', '.join(missing)}"
-                logger.warning(f"Bulk control: {error}")
-                err_response = create_error_response(
-                    ErrorCode.VALIDATION_MISSING_PARAMETER, error, context={"index": i}
+                cls._skip_bulk_operation(
+                    skipped_operations,
+                    op,
+                    ErrorCode.VALIDATION_MISSING_PARAMETER,
+                    f"Operation at index {i} missing required fields: "
+                    f"{', '.join(missing)}",
+                    {"index": i},
                 )
-                err_response["index"] = i
-                err_response["operation"] = op
-                skipped_operations.append(err_response)
-            else:
-                valid.append((i, op, str(entity_id), str(action)))
+                continue
+
+            if not isinstance(entity_id, str) or not isinstance(action, str):
+                cls._skip_bulk_operation(
+                    skipped_operations,
+                    op,
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Operation at index {i} requires string entity_id and "
+                    "action fields",
+                    {"index": i},
+                )
+                continue
+
+            parameters, parameter_error, parameter_detail = (
+                cls._normalize_bulk_parameters(op["parameters"])
+                if "parameters" in op
+                else (None, None, "")
+            )
+            if parameter_error is not None:
+                parameter_message = (
+                    f"Operation at index {i} has invalid JSON parameters: "
+                    f"{parameter_detail}"
+                    if parameter_error == ErrorCode.VALIDATION_INVALID_JSON
+                    else f"Operation at index {i} parameters must be a JSON object"
+                )
+                cls._skip_bulk_operation(
+                    skipped_operations,
+                    op,
+                    parameter_error,
+                    parameter_message,
+                    {"index": i},
+                )
+                continue
+
+            timeout: float | None = None
+            if "timeout_seconds" in op:
+                timeout = cls._normalize_bulk_timeout(op["timeout_seconds"])
+                if timeout is None:
+                    cls._skip_bulk_operation(
+                        skipped_operations,
+                        op,
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        f"Operation at index {i} timeout_seconds must be a "
+                        "non-negative number",
+                        {"index": i},
+                    )
+                    continue
+
+            if "validate_first" in op and not isinstance(op["validate_first"], bool):
+                cls._skip_bulk_operation(
+                    skipped_operations,
+                    op,
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Operation at index {i} validate_first must be a boolean",
+                    {"index": i},
+                )
+                continue
+
+            normalized_op = cls._normalized_bulk_operation(op, parameters, timeout)
+            valid.append((i, normalized_op, entity_id, action))
+
         return valid
 
     async def bulk_device_control(
         self,
-        operations: list[dict[str, Any]],
+        operations: list[Any],
         parallel: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -649,38 +860,51 @@ class DeviceControlTools:
                 operations, skipped_operations
             )
 
-            await safe_info(
-                ctx,
+            logger.debug(
                 f"bulk_device_control: {len(valid_operations)} valid op(s), "
                 f"{len(skipped_operations)} skipped, "
                 f"mode={'parallel' if parallel else 'sequential'}",
             )
+            if not valid_operations:
+                # Nothing dispatched, so nothing to fail soft for: the batch
+                # carve-out from "all tool-level failures raise" exists to
+                # protect successful siblings, and there are none. Raising
+                # before the component probe keeps the no-dispatch guarantee.
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        f"All {len(operations)} operation(s) failed validation; "
+                        "nothing was dispatched",
+                        suggestions=[
+                            _BULK_ROW_SHAPE_SUGGESTION,
+                            "Each operation requires 'entity_id' and 'action'",
+                            "Check skipped_details for the per-operation reason",
+                            "Example: {'entity_id': 'light.living_room', "
+                            + "'action': 'on'}",
+                        ],
+                        context={"skipped_details": skipped_operations},
+                    )
+                )
 
             # Route through the component's bulk_call_service capability when
-            # advertised (D5a): one register-before-fire batch frame confirms every
-            # op inline, so ops return already-verified (no operation-id polling). A
-            # None return means nothing dispatched (capability miss / unresolvable op
-            # / transport failure), so the legacy path below is a safe first fire
-            # (D9 at-most-once).
+            # advertised (D5a): one register-before-fire batch frame; HA confirms ops
+            # inline (no operation-id polling) and each op's result says whether it
+            # did. A None return means nothing dispatched (capability miss /
+            # unresolvable op / pre-send failure), so the legacy path below is a safe
+            # first fire (D9 at-most-once).
             component_response = await self._bulk_via_component(
                 operations, valid_operations, skipped_operations, parallel
             )
             if component_response is not None:
-                # M-progress-msg: the ambiguous batch response carries a top-level
-                # ``partial`` (dispatched but the batch confirmation never arrived — not
-                # retried); only a fully-served batch is "confirmed inline". The legacy
-                # ``_build_bulk_response`` never sets a top-level ``partial``, so this
-                # flag reliably marks the ambiguous path.
-                component_message = (
-                    "dispatched via component (unconfirmed — not retried)"
-                    if component_response.get("partial")
-                    else "dispatched via component (confirmed inline)"
-                )
+                # Report the dispatch only; each op's outcome is in its result and is
+                # never summarised here.
                 await safe_progress(
                     ctx,
                     progress=len(valid_operations),
                     total=len(valid_operations),
-                    message=component_message,
+                    message=(
+                        "dispatched via component; each op's result shows its outcome"
+                    ),
                 )
                 return component_response
 
@@ -705,7 +929,7 @@ class DeviceControlTools:
                 total=len(valid_operations),
                 message=(
                     f"dispatched {len(operation_ids)} op(s); "
-                    "use get_bulk_operation_status to verify completion"
+                    "use ha_get_operation_status to verify completion"
                 ),
             )
 
@@ -749,14 +973,14 @@ class DeviceControlTools:
         try:
             if "." not in entity_id:
                 return None
-            domain = entity_id.split(".")[0]
+            domain = entity_id.split(".", maxsplit=1)[0]
             handler = get_domain_handler(domain)
             valid_actions = handler.get("valid_actions", ["on", "off", "toggle"])
             if action not in valid_actions:
                 return None
             parsed = self._parse_parameters(parameters, entity_id, action)
             service_call = self._build_service_call(entity_id, domain, action, parsed)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # Any resolution failure (incl. a ToolError from _parse_parameters on
             # invalid JSON) → abort the batch to legacy, which surfaces the error.
             return None
@@ -782,15 +1006,24 @@ class DeviceControlTools:
     ) -> dict[str, Any]:
         """Map one component op result into the legacy per-op result shape.
 
-        The component confirms inline, so the op returns already-verified with a
+        The component reports each op's confirmation inline, so the op returns a
         synthesized terminal status instead of the legacy ``pending_verification`` +
         operation-id handle. A ``command_sent: True`` result is counted ``successful``
         by ``_build_bulk_response`` exactly as the legacy dispatch result is; an op
         whose ``async_call`` raised under the batch (``error`` set / not dispatched)
         maps to a structured ``SERVICE_CALL_FAILED`` error and is NOT re-dispatched
-        (D9). When ``validate_first`` (the default) is set and the target's captured
-        pre-state is null (the entity does not exist), the op maps to a structured
-        ``ENTITY_NOT_FOUND`` failure — parity with the legacy per-op validation.
+        (D9). When ``validate_first`` (the default) is set and ``entity_id`` is a
+        single literal entity ID (see ``is_single_entity_target`` — a comma-joined
+        multi-target or magic broadcast target like ``"all"`` is skipped entirely,
+        since its transition row proves nothing about whether the possibly-
+        successful dispatch landed), a captured pre-state that is null (the entity
+        does not exist) maps to a structured ``ENTITY_NOT_FOUND`` failure — parity
+        with the legacy per-op validation. A captured pre-state of ``"unavailable"``
+        maps to a distinct ``ENTITY_UNAVAILABLE`` failure, but only once BOTH the op
+        is unconfirmed AND the post-dispatch state still shows unavailable — unlike
+        the not-found branch, an unavailable target can legitimately reconnect and
+        confirm mid-dispatch, so this check is doubly gated rather than symmetric
+        with it.
         """
         service_call = {
             "domain": row["domain"],
@@ -811,31 +1044,78 @@ class DeviceControlTools:
         # exist (HA no-ops the dispatch, then the wait stalls to partial). The legacy
         # path returns a structured ENTITY_NOT_FOUND per-op failure — match it from
         # the pre-state already in the transition (no extra hops), rather than
-        # counting a phantom entity as a successful command. Reachability is
-        # drift-bounded: a missing transition row from a length-drifted batch now routes
-        # to the ambiguous path (I2) before reaching here, so a null old_state here
-        # means a genuinely absent entity, not a dropped row.
-        if op.get("validate_first", True) and row.get("entity_ids"):
-            old_state = next(
+        # counting a phantom entity as a successful command. I2 (length-drift)
+        # guards the BATCH-level op-count, not this: an individual op can still
+        # legitimately carry an EMPTY transitions list (dispatched, but post-
+        # dispatch formatting raised — see _dispatched_unconfirmed_bulk_result) at
+        # the correct array length, and that proves nothing about existence. So
+        # look for a transition row at all first; only a present row with a null
+        # old_state means a genuinely absent entity.
+        if (
+            op.get("validate_first", True)
+            and row.get("entity_ids")
+            and is_single_entity_target(entity_id)
+        ):
+            transition = next(
                 (
-                    t.get("old_state")
+                    t
                     for t in transitions
                     if isinstance(t, dict) and t.get("entity_id") == entity_id
                 ),
                 None,
             )
-            if old_state is None:
-                err = create_error_response(
-                    ErrorCode.ENTITY_NOT_FOUND,
-                    f"Entity not found: {entity_id}",
-                    suggestions=[
-                        "Use ha_search to find the correct entity",
-                        "Check the entity is not disabled in Home Assistant",
-                    ],
-                    context={"entity_id": entity_id, "action": action},
-                )
-                err["service_call"] = service_call
-                return err
+            if transition is not None:
+                old_state = transition.get("old_state")
+                if old_state is None:
+                    err = create_error_response(
+                        ErrorCode.ENTITY_NOT_FOUND,
+                        f"Entity not found: {entity_id}",
+                        suggestions=[
+                            "Use ha_search to find the correct entity",
+                            "Check the entity is not disabled in Home Assistant",
+                        ],
+                        context={"entity_id": entity_id, "action": action},
+                    )
+                    err["service_call"] = service_call
+                    return err
+                if (
+                    isinstance(old_state, dict)
+                    and old_state.get("state") == "unavailable"
+                ):
+                    new_state = transition.get("new_state")
+                    if new_state is None and not component_op.get("confirmed"):
+                        # Removed during the dispatch -- a more specific outcome
+                        # than "still unavailable", which would falsely assert it
+                        # still exists.
+                        err = create_error_response(
+                            ErrorCode.ENTITY_NOT_FOUND,
+                            f"Entity not found: {entity_id}",
+                            suggestions=[
+                                "Use ha_search to find the correct entity",
+                                "Check the entity is not disabled in Home Assistant",
+                            ],
+                            context={"entity_id": entity_id, "action": action},
+                        )
+                        err["service_call"] = service_call
+                        return err
+                    if (
+                        not component_op.get("confirmed")
+                        and isinstance(new_state, dict)
+                        and new_state.get("state") == "unavailable"
+                    ):
+                        # Gated on NOT confirmed AND still unavailable per the
+                        # best-available post-dispatch read: unlike a nonexistent
+                        # entity, an "unavailable" one legitimately stays in the
+                        # component's confirmation wait and can reconnect and
+                        # transition mid-dispatch (see _confirmable_entity_ids) —
+                        # a confirmed op, or one whose new_state shows it
+                        # reconnected to some OTHER state (just not the expected
+                        # hint), must never be reported as this failure just
+                        # because its PRE-state was unavailable.
+                        err = create_entity_unavailable_after_dispatch_error(entity_id)
+                        err["action"] = action
+                        err["service_call"] = service_call
+                        return err
         final_state = next(
             (
                 t["new_state"].get("state")
@@ -851,7 +1131,7 @@ class DeviceControlTools:
             "action": action,
             "parameters": op.get("parameters") or {},
             "command_sent": True,
-            # M-status: an inline-confirmed op has no operation_id, so a
+            # M-status: a component-path op has no operation_id, so a
             # "pending_verification" status is misleading (nothing will poll it). Use
             # "dispatched_unconfirmed" — the same label the ambiguous batch path uses.
             "status": "completed" if confirmed else "dispatched_unconfirmed",
@@ -887,7 +1167,7 @@ class DeviceControlTools:
 
     async def _bulk_via_component(
         self,
-        operations: list[dict[str, Any]],
+        operations: list[Any],
         valid_operations: list[tuple[int, dict[str, Any], str, str]],
         skipped_operations: list[dict[str, Any]],
         parallel: bool,
@@ -896,7 +1176,7 @@ class DeviceControlTools:
 
         Returns a legacy-shaped bulk response (built by the SAME
         ``_build_bulk_response`` the legacy path uses, with ``operation_ids`` empty
-        and ``follow_up`` None since ops are confirmed inline) when the component
+        and ``follow_up`` None since confirmation is inline) when the component
         advertises ``bulk_call_service`` and the frame lands, else ``None`` so the
         caller runs the unchanged legacy operation-registry path.
 
@@ -942,9 +1222,11 @@ class DeviceControlTools:
         # below so a POST-SEND failure is never misclassified as pre-send.
         try:
             ws = await get_websocket_client(
-                url=self.client.base_url, token=self.client.token
+                url=self.client.base_url,
+                token=self.client.token,
+                verify_ssl=getattr(self.client, "verify_ssl", None),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "%s establishment failed; falling back to legacy: %r",
                 WS_BULK_CALL_SERVICE,
@@ -997,7 +1279,7 @@ class DeviceControlTools:
                     exc,
                 )
             return None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # HomeAssistantCommandTimeout (the response-wait expired — the batch frame
             # WAS sent) or any post-send transport drop: the batch is ambiguous-
             # dispatched. Report partial, NEVER re-dispatch (D9 at-most-once).
@@ -1028,7 +1310,7 @@ class DeviceControlTools:
                 valid_operations, rows, op_results, strict=True
             )
         ]
-        # Reuse the legacy response builder: operation_ids is empty (ops confirmed
+        # Reuse the legacy response builder: operation_ids is empty (confirmation is
         # inline, no polling handle) → follow_up is None, and the successful/failed
         # tallies key off command_sent exactly as the legacy path.
         return self._build_bulk_response(
@@ -1092,20 +1374,20 @@ class DeviceControlTools:
 
     def _build_ambiguous_bulk_response(
         self,
-        operations: list[dict[str, Any]],
+        operations: list[Any],
         valid_operations: list[tuple[int, dict[str, Any], str, str]],
         rows: list[dict[str, Any]],
         skipped_operations: list[dict[str, Any]],
         parallel: bool,
     ) -> dict[str, Any]:
-        """Partial-success bulk response for a post-send batch-frame timeout/drop.
+        """Partial-success bulk response for a sent batch frame with no usable reply.
 
-        The batch frame WAS sent, so some/all ops may have dispatched; the batch
-        response never arrived. Per D9 at-most-once every valid op is reported
-        dispatched-but-unconfirmed (``partial``) and the batch is NEVER re-dispatched
-        via legacy. ``rows`` is aligned 1:1 with ``valid_operations`` (both built in
-        order; an unresolvable op returned to legacy earlier, so no ``None`` rows
-        reach here).
+        The batch frame WAS sent, so some/all ops may have dispatched, but the reply
+        timed out, the connection dropped, or the success envelope was malformed.
+        Per D9 at-most-once every valid op is reported dispatched-but-unconfirmed
+        (``partial``) and the batch is NEVER re-dispatched via legacy. ``rows`` is
+        aligned 1:1 with ``valid_operations`` (both built in order; an unresolvable op
+        returned to legacy earlier, so no ``None`` rows reach here).
         """
         results: list[dict[str, Any]] = [
             {
@@ -1125,8 +1407,8 @@ class DeviceControlTools:
                 },
                 "verification_method": "component_state_change",
                 "message": (
-                    f"{entity_id} {action} dispatched but the batch confirmation did "
-                    "not arrive within the timeout; not retried"
+                    f"{entity_id} {action} dispatched but no usable batch "
+                    "confirmation arrived; not retried"
                 ),
             }
             for (_idx, op, entity_id, action), row in zip(
@@ -1138,9 +1420,9 @@ class DeviceControlTools:
         )
         response["partial"] = True
         response.setdefault("warnings", []).append(
-            "The bulk operation was dispatched but Home Assistant did not confirm "
-            "within the timeout. Operations were NOT retried (at-most-once). Use "
-            "ha_get_state to verify the affected entities."
+            "The bulk operation was dispatched but no usable confirmation arrived "
+            "(timeout, dropped connection or malformed reply). Operations were NOT "
+            "retried (at-most-once). Use ha_get_state to verify the affected entities."
         )
         return response
 
@@ -1149,7 +1431,7 @@ class DeviceControlTools:
         """Extract structured error dict from ToolError without double-encoding."""
         try:
             result: dict[str, Any] = json.loads(str(e))
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             logger.warning(f"Could not decode ToolError as structured response: {e!r}")
             result = create_error_response(ErrorCode.SERVICE_CALL_FAILED, str(e))
         return result
@@ -1211,7 +1493,7 @@ class DeviceControlTools:
                     operation_ids.append(result["operation_id"])
             except ToolError as e:
                 results.append(self._tool_error_to_dict(e))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     create_error_response(
                         ErrorCode.SERVICE_CALL_FAILED,
@@ -1227,7 +1509,7 @@ class DeviceControlTools:
 
     def _build_bulk_response(
         self,
-        operations: list[dict[str, Any]],
+        operations: list[Any],
         results: list[dict[str, Any]],
         operation_ids: list[str],
         skipped_operations: list[dict[str, Any]],
@@ -1251,7 +1533,7 @@ class DeviceControlTools:
             "follow_up": (
                 {
                     "message": (
-                        f"Use get_bulk_operation_status() to check all "
+                        f"Use ha_get_operation_status(operation_id=[...]) to check all "
                         f"{len(operation_ids)} operations"
                     ),
                     "operation_ids": operation_ids,
@@ -1265,6 +1547,7 @@ class DeviceControlTools:
         if skipped_operations:
             response["skipped_details"] = skipped_operations
             response["suggestions"] = [
+                _BULK_ROW_SHAPE_SUGGESTION,
                 "Some operations were skipped due to validation errors",
                 "Each operation requires 'entity_id' and 'action' fields",
                 "Check skipped_details for specific errors",
@@ -1274,13 +1557,20 @@ class DeviceControlTools:
         return response
 
     async def get_bulk_operation_status(
-        self, operation_ids: list[str]
+        self, operation_ids: list[str], timeout_seconds: float = 10
     ) -> dict[str, Any]:
         """
         Check status of multiple operations.
 
+        Polls all operations concurrently under one shared
+        ``timeout_seconds`` window, so the wall time is bounded by the
+        window rather than growing with the batch size. Per-item failures
+        become structured entries in ``detailed_results`` rather than
+        aborting the batch.
+
         Args:
             operation_ids: List of operation IDs to check
+            timeout_seconds: Wait window applied to every operation
 
         Returns:
             Status summary for all operations
@@ -1291,31 +1581,74 @@ class DeviceControlTools:
                     ErrorCode.VALIDATION_MISSING_PARAMETER,
                     "No operation IDs provided",
                     suggestions=[
-                        "Provide a list of operation IDs from control_device_smart"
+                        "Provide the operation_ids that ha_bulk_control returned"
                     ],
                 )
             )
 
-        # Check all operations
-        statuses = []
-        for op_id in operation_ids:
-            status = await self.get_device_operation_status(op_id)
-            statuses.append(status)
+        # Check all operations concurrently under one shared wait window.
+        # Per-item failures must not abort the batch: get_device_operation_status
+        # raises ToolError for failed / timed-out / not-found operations, so each
+        # one is caught and folded back into detailed_results as a structured
+        # entry — otherwise the first bad operation would discard the status of
+        # every other one. The whole parsed error payload is preserved (context
+        # keys like entity_id / duration_ms sit at its top level), with the
+        # batch "status" field layered on for the summary counts.
+        error_code_to_status = {
+            ErrorCode.SERVICE_CALL_FAILED.value: "failed",
+            ErrorCode.TIMEOUT_OPERATION.value: "timeout",
+            ErrorCode.RESOURCE_NOT_FOUND.value: "not_found",
+        }
+
+        async def check_one(op_id: str) -> dict[str, Any]:
+            try:
+                return await self.get_device_operation_status(
+                    op_id, timeout_seconds=timeout_seconds
+                )
+            except ToolError as e:
+                try:
+                    err = json.loads(str(e))
+                except ValueError:
+                    err = {"success": False, "error": {"message": str(e)}}
+                error_info = err.get("error") or {}
+                return {
+                    **err,
+                    "operation_id": op_id,
+                    "status": error_code_to_status.get(
+                        error_info.get("code", ""), "failed"
+                    ),
+                }
+
+        statuses = list(
+            await asyncio.gather(*(check_one(op_id) for op_id in operation_ids))
+        )
 
         # Summarize results
         completed = len([s for s in statuses if s.get("status") == "completed"])
         failed = len([s for s in statuses if s.get("status") in ["failed", "timeout"]])
+        not_found = len([s for s in statuses if s.get("status") == "not_found"])
         pending = len([s for s in statuses if s.get("status") == "pending"])
 
+        # The batch call itself succeeded; per-item failures live inside
+        # detailed_results (batch-item pattern). Top-level ``success`` is
+        # the repo-wide response contract every tool return carries.
         return {
+            "success": True,
             "total_operations": len(operation_ids),
             "completed": completed,
             "failed": failed,
+            "not_found": not_found,
             "pending": pending,
             "all_complete": pending == 0,
             "summary": {
                 "success_rate": f"{completed}/{len(operation_ids)}",
-                "completion_percentage": (completed / len(operation_ids)) * 100,
+                # Terminal fraction (nothing left in flight) — consistent
+                # with all_complete; success_rate carries the successful
+                # fraction separately.
+                "completion_percentage": (
+                    (completed + failed + not_found) / len(operation_ids)
+                )
+                * 100,
             },
             "detailed_results": statuses,
             "recommendations": (
@@ -1324,7 +1657,7 @@ class DeviceControlTools:
                     "Check failed operations for specific error messages",
                     "Retry failed operations with different parameters if needed",
                 ]
-                if pending > 0 or failed > 0
+                if pending > 0 or failed > 0 or not_found > 0
                 else ["All operations completed successfully!"]
             ),
         }

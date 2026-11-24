@@ -20,8 +20,13 @@ import os
 import time
 
 import pytest
+from haos_runtime import (
+    HA_MCP_DEV_ADDON_SLUG,
+    is_haos_backend_selected,
+    is_haos_inaddon_mode,
+)
 
-from ...utilities.assertions import safe_call_tool
+from ...utilities.assertions import MCPAssertions, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +34,6 @@ logger = logging.getLogger(__name__)
 def _error_message(data: dict) -> str:
     error = data.get("error", {})
     return error.get("message", str(error)) if isinstance(error, dict) else str(error)
-
-
-def _server_is_out_of_process() -> bool:
-    """True when the MCP server under test runs in a separate process from
-    pytest: the container-embedded backend (E2E_BACKEND=embedded) or the
-    HAOS embedded/inaddon tiers all run ha-mcp inside the HA instance
-    itself. `monkeypatch.setenv` + `_reset_global_settings()` only affect
-    the pytest process's own Settings singleton, so they cannot reach a
-    server running in one of these modes."""
-    if os.environ.get("E2E_BACKEND", "").strip().lower() == "embedded":
-        return True
-    return os.environ.get("HAOS_TEST_MODE", "external") in ("embedded", "inaddon")
 
 
 @pytest.mark.convenience
@@ -85,19 +78,21 @@ class TestBackupTools:
                     raise AssertionError(f"Backup creation failed: {error_msg}")
 
             # Verify backup was created successfully
-            assert "backup_job_id" in data, "No backup_job_id returned"
+            assert "backup_id" in data, "No backup_id returned"
             assert "name" in data, "No backup name returned"
             assert data["name"].startswith("MCP_Backup_"), (
                 f"Unexpected backup name: {data['name']}"
             )
-
-            backup_job_id = data["backup_job_id"]
-            backup_name = data["name"]
-            backup_id = data.get("backup_id")
-
-            logger.info(
-                f"✅ Backup created: {backup_name} (ID: {backup_id}, job: {backup_job_id})"
+            # The seed configures no automatic-backup agents, so the backup
+            # lands on Home Assistant's default agent: local storage.
+            assert set(data["agents"]) & {"backup.local", "hassio.local"}, (
+                f"Backup not on the local agent: {data['agents']}"
             )
+
+            backup_name = data["name"]
+            backup_id = data["backup_id"]
+
+            logger.info(f"✅ Backup created: {backup_name} (ID: {backup_id})")
 
             # Verify backup completed (tool waits for completion)
             assert "status" in data, "No status returned"
@@ -108,9 +103,6 @@ class TestBackupTools:
             # Log backup details
             if "duration_seconds" in data:
                 logger.info(f"⏱️ Backup duration: {data['duration_seconds']} seconds")
-            if "size_bytes" in data:
-                size_mb = data["size_bytes"] / (1024 * 1024)
-                logger.info(f"📦 Backup size: {size_mb:.2f} MB")
 
             logger.info("✅ Backup test completed successfully")
 
@@ -157,18 +149,14 @@ class TestBackupTools:
                     raise AssertionError(f"Backup creation failed: {error_msg}")
 
             # Verify backup was created successfully
-            assert "backup_job_id" in data, "No backup_job_id returned"
             assert "backup_id" in data, "No backup_id returned"
             assert data["name"] == custom_name, (
                 f"Backup name mismatch: {data['name']} != {custom_name}"
             )
 
-            backup_job_id = data["backup_job_id"]
             backup_id = data["backup_id"]
 
-            logger.info(
-                f"✅ Backup created: {custom_name} (ID: {backup_id}, job: {backup_job_id})"
-            )
+            logger.info(f"✅ Backup created: {custom_name} (ID: {backup_id})")
 
             # Verify backup completed (tool waits for completion)
             assert "completed" in data["status"].lower(), (
@@ -239,6 +227,27 @@ class TestBackupTools:
             logger.error(f"❌ Backup restore validation test failed: {e}")
             raise
 
+    async def test_backup_of_an_app_that_is_not_installed_is_refused(self, mcp_client):
+        """Supervisor leaves a slug it does not have out of a backup without an
+        error, so the request is refused before a backup starts; a Core install
+        refuses any app. The installed dev app must not be named: an app list
+        read as empty would name it too."""
+        expected = (
+            "apps not installed: e2e_not_installed"
+            if is_haos_backend_selected()
+            else "need a Supervisor install"
+        )
+        async with MCPAssertions(mcp_client) as mcp:
+            await mcp.call_tool_failure(
+                "ha_manage_backup",
+                {
+                    "scope": "snapshot",
+                    "action": "create",
+                    "include_addons": [HA_MCP_DEV_ADDON_SLUG, "e2e_not_installed"],
+                },
+                expected_error=expected,
+            )
+
     async def test_snapshot_list(self, mcp_client):
         """
         Test: List full HA snapshot tarballs (scope='snapshot', action='list').
@@ -266,6 +275,20 @@ class TestBackupTools:
         for entry in data["backups"]:
             assert "backup_id" in entry
             assert "date" in entry
+        # Only a Supervisor install has Home Assistant's backup-before-update
+        # settings, and Supervisor refuses them to the app, which says so.
+        settings_warnings = [
+            w for w in data.get("warnings", []) if "before-update" in w
+        ]
+        if is_haos_inaddon_mode():
+            assert "update_backup_settings" not in data, data
+            assert settings_warnings, data
+        elif is_haos_backend_selected():
+            assert isinstance(data["update_backup_settings"], dict), data
+            assert not settings_warnings, data
+        else:
+            assert "update_backup_settings" not in data, data
+            assert not settings_warnings, data
 
         logger.info(f"✅ Snapshot list returned {data['count']} backup(s)")
 
@@ -390,7 +413,7 @@ class TestSnapshotDelete:
 
         A second, newer backup is created after the target so the target
         is NOT also the single newest snapshot — otherwise the newest-
-        snapshot guard (checked first; see backup.py) would fire instead
+        snapshot guard (checked first; see backup_snapshot.py) would fire instead
         of the age-floor guard this test is meant to isolate, since a
         freshly created backup with nothing after it is trivially "newest"
         in a shared test container.
@@ -443,24 +466,25 @@ class TestSnapshotDelete:
         )
         assert "days" in _error_message(data).lower()
 
+    @pytest.mark.external_only
     async def test_delete_succeeds_with_age_floor_disabled(
         self, mcp_client, monkeypatch
     ):
         """Full happy path: with the age floor disabled, an old-enough
-        (non-newest) ad-hoc backup can actually be deleted end-to-end."""
-        if _server_is_out_of_process():
-            pytest.skip(
-                "monkeypatch.setenv cannot reach an out-of-process server "
-                "(container-embedded / HAOS embedded / HAOS inaddon); the "
-                "guard-rejection tests above already exercise the real "
-                "delete path end-to-end under those backends"
-            )
+        (non-newest) ad-hoc backup can actually be deleted end-to-end.
+
+        ``external_only``: monkeypatch.setenv cannot reach an out-of-process
+        server (container-embedded / HAOS embedded / inaddon / stdio); the
+        guard-rejection tests above already exercise the real delete path
+        end-to-end under those backends. Collection-time marker rather than
+        a runtime skip so the mass-skip ceilings account for it (#2245).
+        """
         logger.info("🗑️ Testing snapshot delete success path...")
 
-        from ha_mcp.config import _reset_global_settings
+        from ha_mcp.config import reset_global_settings
 
         monkeypatch.setenv("SNAPSHOT_DELETE_MIN_AGE_DAYS", "0")
-        _reset_global_settings()
+        reset_global_settings()
 
         # Two backups so the target is never the single newest snapshot.
         target = await safe_call_tool(

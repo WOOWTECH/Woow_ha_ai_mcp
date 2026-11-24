@@ -185,6 +185,11 @@ def _refuse_if_sibling_running() -> bool:
 # not only in Settings -> System -> Logs. Path kept in sync with
 # mcp_proxy/__init__.py:INBOUND_LOG_FILE.
 INBOUND_LOG_FILE = Path("/config/.mcp_proxy_inbound.log")
+# Touched every keep-alive iteration; the bundled integration's OAuth views
+# serve only while this file's mtime is fresh (see mcp_proxy/oauth.py
+# _addon_alive) — the proxy-owned liveness signal that survives a crash where
+# _shutdown_cleanup never ran.
+HEARTBEAT_FILE = Path("/config/.mcp_proxy_heartbeat")
 
 
 def _supervisor_get(path: str) -> dict | None:
@@ -729,7 +734,13 @@ def _read_integration_domain() -> str | None:
 
 
 def _probe_oauth_active(attempts: int = 3, delay: int = 2) -> bool:
-    """Probe the OAuth protected-resource metadata endpoint.
+    """Probe the OAuth authorization-server metadata endpoint.
+
+    The RFC 8414 authorization-server document is the right probe target: it
+    is public by design, carries no webhook id, and is served in every OAuth
+    mode — but only by the OAuth-aware integration module. (The
+    protected-resource document is no longer served at a fixed path; its only
+    location now embeds the webhook id, which this probe must not publish.)
 
     Returns True only if HA serves the metadata URL — which means the
     OAuth-enforcing integration code is the one actually loaded in HA's
@@ -753,8 +764,8 @@ def _probe_oauth_active(attempts: int = 3, delay: int = 2) -> bool:
     for attempt in range(attempts):
         domain = _read_integration_domain()
         if domain:
-            result = _ha_core_api("GET", f"/{domain}/oauth/protected-resource")
-            if isinstance(result, dict) and "authorization_servers" in result:
+            result = _ha_core_api("GET", f"/{domain}/oauth/authorization-server")
+            if isinstance(result, dict) and "authorization_endpoint" in result:
                 return True
         if attempt < attempts - 1:
             time.sleep(delay)
@@ -1071,7 +1082,8 @@ def _install_shutdown_handlers() -> dict[str, str | None]:
 
 
 def _shutdown_cleanup(reason: str | None) -> None:
-    """Clean shutdown: restore default signal handling first so a second signal
+    """Clean shutdown: unlink the heartbeat so the integration's OAuth surface
+    goes dark immediately, restore default signal handling so a second signal
     can't abort cleanup, log why we exited, remove the config entry to
     unregister the webhook (keeping the config + component files so the next
     start needs no HA restart), and drop the inbound mirror file.
@@ -1079,6 +1091,16 @@ def _shutdown_cleanup(reason: str | None) -> None:
     On full uninstall the user may still need to manually remove
     /config/custom_components/mcp_proxy/, /config/.mcp_proxy_config.json, and
     /config/.mcp_proxy_inbound.log, then restart HA."""
+    # Take the OAuth surface dark FIRST — before default signal handling is
+    # restored (after which a second signal kills the process outright) and
+    # before the slow HA GET/DELETE calls in _remove_config_entry. Unlinking
+    # last left a fresh heartbeat behind whenever the process was terminated
+    # mid-cleanup, keeping the OAuth routes live for the full staleness window
+    # on an add-on that was already gone (#2219 codex review).
+    try:
+        HEARTBEAT_FILE.unlink(missing_ok=True)
+    except OSError as e:
+        log_error(f"Could not remove heartbeat file ({type(e).__name__}): {e}")
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, signal.SIG_DFL)
     log_info(f"Shutting down (reason: {reason or 'unknown'})...")
@@ -1501,46 +1523,52 @@ def _install_integration_and_handle_restart() -> None:
             )
         else:
             _reload_config_entry()
-            _ha_core_api(
-                "POST",
-                "/services/persistent_notification/dismiss",
-                {"notification_id": "mcp_proxy_restart"},
-            )
+            for stale in ("mcp_proxy_restart", "mcp_proxy_setup_failed"):
+                # Also clear a setup-failed notice from an earlier boot: it
+                # tells the user the webhook URL is NOT active, which is now
+                # untrue and self-clears nowhere else.
+                _ha_core_api(
+                    "POST",
+                    "/services/persistent_notification/dismiss",
+                    {"notification_id": stale},
+                )
             log_info("Setup completed after HA restart")
+    elif not _ensure_config_entry():
+        log_error(
+            "Could not create config entry. Webhook is NOT active. "
+            "Restart Home Assistant; if the problem persists, "
+            "remove and re-add the integration manually from "
+            "Settings → Devices & Services."
+        )
+        _ha_core_api(
+            "POST",
+            "/services/persistent_notification/create",
+            {
+                "title": ("MCP Webhook Proxy: webhook URL is not active"),
+                "message": (
+                    "The addon could not create the integration's "
+                    "config entry, so the webhook URL is currently "
+                    "**not active**. Restart Home Assistant; if "
+                    "the problem persists, remove and re-add the "
+                    "MCP Webhook Proxy integration from "
+                    "Settings → Devices & Services."
+                ),
+                "notification_id": "mcp_proxy_setup_failed",
+            },
+        )
     else:
-        if not _ensure_config_entry():
-            log_error(
-                "Could not create config entry. Webhook is NOT active. "
-                "Restart Home Assistant; if the problem persists, "
-                "remove and re-add the integration manually from "
-                "Settings → Devices & Services."
-            )
-            _ha_core_api(
-                "POST",
-                "/services/persistent_notification/create",
-                {
-                    "title": ("MCP Webhook Proxy: webhook URL is not active"),
-                    "message": (
-                        "The addon could not create the integration's "
-                        "config entry, so the webhook URL is currently "
-                        "**not active**. Restart Home Assistant; if "
-                        "the problem persists, remove and re-add the "
-                        "MCP Webhook Proxy integration from "
-                        "Settings → Devices & Services."
-                    ),
-                    "notification_id": "mcp_proxy_setup_failed",
-                },
-            )
-        else:
-            # Reload the config entry so the integration reads the fresh
-            # config file we just wrote (it may have loaded with stale data
-            # during HA boot, before this addon started).
-            _reload_config_entry()
-            # Dismiss any leftover restart notification from first install
+        # Reload the config entry so the integration reads the fresh
+        # config file we just wrote (it may have loaded with stale data
+        # during HA boot, before this addon started).
+        _reload_config_entry()
+        # Dismiss leftovers from an earlier boot: the first-install restart
+        # prompt, and a setup-failed notice that still claims the webhook URL
+        # is not active.
+        for stale in ("mcp_proxy_restart", "mcp_proxy_setup_failed"):
             _ha_core_api(
                 "POST",
                 "/services/persistent_notification/dismiss",
-                {"notification_id": "mcp_proxy_restart"},
+                {"notification_id": stale},
             )
 
 
@@ -1728,7 +1756,8 @@ def _log_startup_urls(
         log_info(f"    OAuth Client ID:     {oauth_client_id}")
         log_info(f"    OAuth Client Secret: {oauth_client_secret}")
         log_info("    Paste both into the OAuth fields of your MCP client's")
-        log_info("    connector setup (Claude.ai: connector → Advanced settings).")
+        log_info("    connector setup (Claude.ai: OAuth client ->")
+        log_info("    Use your own OAuth client).")
         log_info("    These values persist at /data/oauth_creds.json — same")
         log_info("    values across addon restarts.")
     if debug_logging:
@@ -1790,8 +1819,18 @@ def _keep_alive_loop(
     inbound_tail: dict[str, int] = {"offset": _initial_tail_offset()}
     consecutive_failures = 0
     last_health = 0.0
+    heartbeat_warned = False
     try:
         while True:
+            try:
+                HEARTBEAT_FILE.touch()
+            except OSError as e:
+                if not heartbeat_warned:
+                    heartbeat_warned = True
+                    log_error(
+                        f"Could not touch heartbeat file ({type(e).__name__}): "
+                        f"{e} — the integration's OAuth views will go dark."
+                    )
             if debug_logging:
                 _emit_new_inbound_lines(inbound_tail)
 
@@ -1868,6 +1907,15 @@ def main() -> int:
 
     _install_integration_and_handle_restart()
 
+    # The integration's OAuth views serve only while the heartbeat is fresh,
+    # and the stale-code probe below hits one of those views — touch it BEFORE
+    # enforcement, or every clean start (the shutdown deleted the file) would
+    # misread the freshly loaded integration as stale and enter restart
+    # recovery (#2218 review).
+    try:
+        HEARTBEAT_FILE.touch()
+    except OSError as e:
+        log_error(f"Could not touch heartbeat file ({type(e).__name__}): {e}")
     _enforce_oauth_or_disable(enable_oauth)
 
     _log_startup_urls(

@@ -11,7 +11,10 @@ Results are appended to a JSONL file for historical tracking.
 
 Usage:
     # Run a single story
-    uv run python tests/uat/stories/run_story.py catalog/s01_automation_sunset_lights.yaml --agents gemini
+    uv run python tests/uat/stories/run_story.py tests/uat/stories/catalog/s01_automation_sunset_lights.yaml --agents gemini
+
+    # Run several stories on one HA container per agent
+    uv run python tests/uat/stories/run_story.py tests/uat/stories/catalog/t0*.yaml --agents gemini
 
     # Run all stories
     uv run python tests/uat/stories/run_story.py --all --agents gemini
@@ -28,8 +31,11 @@ Usage:
     # Keep container alive after run (for verification/debugging)
     uv run python tests/uat/stories/run_story.py --all --agents gemini --keep-container
 
+    # Pass extra arguments to run_uat.py after --
+    uv run python tests/uat/stories/run_story.py --all --agents gemini -- --timeout 600
+
     # Just print the BAT scenario JSON
-    uv run python tests/uat/stories/run_story.py catalog/s01_automation_sunset_lights.yaml --dry-run
+    uv run python tests/uat/stories/run_story.py tests/uat/stories/catalog/s01_automation_sunset_lights.yaml --dry-run
 """
 
 from __future__ import annotations
@@ -50,7 +56,8 @@ import yaml
 
 if TYPE_CHECKING:
     import openai
-    from fastmcp import Client as MCPClient
+
+    from ha_mcp._vendor.fastmcp import Client as MCPClient
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CATALOG_DIR = SCRIPT_DIR / "catalog"
@@ -80,6 +87,7 @@ sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPT_DIR))  # for scripts/ subdirectory imports
 
 from scripts.verify_story import verify_ha_checks  # noqa: E402
+from uat import mcp_config  # noqa: E402
 from uat._inprocess import inprocess_mcp_client  # noqa: E402
 from uat._logging import configure_cli_logging  # noqa: E402
 from uat.ha_wait import wait_for_ha_ready  # noqa: E402
@@ -203,7 +211,7 @@ def _extract_tokens(session_file: str | None, agent: str) -> dict | None:
                         "cache_read_input_tokens", 0
                     ) + usage.get("cache_creation_input_tokens", 0)
             return totals
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"  Token extraction failed: {exc}")
         return None
 
@@ -229,7 +237,7 @@ def _extract_model(session_file: str | None, agent: str) -> str | None:
                     model = entry.get("message", {}).get("model")
                     if model:
                         return model
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"  Model extraction failed: {exc}")
         return None
 
@@ -284,7 +292,7 @@ def _extract_tool_sequence(session_file: str | None, agent: str) -> list[str] | 
 
         if agent == "claude":
             return _claude_tool_sequence(session_file)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"  Tool sequence extraction failed: {exc}")
         return None
 
@@ -439,6 +447,7 @@ def _run_test_prompt(
         capture_output=True,
         text=True,
         timeout=600,
+        check=False,
     )
 
     for line in result.stderr.splitlines():
@@ -672,22 +681,40 @@ def get_git_info() -> tuple[str, str]:
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
+            check=True,
         )
         sha = result.stdout.strip()
-    except Exception:
-        # Best-effort git lookup; keep the "unknown" default if git is unavailable.
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Best-effort git lookup; keep the "unknown" default if git is
+        # unavailable or fails. Say so — otherwise every result row records
+        # "unknown" with no trace of why the commit identity was lost. The
+        # reason is in git's stderr, not in str(CalledProcessError), which
+        # renders only the exit status.
+        logger.warning(
+            "git rev-parse failed, recording sha=unknown: %s %s",
+            e,
+            getattr(e, "stderr", "") or "",
+        )
     try:
         result = subprocess.run(
             ["git", "describe", "--tags", "--always"],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
+            check=True,
         )
         describe = result.stdout.strip()
-    except Exception:
-        # Best-effort git lookup; keep the "unknown" default if git is unavailable.
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Best-effort git lookup; keep the "unknown" default if git is
+        # unavailable or fails. Say so — otherwise every result row records
+        # "unknown" with no trace of why the commit identity was lost. The
+        # reason is in git's stderr, not in str(CalledProcessError), which
+        # renders only the exit status.
+        logger.warning(
+            "git describe failed, recording describe=unknown: %s %s",
+            e,
+            getattr(e, "stderr", "") or "",
+        )
     return sha, describe
 
 
@@ -1015,14 +1042,16 @@ async def _setup_inline_agent(
     openai_tools)`` on success, or ``None`` if setup failed (a per-story failure
     row is recorded before returning).
     """
-    from fastmcp import Client as _MCPClient
     from uat.openai_agent import (
         create_and_warm_openai_client,
         fetch_openai_tools,
     )
-    from uat.run_uat import build_stdio_mcp_config
 
-    config = build_stdio_mcp_config(ha_url, ha_token, args.branch, mcp_env_dict or None)
+    from ha_mcp._vendor.fastmcp import Client as _MCPClient
+
+    config = mcp_config.build_stdio_mcp_config(
+        ha_url, ha_token, args.branch, mcp_env_dict or None, args.mcp_url
+    )
     try:
         (
             openai_client,
@@ -1034,7 +1063,7 @@ async def _setup_inline_agent(
             model=args.model,
         )
         agent_stack.push_async_callback(openai_client.close)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         error_msg = f"Failed to initialise OpenAI client: {type(e).__name__}: {e}"
         logger.error(f"[{agent}] {error_msg}")
         _record_setup_failure(
@@ -1049,14 +1078,13 @@ async def _setup_inline_agent(
         )
         return None
     try:
-        source = f"uvx download @ {args.branch}" if args.branch else "local"
-        logger.info(f"[{agent}] Starting MCP server ({source})...")
+        logger.info(f"[{agent}] {mcp_config.mcp_server_action(args)}...")
         inline_mcp_client = await agent_stack.enter_async_context(_MCPClient(config))
         openai_tools = await fetch_openai_tools(
             inline_mcp_client, max_tools=args.max_tools
         )
         logger.info(f"[{agent}] MCP server ready ({len(openai_tools)} tools)")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         error_msg = f"Failed to start MCP server: {type(e).__name__}: {e}"
         logger.error(f"[{agent}] {error_msg}")
         _record_setup_failure(
@@ -1516,11 +1544,9 @@ async def run_stories(
     When --ha-url is provided, all agents share the external instance.
     """
     run_start = time.monotonic()
-    sha, describe = get_git_info()
+    sha, describe = mcp_config.running_server_revision(args) or get_git_info()
     agent_list = [a.strip() for a in args.agents.split(",")]
     using_external_ha = bool(args.ha_url)
-
-    from uat.run_uat import parse_mcp_env
 
     rc = _preflight_stories(args, agent_list, using_external_ha)
     if rc is not None:
@@ -1530,9 +1556,9 @@ async def run_stories(
     # Each entry: (agent, story_id, story, exit_code, summary, session_file, passed)
     backend_aborted = False  # set if any agent aborted on an unreachable backend
 
-    mcp_env_dict = parse_mcp_env(
+    mcp_env_dict = mcp_config.parse_mcp_env(
         getattr(args, "mcp_env", None),
-        base_url=args.base_url,
+        base_url=None if args.mcp_url else args.base_url,
         on_default_applied=logger.info,
     )
     effective_mcp_env: list[str] = [f"{k}={v}" for k, v in mcp_env_dict.items()]
@@ -1554,19 +1580,29 @@ async def run_stories(
     return _log_run_summary(all_results, backend_aborted, run_start, args)
 
 
+def _split_passthrough(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split argv at ``--`` into (run_story args, run_uat.py pass-through).
+
+    Both the story paths and the pass-through take any number of values, so
+    argparse cannot tell them apart; everything after ``--`` is pass-through.
+    """
+    if "--" not in argv:
+        return argv, []
+    split = argv.index("--")
+    return argv[:split], argv[split + 1 :]
+
+
 def main() -> None:
     parser = SuggestingArgumentParser(
         description="Run user acceptance stories via BAT",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("story_file", nargs="?", help="Path to story YAML file")
+    parser.add_argument("story_file", nargs="*", help="Path(s) to story YAML files")
     parser.add_argument(
-        "--all", action="store_true", help="Run all stories in catalog/"
+        "--all", action="store_true", help="Run all s*.yaml stories in catalog/"
     )
     parser.add_argument("--agents", default="gemini", help="Comma-separated agent list")
-    parser.add_argument("--branch", help="Git branch/tag to install ha-mcp from")
-    parser.add_argument("--ha-url", help="Use existing HA instance (skip container)")
-    parser.add_argument("--ha-token", help="HA long-lived access token")
+    mcp_config.add_target_args(parser)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print BAT scenario JSON"
     )
@@ -1628,8 +1664,9 @@ def main() -> None:
             "(local model); override with --mcp-env ENABLE_TOOL_SEARCH=false."
         ),
     )
-    parser.add_argument("extra_args", nargs="*", help="Extra args passed to run_uat.py")
-    args = parser.parse_args()
+    argv, extra_args = _split_passthrough(sys.argv[1:])
+    args = parser.parse_args(argv)
+    args.extra_args = extra_args
 
     # Validate --base-url is provided when using the openai agent
     agent_list = [a.strip() for a in args.agents.split(",")]
@@ -1637,12 +1674,12 @@ def main() -> None:
         parser.error("--base-url is required when using the openai agent")
 
     configure_cli_logging()
+    mcp_config.apply_dev_env(parser, args)
 
     if args.all:
         stories = sorted(CATALOG_DIR.glob("s*.yaml"))
     elif args.story_file:
-        story_path = Path(args.story_file).resolve()
-        stories = [story_path]
+        stories = [Path(path).resolve() for path in args.story_file]
     else:
         parser.print_help()
         sys.exit(1)

@@ -1,29 +1,70 @@
 """Unit tests for LiteDocstringsTransform and the server-side wiring.
 
-Covers three layers:
+Covers five layers:
 
 1. ``LiteDocstringsTransform`` itself — empty-mapping no-op, mapped
    replacement, unmapped passthrough, on both ``list_tools`` and
    ``get_tool`` paths.
-2. ``HomeAssistantSmartMCPServer._apply_lite_docstrings`` — the gate,
-   the WARNING log, the import-error fallback, and the
-   ``add_transform`` failure path. Uses the ``MagicMock`` stub pattern
-   from ``test_categorized_search.TestApplySearchKeywordEnrichment``.
+2. Real server construction and catalog results — the gate, warning log
+   and transform-installation failure path.
 3. The ``_LITE_DOCSTRINGS`` mapping invariant — every lite description
-   names ``ha_get_skill_guide`` so the LLM still has a path to
-   detailed guidance from inside the trimmed text.
+   names the anchor that reaches its own declared destination, so the LLM
+   still has a path to detailed guidance from inside the trimmed text.
+4. The mapping's *ends* — that every key is a registered tool name, and
+   that the guidance each entry defers to actually exists. Layer 3 checks
+   the pointer text; layer 4 checks the two things that can be wrong
+   without the text being malformed (#2153 review §2/§5).
+5. The hand-copied prose tool lists in ``docs/beta.md`` / ``en.json``
+   (#2153 review §4/§6).
 """
 
 from __future__ import annotations
 
+import ast
+import json
+import re
+import sys
 from collections.abc import Sequence
-from unittest.mock import AsyncMock, MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
-from fastmcp.tools import Tool
-from mcp.types import ToolAnnotations
 
+from ha_mcp._vendor.fastmcp.tools import Tool
+from ha_mcp._vendor.mcp.types import ToolAnnotations
+from ha_mcp.client.rest_client import HomeAssistantClient
+from ha_mcp.server_tool_text import LITE_DOCSTRING_DESTINATIONS, LITE_DOCSTRINGS
 from ha_mcp.transforms import LiteDocstringsTransform
+from ha_mcp.utils import skill_loader
+
+from ._server_factory import make_server
+
+REPO_ROOT = Path(__file__).parent.parent.parent.parent
+
+# The generator is a script, not a package module — same import route
+# test_tool_docs_sync and the locale-parity checks use.
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import extract_tools  # noqa: E402
+
+_SKILL_NAME = "home-assistant-best-practices"
+_PLACEHOLDER_RE = re.compile(r"\{[a-z_]+\}")
+_TOOL_RESPONSE_PREFIX = "tool-response:"
+_SELF_CONTAINED = "self-contained"
+_REFERENCE_FILE_RE = re.compile(r"references/[\w.-]+\.md")
+
+
+def _require_vendored_skills() -> Path:
+    """Skip cleanly when the submodule isn't initialised.
+
+    Mirrors ``test_skill_content_wiring._require_vendored_skills``.
+    """
+    skills_dir = skill_loader.get_skills_dir()
+    if skills_dir is None or not (skills_dir / _SKILL_NAME).is_dir():
+        pytest.skip(
+            "skills-vendor submodule not initialised; "
+            "run `git submodule update --init` to enable real-skill tests"
+        )
+    return skills_dir
 
 
 def _make_tool(name: str, *, description: str = "") -> Tool:
@@ -36,7 +77,7 @@ def _make_tool(name: str, *, description: str = "") -> Tool:
         fn=noop,
         name=name,
         description=description,
-        annotations=ToolAnnotations(readOnlyHint=True),
+        annotations=ToolAnnotations(read_only_hint=True),
     )
 
 
@@ -157,63 +198,53 @@ class TestGetTool:
 
 
 class TestApplyLiteDocstrings:
-    """Tests for the server-side ``_apply_lite_docstrings`` wiring."""
+    @pytest.mark.parametrize("enabled", [False, True])
+    async def test_catalog_uses_lite_descriptions_only_when_enabled(
+        self, core_client: HomeAssistantClient, monkeypatch, enabled
+    ) -> None:
+        server = make_server(
+            core_client,
+            monkeypatch,
+            enabled_tool_modules="tools_config_automations",
+            enable_lite_docstrings=enabled,
+        )
+        tool = await server.mcp.get_tool("ha_config_get_automation")
+        assert tool is not None
+        assert tool.description.startswith(LITE_DOCSTRINGS[tool.name]) is enabled
 
-    def _make_server_stub(self, *, enable_lite_docstrings: bool) -> MagicMock:
-        """Minimal stub exposing only the attributes the method touches."""
-        from ha_mcp.server import HomeAssistantSmartMCPServer
+    def test_lite_descriptions_carry_no_format_tokens(self) -> None:
+        assert not [
+            name
+            for name, text in LITE_DOCSTRINGS.items()
+            if _PLACEHOLDER_RE.search(text)
+        ]
 
-        stub = MagicMock()
-        stub._LITE_DOCSTRINGS = HomeAssistantSmartMCPServer._LITE_DOCSTRINGS
-        stub.settings = MagicMock(enable_lite_docstrings=enable_lite_docstrings)
-        stub.mcp = MagicMock()
-        return stub
-
-    def test_noop_when_flag_disabled(self) -> None:
-        """When the flag is off, no transform is installed and no log."""
-        from ha_mcp.server import HomeAssistantSmartMCPServer
-
-        stub = self._make_server_stub(enable_lite_docstrings=False)
-        HomeAssistantSmartMCPServer._apply_lite_docstrings(stub)
-
-        stub.mcp.add_transform.assert_not_called()
-
-    def test_installs_transform_when_flag_enabled(self) -> None:
-        """When on, install a LiteDocstringsTransform with the real mapping."""
-        from ha_mcp.server import HomeAssistantSmartMCPServer
-
-        stub = self._make_server_stub(enable_lite_docstrings=True)
-        HomeAssistantSmartMCPServer._apply_lite_docstrings(stub)
-
-        stub.mcp.add_transform.assert_called_once()
-        installed = stub.mcp.add_transform.call_args.args[0]
-        assert isinstance(installed, LiteDocstringsTransform)
-        assert installed._replacements is stub._LITE_DOCSTRINGS
-
-    def test_logs_warning_when_enabled(self, caplog) -> None:
-        """The trade-off WARNING must be emitted so env-var users see it."""
-        from ha_mcp.server import HomeAssistantSmartMCPServer
-
-        stub = self._make_server_stub(enable_lite_docstrings=True)
+    def test_logs_warning_when_enabled(
+        self, core_client: HomeAssistantClient, monkeypatch, caplog
+    ) -> None:
         with caplog.at_level("WARNING"):
-            HomeAssistantSmartMCPServer._apply_lite_docstrings(stub)
-
+            make_server(core_client, monkeypatch, enable_lite_docstrings=True)
         assert any(
             "ENABLE_LITE_DOCSTRINGS=true" in rec.message
             and "may degrade LLM performance" in rec.message
             for rec in caplog.records
         )
 
-    def test_transform_failure_logs_second_warning(self, caplog) -> None:
-        """If add_transform fails, the user must know full descs remain."""
-        from ha_mcp.server import HomeAssistantSmartMCPServer
+    def test_transform_failure_logs_second_warning(
+        self, core_client: HomeAssistantClient, monkeypatch, caplog
+    ) -> None:
+        from ha_mcp.http_transport import HttpTransportFastMCP
 
-        stub = self._make_server_stub(enable_lite_docstrings=True)
-        stub.mcp.add_transform.side_effect = RuntimeError("boom")
+        original = HttpTransportFastMCP.add_transform
 
+        def add_transform(server, transform):
+            if isinstance(transform, LiteDocstringsTransform):
+                raise RuntimeError("boom")
+            return original(server, transform)
+
+        monkeypatch.setattr(HttpTransportFastMCP, "add_transform", add_transform)
         with caplog.at_level("WARNING"):
-            HomeAssistantSmartMCPServer._apply_lite_docstrings(stub)
-
+            make_server(core_client, monkeypatch, enable_lite_docstrings=True)
         assert any(
             "failed to install" in rec.message
             and "full tool descriptions remain in effect" in rec.message
@@ -229,34 +260,69 @@ class TestApplyLiteDocstrings:
 class TestLiteDocstringsMappingInvariants:
     """Guard-rails on the user-visible lite descriptions themselves."""
 
-    def test_every_lite_description_references_skill(self) -> None:
-        """The design promise: every lite description points at a skill tool.
+    def test_every_lite_description_names_its_own_destination(self) -> None:
+        """The design promise: every lite description points somewhere real.
 
-        Without this anchor, the user-facing behaviour of the toggle
-        regresses to "shorter descriptions, no guidance" the moment
-        someone trims an entry too aggressively.
+        Without an anchor, the user-facing behaviour of the toggle regresses
+        to "shorter descriptions, no guidance" the moment someone trims an
+        entry too aggressively.
+
+        Derived from ``_LITE_DOCSTRING_DESTINATIONS`` rather than hunting a
+        fixed string. The previous version of this test required the literal
+        ``"ha_get_skill_guide"`` in every value, which made it impossible to
+        add a tool the skill pack doesn't cover WITHOUT manufacturing a
+        dead-end pointer — and, worse, was satisfiable by a sentence saying
+        the guide does *not* cover the tool. Now the required anchor follows
+        from where the entry actually defers:
+
+        * skill-path destination → must name ``ha_get_skill_guide``, the
+          tool that serves it.
+        * ``tool-response:<field>`` → must name ``<field>``. It may still
+          mention ``ha_get_skill_guide``; ``ha_report_issue`` does, to say
+          the guide does NOT cover issue reporting, which saves a compliant
+          agent a pointless call. Only the field name is required here.
+        * ``self-contained`` → must carry NO pointer at all. An entry that
+          defers nothing cannot be allowed to quietly re-acquire a
+          ``ha_get_skill_guide`` pointer or name a reference file, because
+          that is how a description starts advertising content the pinned
+          submodule does not contain. No entry declares this today — the
+          arm is kept so a tool the skill pack does not cover has an
+          honest option other than a dead pointer.
         """
-        from ha_mcp.server import HomeAssistantSmartMCPServer
-
         offenders: list[str] = []
-        for name, lite in HomeAssistantSmartMCPServer._LITE_DOCSTRINGS.items():
-            if "ha_get_skill_guide" not in lite:
-                offenders.append(name)
+        for name, lite in LITE_DOCSTRINGS.items():
+            dest = LITE_DOCSTRING_DESTINATIONS[name]
+            if dest == _SELF_CONTAINED:
+                if "ha_get_skill_guide" in lite or _REFERENCE_FILE_RE.search(lite):
+                    offenders.append(
+                        f"{name}: declared self-contained but the description "
+                        "still points somewhere — either vendor the "
+                        "destination and declare it, or drop the pointer"
+                    )
+            elif dest.startswith(_TOOL_RESPONSE_PREFIX):
+                field = dest[len(_TOOL_RESPONSE_PREFIX) :]
+                if f"`{field}`" not in lite:
+                    offenders.append(
+                        f"{name}: defers to its own {field!r} response field "
+                        "but the description never names it"
+                    )
+            elif "ha_get_skill_guide" not in lite:
+                offenders.append(
+                    f"{name}: defers to {dest!r} but the description has no "
+                    "ha_get_skill_guide pointer to reach it"
+                )
 
         assert not offenders, (
-            "Lite descriptions missing a ha_get_skill_guide pointer "
-            f"(invariant from _LITE_DOCSTRINGS docstring): {offenders}"
+            "Lite descriptions with an unreachable anchor:\n"
+            + "\n".join(f"  - {entry}" for entry in offenders)
         )
 
     def test_every_lite_description_starts_with_action_verb(self) -> None:
-        """AGENTS.md tool-docstring rule: first word is an action verb.
+        """Style-guide tool-docstring rule: first word is an action verb.
 
-        Verb list mirrors AGENTS.md > Tool Docstrings > Required for
-        every tool. ``Create`` covers ``Create or update`` openers used
-        on the consolidated set_* tools.
+        Verb list mirrors `.gemini/styleguide.md` > MCP Tool Docstrings.
+        ``Create`` covers ``Create or update`` on consolidated set_* tools.
         """
-        from ha_mcp.server import HomeAssistantSmartMCPServer
-
         accepted = {
             "Get",
             "List",
@@ -274,7 +340,7 @@ class TestLiteDocstringsMappingInvariants:
         # leading verb.
         punctuation = ",.;:"
         offenders: list[tuple[str, str]] = []
-        for name, lite in HomeAssistantSmartMCPServer._LITE_DOCSTRINGS.items():
+        for name, lite in LITE_DOCSTRINGS.items():
             first_word = lite.split(maxsplit=1)[0].rstrip(punctuation)
             if first_word not in accepted:
                 offenders.append((name, first_word))
@@ -282,3 +348,342 @@ class TestLiteDocstringsMappingInvariants:
         assert not offenders, (
             f"Lite descriptions not starting with an action verb: {offenders}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: the mapping's keys and its deferral destinations must be real
+#
+# The three tests above check the lite TEXT. They cannot catch either of the
+# two ways an entry is wrong without being malformed: a key that matches no
+# registered tool (silently no-ops in LiteDocstringsTransform._rewrite), or
+# a pointer to guide content that does not exist.
+# ---------------------------------------------------------------------------
+
+
+class TestLiteDocstringsKeysAndDestinations:
+    def test_every_key_resolves_to_a_registered_tool(self) -> None:
+        """A key that matches no tool is a silent no-op.
+
+        ``LiteDocstringsTransform._rewrite`` does ``.get(tool.name)`` and
+        returns the tool untouched on a miss — no log, no error. So a
+        typo'd or renamed key means that tool quietly keeps its full
+        description while the toggle reports success. Nothing else checks
+        this for every mapping entry: the server wiring tests exercise selected
+        catalog entries.
+
+        Resolves against the AST-extracted catalog rather than a live
+        server, so it needs no HA instance.
+        """
+        real = {t["name"] for t in extract_tools.extract_tools()}
+        unknown = sorted(set(LITE_DOCSTRINGS) - real)
+
+        assert not unknown, (
+            "_LITE_DOCSTRINGS keys matching no registered tool (these "
+            f"entries silently do nothing): {unknown}"
+        )
+
+    def test_every_mapped_tool_declares_a_destination(self) -> None:
+        """Both maps must cover exactly the same tools.
+
+        Keeps ``test_every_lite_destination_resolves`` honest — without
+        this, adding an entry to ``_LITE_DOCSTRINGS`` and forgetting the
+        destination would skip the resolution check rather than fail it.
+        """
+        lite = set(LITE_DOCSTRINGS)
+        declared = set(LITE_DOCSTRING_DESTINATIONS)
+
+        assert lite == declared, (
+            "_LITE_DOCSTRINGS and _LITE_DOCSTRING_DESTINATIONS disagree.\n"
+            f"  missing a destination: {sorted(lite - declared)}\n"
+            f"  destination with no lite entry: {sorted(declared - lite)}"
+        )
+
+    def test_every_lite_destination_resolves(self) -> None:
+        """The design promise, checked at the destination end.
+
+        ``test_every_lite_description_names_its_own_destination`` asserts
+        the pointer STRING is present; it cannot tell whether the guide holds
+        anything on the subject. An entry deferring to content that does
+        not exist is worse than the documented trade-off ("the LLM might
+        skip the extra call"), because a compliant agent that does follow
+        the pointer also comes back with nothing.
+        """
+        skills_dir = _require_vendored_skills()
+        failures: list[str] = []
+
+        for (
+            tool,
+            dest,
+        ) in LITE_DOCSTRING_DESTINATIONS.items():
+            if dest.startswith(_TOOL_RESPONSE_PREFIX):
+                field = dest[len(_TOOL_RESPONSE_PREFIX) :]
+                if not _tool_response_has_field(tool, field):
+                    failures.append(
+                        f"{tool} defers to its own response field "
+                        f"{field!r}, which its source does not return"
+                    )
+                continue
+
+            if dest == _SELF_CONTAINED:
+                # Nothing to resolve: the entry advertises no destination.
+                # test_every_lite_description_names_its_own_destination is
+                # what holds it to that.
+                continue
+
+            resolved = skill_loader.resolve_skill_files(skills_dir, _SKILL_NAME, [dest])
+            if not resolved.get(dest):
+                failures.append(
+                    f"{tool} defers to {dest!r}, which does not exist in "
+                    f"the bundled {_SKILL_NAME} skill"
+                )
+
+        assert not failures, (
+            "Lite deferral destinations that do not resolve:\n"
+            + "\n".join(f"  - {f}" for f in failures)
+        )
+
+    def test_named_reference_files_match_the_destination_map(self) -> None:
+        """A lite text that names a ``references/*.md`` file must name its own.
+
+        Two places can state the destination — the prose an LLM reads and
+        the map the tests read. If they disagree, one of them is lying to
+        somebody.
+
+        Live as of the ``references/backups.md`` pin bump:
+        ``ha_manage_backup``'s lite text cites that file inline and its
+        destination names the same one, so a future edit that changes one
+        without the other fails here.
+        """
+        pattern = re.compile(r"references/[\w.-]+\.md")
+        mismatches: list[str] = []
+        for tool, lite in LITE_DOCSTRINGS.items():
+            named = set(pattern.findall(lite))
+            if not named:
+                continue
+            dest = LITE_DOCSTRING_DESTINATIONS[tool]
+            if named != {dest}:
+                mismatches.append(
+                    f"{tool}: text names {sorted(named)}, map says {dest!r}"
+                )
+
+        assert not mismatches, "\n".join(mismatches)
+
+
+class TestBackupLiteDescriptionSize:
+    """The claim the comments used to make as a number, made as a test.
+
+    An exact "4571 -> 1295, 72%" pair went stale across three successive
+    edits of the lite text, twice unnoticed. A ratio measured at test time
+    cannot: it fails if someone re-inflates the lite value toward the full
+    one, and it does not need touching when the wording changes.
+
+    ``ha_manage_backup``'s advertised text is the ``description=`` string
+    built in ``register_backup_tools()``, not a docstring (``__doc__`` is 73
+    chars), so the full side is measured by extracting that string.
+    """
+
+    def _full_description(self) -> str:
+        source = (REPO_ROOT / "src" / "ha_mcp" / "tools" / "backup.py").read_text(
+            encoding="utf-8"
+        )
+        opener = 'manage_backup_description = """'
+        start = source.index(opener) + len(opener)
+        return source[start : source.index('"""', start)]
+
+    def test_full_description_carries_no_format_tokens(self) -> None:
+        """The full description is a plain string; a ``{name}`` token in it
+        would reach the LLM verbatim."""
+        assert not _PLACEHOLDER_RE.search(self._full_description())
+
+    def test_backup_lite_description_stays_substantially_smaller(self) -> None:
+        full = self._full_description()
+        lite = LITE_DOCSTRINGS["ha_manage_backup"]
+        assert len(lite) < 0.45 * len(full), (
+            f"lite is {len(lite)} chars against a "
+            f"full {len(full)} ({100 * len(lite) / len(full):.0f}%) — the "
+            "entry is meant to be a fraction of the full description, and "
+            "the whole point of mapping it was catalog size"
+        )
+        # And it must not be trimmed back to uselessness: the safety content
+        # kept inline is why this entry accepts a smaller cut than pure
+        # compression would give.
+        assert len(lite) > 900, (
+            f"lite is only {len(lite)} chars — "
+            "check the irreversibility markers below are still inline"
+        )
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "confirm=True",
+            "enable_snapshot_delete",
+            "snapshot_delete_min_age_days",
+            "restarts HA",
+            "enable_auto_backup",
+            "per-entity backup first",
+            "heartbeats",
+        ],
+    )
+    def test_backup_lite_description_keeps_its_safety_content(
+        self, marker: str
+    ) -> None:
+        """Every irreversibility marker and no-fallback diagnostic, pinned.
+
+        ``destructiveHint`` is set on this tool and the stated reason for
+        accepting a smaller reduction is that these stay inline — but every
+        other guard in this file passed with these sentences deleted, which
+        is exactly the regression the review caught twice.
+        """
+        lite = LITE_DOCSTRINGS["ha_manage_backup"]
+        assert marker in lite, (
+            f"{marker!r} dropped from the ha_manage_backup lite description; "
+            "it has no fallback in the skill pack or the input schema"
+        )
+
+
+class TestDocumentedToolLists:
+    """The mapped-tool list is hand-copied into docs and the settings UI."""
+
+    def test_documented_tool_lists_cover_every_mapped_tool(self) -> None:
+        """Every mapped tool must be named in each documented list.
+
+        Three regions, checked independently rather than as one blob:
+        ``beta.md``'s beta-tools row, ``beta.md``'s
+        ``### enable_lite_docstrings`` summary sentence, and the ``en.json``
+        help string.
+
+        The previous version matched over the WHOLE of ``beta.md``, which
+        made it ineffective: ``ha_config_get_dashboard`` and
+        ``ha_config_set_dashboard`` also appear in the dashboard-screenshot
+        row, so both lite lists could be stripped of them and this still
+        passed — verified by mutation. A companion test sentinelled one tool
+        at count >= 2, which a 16th tool added to only one passage also
+        slipped past. ``beta.md`` meanwhile *claimed* the guarantee neither
+        delivered, and this PR exists partly because ``ha_search`` drifted
+        out of all three lists unnoticed.
+
+        Names are matched in their backticked form in Markdown and on word
+        boundaries in JSON, so ``ha_search`` is not satisfied by
+        ``ha_search_tools``.
+        """
+        mapped = sorted(LITE_DOCSTRINGS)
+        beta = (REPO_ROOT / "docs" / "beta.md").read_text(encoding="utf-8")
+
+        # Region 1: the beta-tools table row (the env-var string is unique to
+        # it). Region 2: the summary sentence under the section heading.
+        rows = [ln for ln in beta.splitlines() if "ENABLE_LITE_DOCSTRINGS=true" in ln]
+        assert len(rows) == 1, (
+            f"expected exactly one beta-tools row for the flag, found {len(rows)}"
+        )
+        summaries = [
+            ln
+            for ln in beta.splitlines()
+            if ln.startswith("Replaces the docstrings on")
+        ]
+        assert len(summaries) == 1, (
+            "expected exactly one 'Replaces the docstrings on ...' summary "
+            f"sentence in docs/beta.md, found {len(summaries)}"
+        )
+
+        help_text = json.loads(
+            (
+                REPO_ROOT / "src" / "ha_mcp" / "settings_ui" / "locales" / "en.json"
+            ).read_text(encoding="utf-8")
+        )["messages"]["features.enable_lite_docstrings.help"]
+
+        regions = {
+            "docs/beta.md (beta-tools row)": ("md", rows[0]),
+            "docs/beta.md (enable_lite_docstrings summary)": ("md", summaries[0]),
+            "en.json (features.enable_lite_docstrings.help)": ("json", help_text),
+        }
+
+        failures: list[str] = []
+        for label, (kind, text) in regions.items():
+            if kind == "md":
+                missing = [n for n in mapped if f"`{n}`" not in text]
+            else:
+                missing = [
+                    n for n in mapped if not re.search(rf"\b{re.escape(n)}\b", text)
+                ]
+            if missing:
+                failures.append(f"{label} does not name: {missing}")
+
+        assert not failures, (
+            "Documented lite-docstring tool lists are out of sync with "
+            "_LITE_DOCSTRINGS:\n" + "\n".join(f"  - {f}" for f in failures)
+        )
+
+
+def _tool_response_has_field(tool_name: str, field: str) -> bool:
+    """True when ``tool_name``'s own function builds a dict carrying ``field``.
+
+    AST check, scoped to the function whose name matches the tool inside the
+    module ``extract_tools`` attributes it to. The previous version substring-
+    matched ``'"<field>":'`` over the WHOLE source file, so any dict literal
+    anywhere in the module satisfied it — including one never returned, which
+    is the checked-the-pointer-never-the-destination pattern this test file
+    exists to replace. Scoping to the function is still static (no live HA)
+    and still an approximation — it accepts a dict built but not returned —
+    but the dict must at least live in the tool's own body.
+
+    Assumes the tool's function shares its registered name (true for every
+    tool today); a mismatch returns False, which fails the destination test
+    loudly rather than passing it silently.
+    """
+    sources = {
+        t["source_file"]
+        for t in extract_tools.extract_tools()
+        if t["name"] == tool_name
+    }
+    tools_dir = REPO_ROOT / "src" / "ha_mcp" / "tools"
+
+    def _dict_with_field_in_scope(node: ast.AST) -> bool:
+        """Scan one function's own scope, not code nested inside it.
+
+        A helper or lambda defined inside the tool has its own return
+        value, so a dict it builds is not the tool's response — descending
+        into it would re-open the any-dict-anywhere hole one level down.
+        """
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child,
+                ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef,
+            ):
+                continue
+            if isinstance(child, ast.Dict) and any(
+                isinstance(key, ast.Constant) and key.value == field
+                for key in child.keys
+            ):
+                return True
+            if _dict_with_field_in_scope(child):
+                return True
+        return False
+
+    for source in sources:
+        tree = ast.parse((tools_dir / source).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            # ast.walk, not module-level lookup: registered tools are
+            # methods on registrar classes (ha_report_issue lives inside
+            # one), so the function has to be findable at any depth — only
+            # the scan of its BODY stops at nested scope boundaries.
+            if (
+                isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == tool_name
+            ):
+                if _dict_with_field_in_scope(node):
+                    return True
+    return False
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["ha_config_get_dashboard", "ha_config_set_dashboard"]
+)
+def test_lite_dashboard_descriptions_expose_patch(tool_name):
+    description = LITE_DOCSTRINGS[tool_name]
+    assert "patch" in description
+    assert "config_hash" in description
+    assert "python_transform" in description
+    if tool_name == "ha_config_set_dashboard":
+        assert "JSON Pointer" in description
+        assert "append" in description
+        assert "two modes" not in description

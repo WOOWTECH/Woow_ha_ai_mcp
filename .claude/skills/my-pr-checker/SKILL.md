@@ -34,7 +34,7 @@ gh api graphql -F pr="$ARGUMENTS" -f query='query($pr: Int!) { repository(owner:
 ## Step 2: Triage Comments
 
 - **Human comments**: highest priority
-- **Bot comments** (Copilot, Codex, etc.): treat as suggestions — assess whether they prevent a bug or improve maintainability; dismiss with explanation if not
+- **Bot comments** (Copilot, Codex, CodeRabbit, etc.): treat as suggestions — assess whether they prevent a bug or improve maintainability; dismiss with explanation if not
 
 Accept if: prevents a bug, improves clarity for future maintainers, aligns with project conventions, addresses security.
 Dismiss if: incorrect suggestion, reduces readability, conflicts with project patterns, already handled elsewhere.
@@ -109,7 +109,7 @@ gh pr comment "$ARGUMENTS" --repo homeassistant-ai/ha-mcp --body "## PR Assessme
 
 ## Special Operations
 
-When needed:
+Use these when needed. Re-creating the PR (which closes it) and deleting a comment each need the user's approval for that exact action first:
 - **Rebase**: `gh pr checkout "$ARGUMENTS" && git rebase master && git push --force-with-lease`
 - **Re-create PR**: `gh pr close "$ARGUMENTS" --repo homeassistant-ai/ha-mcp` then `gh pr create --draft …` with the same branch
 - **Delete comment**: `gh api -X DELETE repos/homeassistant-ai/ha-mcp/issues/comments/<id>`

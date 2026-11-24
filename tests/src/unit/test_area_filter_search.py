@@ -1,481 +1,602 @@
-"""Unit tests for area-filtered entity search (issue #504).
+"""Area-filtered entity search on real Core registries (issue #504).
 
-Tests that get_entities_by_area uses HA registries for accurate area resolution
-instead of fuzzy-matching on friendly names, which caused false positives.
+``ha_search(area_filter=...)`` resolves areas from the area, floor, device and
+entity registries instead of fuzzy-matching entity friendly names.
 
-Bug: ha_search(area_filter="salon") returned entities from unrelated
-areas because the old implementation used fuzzy matching on entity friendly
-names instead of consulting the entity/device/area registries.
+Bug: ha_search(area_filter="salon") returned entities from unrelated areas
+because the old implementation fuzzy-matched entity friendly names instead of
+consulting the registries.
+
+The tests use ``core_client`` without the component, so the search runs on the
+server's own registry resolution (``SmartSearchTools.get_entities_by_area``).
 """
 
+from typing import Any
+from unittest.mock import AsyncMock
+
 import pytest
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import floor_registry as fr
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant.common import MockConfigEntry
 
-from ha_mcp.tools.smart_search import SmartSearchTools
+from ha_mcp.client.rest_client import HomeAssistantClient, HomeAssistantConnectionError
+
+from ._core_setup import add_test_entry
+from ._search_tool import _build_ha_search
 
 
-def _ws_success(result):
-    """Wrap a result list in a successful WebSocket response."""
-    return {"success": True, "result": result}
-
-
-class MockClientWithRegistries:
-    """Mock Home Assistant client that returns configurable registry data."""
-
-    def __init__(
-        self,
-        entities: list[dict],
-        areas: list[dict] | None = None,
-        entity_registry: list[dict] | None = None,
-        device_registry: list[dict] | None = None,
-    ):
-        self.entities = entities
-        self.areas = areas or []
-        self.entity_registry = entity_registry or []
-        self.device_registry = device_registry or []
-        self.base_url = "http://localhost:8123"
-
-    async def get_states(self) -> list[dict]:
-        return self.entities
-
-    async def get_config(self) -> dict:
-        return {"version": "2026.1.0"}
-
-    async def send_websocket_message(self, message: dict) -> dict:
-        msg_type = message.get("type", "")
-        if msg_type == "config/area_registry/list":
-            return _ws_success(self.areas)
-        elif msg_type == "config/entity_registry/list":
-            return _ws_success(self.entity_registry)
-        elif msg_type == "config/device_registry/list":
-            return _ws_success(self.device_registry)
-        return {"success": False, "error": {"code": "unknown_command"}}
+@pytest.fixture(autouse=True)
+async def registry_commands(hass: HomeAssistant) -> None:
+    """``config`` answers the registry list commands the search reads."""
+    assert await async_setup_component(hass, "config", {})
 
 
 @pytest.fixture
-def two_area_setup():
-    """Setup with two areas: 'salon' and 'abc', each with distinct entities.
+def config_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """The config entry the test devices belong to."""
+    return add_test_entry(hass)
 
-    This reproduces the exact scenario from issue #504:
-    - Area 'salon' has a light entity
-    - Area 'abc' has a climate entity (assigned via device)
-    - Searching for area 'salon' must NOT return climate.abc
+
+def _add_entity(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    entity_id: str,
+    *,
+    friendly_name: str,
+    area_id: str | None = None,
+    device_id: str | None = None,
+) -> None:
+    """Register ``entity_id`` (optionally on a device / in an area) with a state."""
+    domain, object_id = entity_id.split(".")
+    entry = entity_registry.async_get_or_create(
+        domain,
+        "test",
+        object_id,
+        suggested_object_id=object_id,
+        device_id=device_id,
+        # Core lets a device's entity hold an area of its own only when it
+        # has a name of its own.
+        original_name=friendly_name,
+    )
+    assert entry.entity_id == entity_id
+    if area_id is not None:
+        entity_registry.async_update_entity(entity_id, area_id=area_id)
+    hass.states.async_set(entity_id, "on", {"friendly_name": friendly_name})
+
+
+def _add_device(
+    device_registry: dr.DeviceRegistry,
+    config_entry: MockConfigEntry,
+    identifier: str,
+    *,
+    area_id: str | None = None,
+) -> str:
+    """Register a device, optionally placed in ``area_id``; return its id."""
+    device = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id, identifiers={("test", identifier)}
+    )
+    if area_id is not None:
+        device_registry.async_update_device(device.id, area_id=area_id)
+    return device.id
+
+
+async def _search(
+    client: HomeAssistantClient, area_filter: str, **kwargs: Any
+) -> dict[str, Any]:
+    result: dict[str, Any] = await _build_ha_search(client)(
+        area_filter=area_filter, **kwargs
+    )
+    return result
+
+
+def _ids(result: dict[str, Any]) -> set[str]:
+    return {row["entity_id"] for row in result["entities"]}
+
+
+def _warnings(result: dict[str, Any]) -> list[str]:
+    warnings: list[str] = result.get("warnings", [])
+    return warnings
+
+
+@pytest.fixture
+def salon_and_abc(
+    hass: HomeAssistant,
+    area_registry: ar.AreaRegistry,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry: MockConfigEntry,
+) -> None:
+    """The issue #504 home.
+
+    ``light.salon_lamp`` is in Salon directly, ``climate.abc`` is in ABC
+    through its thermostat device, and ``sensor.outdoor_temp`` has no area but
+    a friendly name that mentions Salon, so a friendly-name match would return
+    it for "salon".
     """
-    areas = [
-        {"area_id": "salon", "name": "Salon"},
-        {"area_id": "abc", "name": "ABC"},
-    ]
-
-    entities = [
-        {
-            "entity_id": "light.salon_lamp",
-            "attributes": {"friendly_name": "Salon Lamp"},
-            "state": "on",
-        },
-        {
-            "entity_id": "climate.abc",
-            "attributes": {"friendly_name": "Climatisation ABC"},
-            "state": "heat",
-        },
-        {
-            "entity_id": "sensor.outdoor_temp",
-            "attributes": {"friendly_name": "Outdoor Temperature"},
-            "state": "15.2",
-        },
-    ]
-
-    entity_registry = [
-        # light.salon_lamp directly assigned to salon area
-        {"entity_id": "light.salon_lamp", "area_id": "salon", "device_id": None},
-        # climate.abc assigned to area via device (no direct area_id)
-        {
-            "entity_id": "climate.abc",
-            "area_id": None,
-            "device_id": "device_abc_thermostat",
-        },
-        # sensor has no area at all
-        {"entity_id": "sensor.outdoor_temp", "area_id": None, "device_id": None},
-    ]
-
-    device_registry = [
-        {"id": "device_abc_thermostat", "area_id": "abc"},
-    ]
-
-    return {
-        "areas": areas,
-        "entities": entities,
-        "entity_registry": entity_registry,
-        "device_registry": device_registry,
-    }
+    salon = area_registry.async_create("Salon")
+    abc = area_registry.async_create("ABC")
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.salon_lamp",
+        friendly_name="Salon Lamp",
+        area_id=salon.id,
+    )
+    thermostat = _add_device(
+        device_registry, config_entry, "thermostat", area_id=abc.id
+    )
+    _add_entity(
+        hass,
+        entity_registry,
+        "climate.abc",
+        friendly_name="Climatisation ABC",
+        device_id=thermostat,
+    )
+    _add_entity(
+        hass,
+        entity_registry,
+        "sensor.outdoor_temp",
+        friendly_name="Salon Window Outdoor Temperature",
+    )
 
 
-class TestAreaFilterAccuracy:
-    """Test that area filtering uses registries and returns only correct entities."""
+@pytest.mark.usefixtures("salon_and_abc")
+async def test_area_filter_returns_only_entities_placed_in_that_area(
+    core_client: HomeAssistantClient,
+) -> None:
+    """Issue #504: "salon" must not return another area's entity, nor an
+    unplaced entity whose friendly name merely mentions Salon."""
+    result = await _search(core_client, "salon")
 
-    @pytest.mark.asyncio
-    async def test_area_filter_excludes_other_areas(self, two_area_setup):
-        """Issue #504: searching for 'salon' must NOT return entities from area 'abc'."""
-        client = MockClientWithRegistries(
-            entities=two_area_setup["entities"],
-            areas=two_area_setup["areas"],
-            entity_registry=two_area_setup["entity_registry"],
-            device_registry=two_area_setup["device_registry"],
+    assert result["area_names"] == ["Salon"]
+    assert _ids(result) == {"light.salon_lamp"}
+
+
+@pytest.mark.usefixtures("salon_and_abc")
+async def test_entity_without_own_area_is_found_through_its_device_area(
+    core_client: HomeAssistantClient,
+) -> None:
+    """An entity placed only through its device is listed under the device's area."""
+    result = await _search(core_client, "abc")
+
+    assert result["area_names"] == ["ABC"]
+    assert _ids(result) == {"climate.abc"}
+
+
+def _child_device_sensor(
+    hass: HomeAssistant,
+    area_registry: ar.AreaRegistry,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry: MockConfigEntry,
+    *,
+    entity_area_id: str | None,
+) -> None:
+    """``sensor.child`` on a child device whose parent is in Office."""
+    office = area_registry.async_create("Office")
+    parent = _add_device(device_registry, config_entry, "parent", area_id=office.id)
+    child = device_registry.async_get_or_create_child(
+        config_entry_id=config_entry.entry_id,
+        identifiers={("test", "child")},
+        parent_device_id=parent,
+    )
+    _add_entity(
+        hass,
+        entity_registry,
+        "sensor.child",
+        friendly_name="Child Sensor",
+        area_id=entity_area_id,
+        device_id=child.id,
+    )
+
+
+async def test_entity_on_child_device_is_found_through_parent_device_area(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry: MockConfigEntry,
+) -> None:
+    """A child device with no area of its own sits in its parent's area, so
+    its entities are found by that area."""
+    _child_device_sensor(
+        hass,
+        area_registry,
+        device_registry,
+        entity_registry,
+        config_entry,
+        entity_area_id=None,
+    )
+
+    result = await _search(core_client, "office")
+
+    assert _ids(result) == {"sensor.child"}
+
+
+async def test_empty_entity_area_blocks_fallback_to_device_area(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry: MockConfigEntry,
+) -> None:
+    """An entity whose own area_id is present but empty (Core's registry and
+    its update command both store ``""``) is not silently placed in its
+    device's area."""
+    _child_device_sensor(
+        hass,
+        area_registry,
+        device_registry,
+        entity_registry,
+        config_entry,
+        entity_area_id="",
+    )
+
+    result = await _search(core_client, "office")
+
+    assert result["area_names"] == ["Office"]
+    assert _ids(result) == set()
+
+
+async def test_entity_own_area_overrides_its_device_area(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry: MockConfigEntry,
+) -> None:
+    """An entity moved to another room than its device is found in its own room
+    only."""
+    salon = area_registry.async_create("Salon")
+    bedroom = area_registry.async_create("Bedroom")
+    device = _add_device(device_registry, config_entry, "device_1", area_id=bedroom.id)
+    _add_entity(
+        hass,
+        entity_registry,
+        "sensor.device_temp",
+        friendly_name="Device Temp",
+        area_id=salon.id,
+        device_id=device,
+    )
+
+    salon_result = await _search(core_client, "salon")
+    bedroom_result = await _search(core_client, "bedroom")
+
+    assert _ids(salon_result) == {"sensor.device_temp"}
+    assert bedroom_result["area_names"] == ["Bedroom"]
+    assert _ids(bedroom_result) == set()
+
+
+@pytest.mark.parametrize(
+    "area_query",
+    [
+        pytest.param("MASTER BEDROOM", id="name-in-other-case"),
+        # The id ha_list_floors_areas reports.
+        pytest.param("master_bedroom", id="area-id"),
+        pytest.param("Chambre", id="area-alias"),
+    ],
+)
+async def test_exact_area_reference_does_not_pull_in_similar_areas(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+    area_query: str,
+) -> None:
+    """An area's exact name (in whatever case), id or alias selects that area
+    alone, not every area whose name, id or alias contains it."""
+    bedroom = area_registry.async_create("Master Bedroom", aliases={"Chambre"})
+    closet = area_registry.async_create(
+        "Master Bedroom Closet", aliases={"Chambre placard"}
+    )
+    assert bedroom.id == "master_bedroom"
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.bedroom",
+        friendly_name="Bedroom Light",
+        area_id=bedroom.id,
+    )
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.closet",
+        friendly_name="Closet Light",
+        area_id=closet.id,
+    )
+
+    result = await _search(core_client, area_query)
+
+    assert result["area_names"] == ["Master Bedroom"]
+    assert _ids(result) == {"light.bedroom"}
+
+
+async def test_unknown_area_returns_no_entities(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """An area that does not exist matches nothing rather than a nearby area."""
+    for name in ("Living Room", "Kitchen"):
+        area = area_registry.async_create(name)
+        _add_entity(
+            hass,
+            entity_registry,
+            f"light.{area.id}",
+            friendly_name=f"{name} Light",
+            area_id=area.id,
         )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
 
-        result = await tools.get_entities_by_area("salon")
+    result = await _search(core_client, "garage")
 
-        assert result["total_areas_found"] == 1
-        assert result["total_entities"] == 1
-
-        # Should only contain salon area
-        assert "salon" in result["areas"]
-        assert "abc" not in result["areas"]
-
-        # Should only contain the salon lamp, not climate.abc
-        salon_area = result["areas"]["salon"]
-        all_entity_ids = []
-        for domain_entities in salon_area["entities"].values():
-            all_entity_ids.extend([e["entity_id"] for e in domain_entities])
-
-        assert "light.salon_lamp" in all_entity_ids
-        assert "climate.abc" not in all_entity_ids
-
-    @pytest.mark.asyncio
-    async def test_area_filter_returns_abc_area(self, two_area_setup):
-        """Searching for 'abc' returns only entities in area 'abc'."""
-        client = MockClientWithRegistries(
-            entities=two_area_setup["entities"],
-            areas=two_area_setup["areas"],
-            entity_registry=two_area_setup["entity_registry"],
-            device_registry=two_area_setup["device_registry"],
-        )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        result = await tools.get_entities_by_area("abc")
-
-        assert result["total_areas_found"] == 1
-        assert "abc" in result["areas"]
-        assert "salon" not in result["areas"]
-
-        abc_area = result["areas"]["abc"]
-        all_entity_ids = []
-        for domain_entities in abc_area["entities"].values():
-            all_entity_ids.extend([e["entity_id"] for e in domain_entities])
-
-        assert "climate.abc" in all_entity_ids
-        assert "light.salon_lamp" not in all_entity_ids
-
-    @pytest.mark.asyncio
-    async def test_device_area_inheritance(self, two_area_setup):
-        """Entities inherit area from their device when no direct area assignment."""
-        client = MockClientWithRegistries(
-            entities=two_area_setup["entities"],
-            areas=two_area_setup["areas"],
-            entity_registry=two_area_setup["entity_registry"],
-            device_registry=two_area_setup["device_registry"],
-        )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        result = await tools.get_entities_by_area("abc")
-
-        # climate.abc should be found via device_abc_thermostat -> area "abc"
-        assert result["total_entities"] == 1
-        abc_area = result["areas"]["abc"]
-        all_entity_ids = []
-        for domain_entities in abc_area["entities"].values():
-            all_entity_ids.extend([e["entity_id"] for e in domain_entities])
-        assert "climate.abc" in all_entity_ids
-
-    @pytest.mark.asyncio
-    async def test_unassigned_entities_excluded(self, two_area_setup):
-        """Entities without any area assignment are not returned."""
-        client = MockClientWithRegistries(
-            entities=two_area_setup["entities"],
-            areas=two_area_setup["areas"],
-            entity_registry=two_area_setup["entity_registry"],
-            device_registry=two_area_setup["device_registry"],
-        )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        # Check salon
-        salon_result = await tools.get_entities_by_area("salon")
-        salon_ids = []
-        for domain_entities in salon_result["areas"]["salon"]["entities"].values():
-            salon_ids.extend([e["entity_id"] for e in domain_entities])
-        assert "sensor.outdoor_temp" not in salon_ids
-
-        # Check abc
-        abc_result = await tools.get_entities_by_area("abc")
-        abc_ids = []
-        for domain_entities in abc_result["areas"]["abc"]["entities"].values():
-            abc_ids.extend([e["entity_id"] for e in domain_entities])
-        assert "sensor.outdoor_temp" not in abc_ids
+    assert result["area_names"] == []
+    assert _ids(result) == set()
 
 
-class TestAreaMatchingLogic:
-    """Test fuzzy matching on area names/IDs."""
+@pytest.fixture
+def basement(
+    hass: HomeAssistant,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+    floor_registry: fr.FloorRegistry,
+) -> None:
+    """Floor Sous-sol (alias "Cave level") holds Couloir Sous-Sol and Cave.
 
-    @pytest.fixture
-    def multi_area_setup(self):
-        areas = [
-            {"area_id": "living_room", "name": "Living Room"},
-            {"area_id": "bedroom_main", "name": "Main Bedroom"},
-            {"area_id": "kitchen", "name": "Kitchen"},
-        ]
-        entities = [
-            {
-                "entity_id": "light.living_light",
-                "attributes": {"friendly_name": "Living Room Light"},
-                "state": "on",
-            },
-            {
-                "entity_id": "light.bedroom_light",
-                "attributes": {"friendly_name": "Main Bedroom Light"},
-                "state": "off",
-            },
-            {
-                "entity_id": "light.kitchen_light",
-                "attributes": {"friendly_name": "Kitchen Light"},
-                "state": "on",
-            },
-        ]
-        entity_registry = [
-            {
-                "entity_id": "light.living_light",
-                "area_id": "living_room",
-                "device_id": None,
-            },
-            {
-                "entity_id": "light.bedroom_light",
-                "area_id": "bedroom_main",
-                "device_id": None,
-            },
-            {
-                "entity_id": "light.kitchen_light",
-                "area_id": "kitchen",
-                "device_id": None,
-            },
-        ]
-        return {
-            "areas": areas,
-            "entities": entities,
-            "entity_registry": entity_registry,
-            "device_registry": [],
-        }
-
-    @pytest.mark.asyncio
-    async def test_exact_area_name_match(self, multi_area_setup):
-        """Exact area name match works."""
-        client = MockClientWithRegistries(
-            entities=multi_area_setup["entities"],
-            areas=multi_area_setup["areas"],
-            entity_registry=multi_area_setup["entity_registry"],
-            device_registry=multi_area_setup["device_registry"],
-        )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        result = await tools.get_entities_by_area("Kitchen")
-
-        assert result["total_areas_found"] == 1
-        assert "kitchen" in result["areas"]
-
-    @pytest.mark.asyncio
-    async def test_case_insensitive_area_match(self, multi_area_setup):
-        """Area matching is case-insensitive."""
-        client = MockClientWithRegistries(
-            entities=multi_area_setup["entities"],
-            areas=multi_area_setup["areas"],
-            entity_registry=multi_area_setup["entity_registry"],
-            device_registry=multi_area_setup["device_registry"],
-        )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        result = await tools.get_entities_by_area("kitchen")
-
-        assert result["total_areas_found"] == 1
-        assert "kitchen" in result["areas"]
-
-    @pytest.mark.asyncio
-    async def test_no_matching_area_returns_empty_with_suggestions(
-        self, multi_area_setup
+    Garage on the Ground floor shows an expansion stays on its floor; Couloir
+    Sous-Sol's name contains the floor's name, the shape that made a floor
+    query resolve to that single area.
+    """
+    sous_sol = floor_registry.async_create("Sous-sol", aliases={"Cave level"})
+    ground = floor_registry.async_create("Ground")
+    for name, floor_id, entity_id in (
+        ("Couloir Sous-Sol", sous_sol.floor_id, "light.basement_hall"),
+        ("Cave", sous_sol.floor_id, "light.cave_lamp"),
+        ("Garage", ground.floor_id, "light.garage_lamp"),
     ):
-        """Non-matching area returns empty results with available areas."""
-        client = MockClientWithRegistries(
-            entities=multi_area_setup["entities"],
-            areas=multi_area_setup["areas"],
-            entity_registry=multi_area_setup["entity_registry"],
-            device_registry=multi_area_setup["device_registry"],
+        area = area_registry.async_create(name, floor_id=floor_id)
+        _add_entity(
+            hass, entity_registry, entity_id, friendly_name=name, area_id=area.id
         )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        result = await tools.get_entities_by_area("garage")
-
-        assert result["total_areas_found"] == 0
-        assert result["total_entities"] == 0
-        assert result["areas"] == {}
-        # Should include available areas
-        available = result["available_areas"]
-        area_ids = [a["area_id"] for a in available]
-        assert "living_room" in area_ids
-        assert "kitchen" in area_ids
 
 
-class TestAreaFilterGroupByDomain:
-    """Test domain grouping in area results."""
+_WHOLE_BASEMENT = {"light.basement_hall", "light.cave_lamp"}
 
-    @pytest.mark.asyncio
-    async def test_grouped_by_domain(self):
-        """Results are correctly grouped by domain when requested."""
-        areas = [{"area_id": "salon", "name": "Salon"}]
-        entities = [
-            {
-                "entity_id": "light.salon_light",
-                "attributes": {"friendly_name": "Salon Light"},
-                "state": "on",
-            },
-            {
-                "entity_id": "switch.salon_switch",
-                "attributes": {"friendly_name": "Salon Switch"},
-                "state": "off",
-            },
-            {
-                "entity_id": "sensor.salon_temp",
-                "attributes": {"friendly_name": "Salon Temperature"},
-                "state": "21",
-            },
-        ]
-        entity_registry = [
-            {"entity_id": "light.salon_light", "area_id": "salon", "device_id": None},
-            {"entity_id": "switch.salon_switch", "area_id": "salon", "device_id": None},
-            {"entity_id": "sensor.salon_temp", "area_id": "salon", "device_id": None},
-        ]
-        client = MockClientWithRegistries(
-            entities=entities,
-            areas=areas,
-            entity_registry=entity_registry,
+
+@pytest.mark.usefixtures("basement")
+@pytest.mark.parametrize("floor_query", ["sous-sol", "sous_sol"])
+async def test_floor_name_or_id_expands_to_every_area_on_the_floor(
+    core_client: HomeAssistantClient, floor_query: str
+) -> None:
+    """A floor's name or id lists every area on that floor, not just the one
+    area whose name contains the floor's name, and is not reported as a guess."""
+    result = await _search(core_client, floor_query)
+
+    assert set(result["area_names"]) == {"Couloir Sous-Sol", "Cave"}
+    assert _ids(result) == _WHOLE_BASEMENT
+    assert any(
+        "is a floor, not an area — expanded to 2 area(s)" in warning
+        for warning in _warnings(result)
+    )
+    assert not any("close spelling" in w for w in _warnings(result))
+
+
+@pytest.mark.usefixtures("basement")
+async def test_floor_alias_shared_by_two_floors_expands_both(
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+    floor_registry: fr.FloorRegistry,
+    hass: HomeAssistant,
+) -> None:
+    """An exact floor alias expands like the floor's name, and when two floors
+    share it, both are expanded and the warning names each floor."""
+    lower = floor_registry.async_create("Lower level", aliases={"Cave level"})
+    lower_room = area_registry.async_create("Lower room", floor_id=lower.floor_id)
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.lower_lamp",
+        friendly_name="Lower Lamp",
+        area_id=lower_room.id,
+    )
+
+    result = await _search(core_client, "Cave level")
+
+    assert _ids(result) == {*_WHOLE_BASEMENT, "light.lower_lamp"}
+    warning = next(w for w in _warnings(result) if "expanded" in w)
+    assert "Sous-sol" in warning
+    assert "Lower level" in warning
+
+
+@pytest.mark.usefixtures("basement")
+async def test_area_alias_equal_to_floor_name_selects_the_area_with_warning(
+    core_client: HomeAssistantClient, area_registry: ar.AreaRegistry
+) -> None:
+    """A name that is both an area alias and a floor name resolves to the area,
+    and says the floor was passed over."""
+    area_registry.async_update("couloir_sous_sol", aliases={"Sous-sol"})
+
+    result = await _search(core_client, "Sous-sol")
+
+    assert _ids(result) == {"light.basement_hall"}
+    assert any("matches both an area and a floor" in w for w in _warnings(result))
+
+
+@pytest.mark.usefixtures("basement")
+async def test_area_id_equal_to_floor_id_selects_the_area_with_warning(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """An area whose id is also a floor's id wins over that floor."""
+    stairs = area_registry.async_create("Sous sol")
+    assert stairs.id == "sous_sol"  # the floor "Sous-sol" has this id too
+    _add_entity(
+        hass, entity_registry, "light.stairs", friendly_name="Stairs", area_id=stairs.id
+    )
+
+    result = await _search(core_client, "sous_sol")
+
+    assert _ids(result) == {"light.stairs"}
+    assert any("matches both an area and a floor" in w for w in _warnings(result))
+
+
+@pytest.mark.usefixtures("basement")
+async def test_misspelled_floor_expands_to_every_area_on_the_floor(
+    core_client: HomeAssistantClient,
+) -> None:
+    """A close spelling of a whole floor name expands that floor instead of
+    returning the one area whose name contains it."""
+    result = await _search(core_client, "sous-sl")
+
+    assert _ids(result) == _WHOLE_BASEMENT
+    assert any("close spelling" in w for w in _warnings(result))
+
+
+@pytest.mark.usefixtures("basement")
+async def test_misspelled_area_name_stays_one_area_despite_containing_floor(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """A misspelling close to the floor's name but closer to an area's name
+    selects that area, not the whole floor."""
+    east = area_registry.async_create("Sous-sol Est", floor_id="sous_sol")
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.cellar_east",
+        friendly_name="Cellar East",
+        area_id=east.id,
+    )
+
+    result = await _search(core_client, "Sous-sol Es")
+
+    assert _ids(result) == {"light.cellar_east"}
+    assert not any("is a floor" in w for w in _warnings(result))
+
+
+async def test_misspelling_close_to_two_floors_expands_neither(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+    floor_registry: fr.FloorRegistry,
+) -> None:
+    """A spelling equally close to two floors returns nothing and names both
+    floors, instead of expanding the two of them."""
+    for wing in ("East", "West"):
+        floor = floor_registry.async_create(f"{wing} Wing")
+        room = area_registry.async_create(f"{wing} room", floor_id=floor.floor_id)
+        _add_entity(
+            hass,
+            entity_registry,
+            f"light.{room.id}",
+            friendly_name=f"{wing} Lamp",
+            area_id=room.id,
         )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
 
-        result = await tools.get_entities_by_area("salon", group_by_domain=True)
+    result = await _search(core_client, "st Wing")
 
-        salon_entities = result["areas"]["salon"]["entities"]
-        assert isinstance(salon_entities, dict)  # grouped by domain
-        assert "light" in salon_entities
-        assert "switch" in salon_entities
-        assert "sensor" in salon_entities
-        assert len(salon_entities["light"]) == 1
-        assert salon_entities["light"][0]["entity_id"] == "light.salon_light"
+    assert result["area_names"] == []
+    assert _ids(result) == set()
+    warning = next(w for w in _warnings(result) if "ambiguously" in w)
+    assert "East Wing" in warning
+    assert "West Wing" in warning
 
-    @pytest.mark.asyncio
-    async def test_flat_list_without_grouping(self):
-        """Results are a flat list when group_by_domain=False."""
-        areas = [{"area_id": "salon", "name": "Salon"}]
-        entities = [
-            {
-                "entity_id": "light.salon_light",
-                "attributes": {"friendly_name": "Salon Light"},
-                "state": "on",
-            },
-            {
-                "entity_id": "switch.salon_switch",
-                "attributes": {"friendly_name": "Salon Switch"},
-                "state": "off",
-            },
-        ]
-        entity_registry = [
-            {"entity_id": "light.salon_light", "area_id": "salon", "device_id": None},
-            {"entity_id": "switch.salon_switch", "area_id": "salon", "device_id": None},
-        ]
-        client = MockClientWithRegistries(
-            entities=entities,
-            areas=areas,
-            entity_registry=entity_registry,
+
+async def test_floor_with_an_empty_name_is_named_by_its_id(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+    floor_registry: fr.FloorRegistry,
+) -> None:
+    """Core lets a floor be renamed to an empty name, keeping its id; the
+    expansion warning still says which floor was expanded, by that id."""
+    floor = floor_registry.async_create("Attic")
+    floor_registry.async_update(floor.floor_id, name="")
+    room = area_registry.async_create("Attic room", floor_id=floor.floor_id)
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.attic_lamp",
+        friendly_name="Attic Lamp",
+        area_id=room.id,
+    )
+
+    result = await _search(core_client, floor.floor_id)
+
+    assert _ids(result) == {"light.attic_lamp"}
+    warning = next(w for w in _warnings(result) if "expanded" in w)
+    assert f"({floor.floor_id})" in warning
+
+
+async def test_area_listing_is_grouped_by_domain_only_when_asked(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """``group_by_domain=True`` buckets an area's entities by domain; without it
+    they stay one flat list."""
+    salon = area_registry.async_create("Salon")
+    salon_ids = {"light.salon_light", "switch.salon_switch", "sensor.salon_temp"}
+    for entity_id in salon_ids:
+        _add_entity(
+            hass, entity_registry, entity_id, friendly_name=entity_id, area_id=salon.id
         )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
 
-        result = await tools.get_entities_by_area("salon", group_by_domain=False)
+    grouped = await _search(core_client, "salon", group_by_domain=True)
+    flat = await _search(core_client, "salon", group_by_domain=False)
 
-        salon_entities = result["areas"]["salon"]["entities"]
-        assert isinstance(salon_entities, list)  # flat list
-        entity_ids = [e["entity_id"] for e in salon_entities]
-        assert "light.salon_light" in entity_ids
-        assert "switch.salon_switch" in entity_ids
-
-
-class TestEntityDirectAreaOverride:
-    """Test that entity-level area_id takes priority over device-level area_id."""
-
-    @pytest.mark.asyncio
-    async def test_entity_area_overrides_device_area(self):
-        """Entity's direct area assignment takes priority over device area."""
-        areas = [
-            {"area_id": "salon", "name": "Salon"},
-            {"area_id": "bedroom", "name": "Bedroom"},
-        ]
-        entities = [
-            {
-                "entity_id": "sensor.device_temp",
-                "attributes": {"friendly_name": "Device Temp"},
-                "state": "22",
-            },
-        ]
-        # Entity is directly assigned to salon, but device is in bedroom
-        entity_registry = [
-            {
-                "entity_id": "sensor.device_temp",
-                "area_id": "salon",
-                "device_id": "device_1",
-            },
-        ]
-        device_registry = [
-            {"id": "device_1", "area_id": "bedroom"},
-        ]
-        client = MockClientWithRegistries(
-            entities=entities,
-            areas=areas,
-            entity_registry=entity_registry,
-            device_registry=device_registry,
-        )
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        # Should be in salon (entity override), not bedroom (device)
-        salon_result = await tools.get_entities_by_area("salon")
-        assert salon_result["total_entities"] == 1
-
-        bedroom_result = await tools.get_entities_by_area("bedroom")
-        assert bedroom_result["total_entities"] == 0
+    assert {
+        domain: {row["entity_id"] for row in rows}
+        for domain, rows in grouped["by_domain"].items()
+    } == {
+        "light": {"light.salon_light"},
+        "switch": {"switch.salon_switch"},
+        "sensor": {"sensor.salon_temp"},
+    }
+    assert "by_domain" not in flat
+    assert _ids(flat) == salon_ids
 
 
-class TestRegistryFailureGracefulDegradation:
-    """Test behavior when registry calls fail."""
+async def test_unreachable_registries_return_no_entities_and_say_why(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    area_registry: ar.AreaRegistry,
+    entity_registry: er.EntityRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the WebSocket gone, an area search answers with no entities instead
+    of failing, and warns that the registries were not read, so the empty
+    answer is not taken for an empty area."""
+    salon = area_registry.async_create("Salon")
+    _add_entity(
+        hass,
+        entity_registry,
+        "light.salon_lamp",
+        friendly_name="Salon Lamp",
+        area_id=salon.id,
+    )
+    monkeypatch.setattr(
+        core_client,
+        "send_websocket_message",
+        AsyncMock(side_effect=HomeAssistantConnectionError("WebSocket unavailable")),
+    )
 
-    @pytest.mark.asyncio
-    async def test_all_registries_fail_returns_empty(self):
-        """When all registry calls fail, returns empty results gracefully."""
+    result = await _search(core_client, "salon")
 
-        class FailingClient:
-            base_url = "http://localhost:8123"
-
-            async def get_states(self):
-                return [
-                    {
-                        "entity_id": "light.test",
-                        "attributes": {"friendly_name": "Test"},
-                        "state": "on",
-                    },
-                ]
-
-            async def get_config(self):
-                return {}
-
-            async def send_websocket_message(self, message):
-                raise ConnectionError("WebSocket unavailable")
-
-        client = FailingClient()
-        tools = SmartSearchTools(client=client, fuzzy_threshold=60)
-
-        result = await tools.get_entities_by_area("salon")
-
-        # Should return empty, not crash
-        assert result["total_areas_found"] == 0
-        assert result["total_entities"] == 0
+    assert _ids(result) == set()
+    assert any("area registry" in w for w in _warnings(result))

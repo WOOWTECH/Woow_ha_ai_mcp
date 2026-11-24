@@ -32,18 +32,18 @@ The simplest method - no installation required, no virtual environments, just ru
 
 ```bash
 # Run dev version directly
-uvx ha-mcp-dev
+uvx --python 3.14 ha-mcp-dev
 ```
 
 **Check version:**
 ```bash
-uvx ha-mcp-dev --version
+uvx --python 3.14 ha-mcp-dev --version
 # Output: ha-mcp 6.3.1.dev140
 ```
 
 **Switch back to stable:**
 ```bash
-uvx ha-mcp
+uvx --python 3.14 ha-mcp
 ```
 
 **Config changes required:** None. Uses the same `HOMEASSISTANT_URL` and `HOMEASSISTANT_TOKEN` environment variables.
@@ -114,9 +114,15 @@ Every dev build is also published under an immutable `:dev-<sha>` tag (the short
 docker pull ghcr.io/homeassistant-ai/ha-mcp:dev-a1b2c3d
 ```
 
+These commands mount `ha-mcp-dev-data` rather than the `ha-mcp-data` volume the
+stable recipes use, so trying a dev build never writes to the settings your
+stable install depends on — a dev build can persist data a released version
+doesn't expect to read back.
+
 **Run in stdio mode (Claude Desktop):**
 ```bash
 docker run --rm -i \
+  -v ha-mcp-dev-data:/home/mcpuser/.ha-mcp \
   -e HOMEASSISTANT_URL=http://your-ha-instance:8123 \
   -e HOMEASSISTANT_TOKEN=your_token \
   ghcr.io/homeassistant-ai/ha-mcp:dev
@@ -125,6 +131,7 @@ docker run --rm -i \
 **Run in HTTP mode (web clients):**
 ```bash
 docker run -d -p 8086:8086 \
+  -v ha-mcp-dev-data:/home/mcpuser/.ha-mcp \
   -e HOMEASSISTANT_URL=http://your-ha-instance:8123 \
   -e HOMEASSISTANT_TOKEN=your_token \
   ghcr.io/homeassistant-ai/ha-mcp:dev ha-mcp-web
@@ -142,20 +149,20 @@ docker pull ghcr.io/homeassistant-ai/ha-mcp:latest
 # Stop your dev container and start a new one with :latest tag
 ```
 
-### Home Assistant Add-on
+### Home Assistant app (add-on)
 
-The dev channel is available as a **separate add-on** in the Home Assistant add-on store.
+The dev channel is available as a **separate app (add-on)** in the Home Assistant App store.
 
 **To use the dev channel:**
 
 1. Open Home Assistant
-2. Go to **Settings** → **Add-ons** → **Add-on Store**
+2. Go to **Settings** → **Apps** → **Install app** (**Settings** → **Add-ons** → **Add-on store** before Home Assistant 2026.2)
 3. Search for **"Home Assistant MCP Server (Dev)"**
 4. Click **Install**
 5. Configure with your token (if not using auto-discovery)
-6. Start the add-on
+6. Start the app
 
-**Key differences from stable add-on:**
+**Key differences from stable app:**
 
 | Property | Stable | Dev |
 |----------|--------|-----|
@@ -164,9 +171,9 @@ The dev channel is available as a **separate add-on** in the Home Assistant add-
 | **Stage** | Stable | Experimental |
 | **Updates** | Biweekly (Wednesday) | Every master push |
 
-**Can I run both?** Yes! Both add-ons can be installed simultaneously. They use different slugs and configuration.
+**Can I run both?** Yes! Both apps can be installed simultaneously. They use different slugs and configuration.
 
-**Switch back to stable:** Simply stop the dev add-on and start/install the stable "Home Assistant MCP Server" add-on instead.
+**Switch back to stable:** Simply stop the dev app and start/install the stable "Home Assistant MCP Server" app instead.
 
 ### Claude Desktop Configuration
 
@@ -183,7 +190,7 @@ If you're using Claude Desktop, update your `claude_desktop_config.json`:
   "mcpServers": {
     "ha-mcp": {
       "command": "uvx",
-      "args": ["ha-mcp-dev"],
+      "args": ["--python", "3.14", "ha-mcp-dev"],
       "env": {
         "HOMEASSISTANT_URL": "http://your-ha-instance:8123",
         "HOMEASSISTANT_TOKEN": "your_token"
@@ -203,7 +210,7 @@ The easiest way to check your version:
 
 ```bash
 # With uvx
-uvx ha-mcp-dev --version
+uvx --python 3.14 ha-mcp-dev --version
 
 # With pip
 pip show ha-mcp-dev | grep Version
@@ -225,7 +232,7 @@ If you encounter issues with a dev release:
 2. **Check if the issue exists in stable** - Try the [latest stable release](https://github.com/homeassistant-ai/ha-mcp/releases/latest) to confirm it's dev-specific
 3. **Report the issue:**
    - If it's a regression (worked in stable, broken in dev), comment on the related PR or issue
-   - If it's a new bug, [open a bug report](https://github.com/homeassistant-ai/ha-mcp/issues/new?template=bug_report.md) and include:
+   - If it's a new bug, [open a bug report](https://github.com/homeassistant-ai/ha-mcp/issues/new?template=runtime_bug.yml) and include:
      - The dev version number
      - Whether it reproduces in stable
      - Steps to reproduce

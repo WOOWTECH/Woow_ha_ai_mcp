@@ -1,14 +1,15 @@
 """Load skill reference files from the bundled skills-vendor directory.
 
-Shared helper for the consolidated ``ha_get_skill_guide`` tool and the
-write-tool ``MandatoryBPS`` parameter. Mirrors the symlink + path-traversal
-guards in ``server.py::_handle_skill_guide_call`` so any caller that needs to
-read a ``(skill, file)`` pair gets the same safety contract.
+Helper behind the write-tool ``MandatoryBPS`` parameter. Refuses symlinks
+and paths that resolve outside the skill directory, so any caller that needs
+to read a ``(skill, file)`` pair gets that safety contract.
 
 Functions:
 
 * :func:`get_skills_dir` — returns the on-disk skills root when the vendor
   submodule is present, else ``None``.
+* :func:`list_skills` — the bundled skills whose frontmatter parses, as
+  ``(name, dir, frontmatter)``.
 * :func:`resolve_skill_files` — reads N file refs from one skill and returns
   ``{ref: body_or_section}``. Each ref is either a bare file path
   (``"references/X.md"``) or a path with an anchor
@@ -16,8 +17,10 @@ Functions:
   matching markdown section so reactive embeds don't ship 20 KB when only
   one 2 KB section is relevant. A top-level ``#`` anchor or a section
   near EOF will return most of the file — the section runs from the
-  matching heading to the next same/higher-level heading. Silently skips
-  missing files, missing anchors, symlinks, and path-traversal attempts.
+  matching heading to the next same/higher-level heading. Skips missing
+  files, symlinks, and path-traversal attempts silently; a missing ANCHOR
+  is skipped but logged at WARNING, since that means a caller typo or a
+  vendor heading rename rather than an absent optional file.
 * :func:`extract_section` — markdown heading-based slicer used by
   ``resolve_skill_files`` and exposed for callers that already have a file
   body in hand.
@@ -25,9 +28,9 @@ Functions:
 The silent-skip contract is deliberate. Callers (write tools) attach the
 returned dict to a ``skill_content`` response field. A missing reference
 should never fail the surrounding write operation — the agent still gets
-any warnings plus whatever files did resolve. The strict-error path stays
-with ``_handle_skill_guide_call``, which must raise ``ToolError`` for the
-explicit user-requested file lookup.
+any warnings plus whatever files did resolve. The explicit
+``ha_get_skill_guide`` lookup lives in ``server.py`` and raises ``ToolError``
+instead.
 """
 
 from __future__ import annotations
@@ -36,6 +39,9 @@ import logging
 import re
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import Any
+
+import yaml  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +50,20 @@ logger = logging.getLogger(__name__)
 # (e.g. "## if/then vs choose" → "ifthen-vs-choose").
 _HEADING_LINE_RE = re.compile(r"^(#+)\s+(.+?)\s*$")
 _SLUG_STRIP = re.compile(r"[^\w\s-]")
-_SLUG_SPACES = re.compile(r"\s+")
+# One hyphen per whitespace CHARACTER, not per run. GitHub drops stripped
+# punctuation in place and leaves the spaces that flanked it, so ANY heading
+# with punctuation between spaces yields a DOUBLE hyphen — an em dash in
+# "Config-Entry Data — Blind Spots" and an ampersand in "Triggers &
+# Conditions" behave identically. Collapsing runs (`\s+`) produced a single
+# hyphen, so an anchor copied out of GitHub's own heading link matched
+# nothing. Only headings of that shape differ between the two rules; a
+# plain-word heading slugifies the same either way.
+#
+# Two anchors cited in the bundled SKILL.md were dead this way (one em dash,
+# one ampersand). The best-practice checker also emits a double-hyphen
+# anchor (`#purpose-specific-triggers--conditions-default-since-20267`), so
+# a warning's embedded section depends on this rule too.
+_SLUG_SPACES = re.compile(r"\s")
 
 
 def _slugify(heading: str) -> str:
@@ -131,6 +150,144 @@ def _skills_dir_at(root: Path) -> Path | None:
     return root if root.exists() else None
 
 
+BEST_PRACTICES_SKILL_NAME = "home-assistant-best-practices"
+
+
+def parse_skill_frontmatter(main_file: Path, *, warn: bool = True) -> dict | None:
+    """Parse YAML frontmatter from a SKILL.md file.
+
+    Returns the frontmatter dict if valid, or None with a logged
+    warning for each failure case. ``warn=False`` logs at DEBUG instead,
+    for callers that run on every request and report the failure once
+    themselves.
+    """
+    log = logger.warning if warn else logger.debug
+    try:
+        content = main_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        log("Could not read %s: %s", main_file, e)
+        return None
+
+    # Frontmatter opens on the first line and closes at the next unindented
+    # "---" line; a "---" inside a value (inline or an indented block-scalar
+    # line) or a Markdown rule in the body is not a delimiter.
+    lines = content.removeprefix("\ufeff").splitlines()
+    closing = next(
+        (i for i, line in enumerate(lines[1:], 1) if line.rstrip() == "---"), None
+    )
+    if not lines or lines[0].rstrip() != "---" or closing is None:
+        log("No valid frontmatter delimiters in %s", main_file)
+        return None
+
+    try:
+        frontmatter = yaml.safe_load("\n".join(lines[1:closing]))
+    except yaml.YAMLError as e:
+        # yaml.YAMLError exposes `.problem` and `.problem_mark` for
+        # parse errors — both are the entire debugging payload for
+        # an operator trying to fix the SKILL.md.
+        log("Could not parse YAML frontmatter in %s: %s", main_file, e)
+        return None
+
+    if not isinstance(frontmatter, dict):
+        log("Frontmatter is not a mapping in %s", main_file)
+        return None
+
+    description = frontmatter.get("description", "")
+    if not description:
+        log("No description in frontmatter for %s", main_file.parent.name)
+        return None
+    if not isinstance(description, str):
+        # Truthy non-string values (e.g. `description: [foo]` or
+        # `description: 42`) would later crash on `.strip()` in the
+        # callers. Fail closed here so malformed bundles only break
+        # themselves, not the whole skill registration.
+        log(
+            "Description in frontmatter for %s is not a string (got %s); skipping",
+            main_file.parent.name,
+            type(description).__name__,
+        )
+        return None
+
+    return frontmatter
+
+
+def list_skills(skills_dir: Path) -> list[tuple[str, Path, dict[str, Any]]]:
+    """Return parsed (name, dir, frontmatter) triples for valid bundled skills.
+
+    Skips entries that aren't directories, lack ``SKILL.md``, or whose
+    frontmatter doesn't parse. Sorted by directory name for stable
+    ordering across clients.
+    """
+    try:
+        entries = sorted(skills_dir.iterdir())
+    except OSError as e:
+        logger.warning("Could not read skills directory %s: %s", skills_dir, e)
+        return []
+
+    skills: list[tuple[str, Path, dict[str, Any]]] = []
+    for skill_dir in entries:
+        main_file = skill_dir / "SKILL.md"
+        if not skill_dir.is_dir() or not main_file.exists():
+            continue
+        frontmatter = parse_skill_frontmatter(main_file)
+        if frontmatter:
+            skills.append((skill_dir.name, skill_dir, frontmatter))
+    return skills
+
+
+def list_skill_files(skill_dir: Path, *, warn: bool = True) -> list[str]:
+    """Return relative POSIX paths of the regular files in a skill.
+
+    Symlinks are skipped (defense against a malicious skill bundle
+    linking outside its dir) and ``is_relative_to(resolved_root)``
+    rejects anything that resolves outside the skill's own tree. POSIX
+    form keeps the names equal to SKILL.md's links on Windows too.
+    ``warn`` works as in :func:`parse_skill_frontmatter`.
+    """
+    files: list[str] = []
+    try:
+        resolved_root = skill_dir.resolve()
+        for f in sorted(skill_dir.rglob("*")):
+            if not f.is_file() or f.is_symlink():
+                continue
+            if not f.resolve().is_relative_to(resolved_root):
+                continue
+            files.append(f.relative_to(skill_dir).as_posix())
+    except OSError as e:
+        (logger.warning if warn else logger.debug)(
+            "Error reading skill files in %s: %s", skill_dir, e
+        )
+    return files
+
+
+def best_practices_skill(
+    skills_dir: Path | None,
+) -> tuple[str, Path, dict[str, Any]] | None:
+    """Return the bundled best-practices skill, or None when it cannot be served.
+
+    ``ha_get_skill_guide`` registration, every guide call, and the strict
+    best-practices gate all use this one check. The gate fails open when it
+    returns None, because the guide is then unable to publish the
+    acknowledgment key. The skill counts as served only when SKILL.md is in
+    the same file list the guide serves from, so a symlinked SKILL.md or an
+    unlistable folder counts as missing. A symlinked skill folder counts as
+    missing too: every file under its target would otherwise become
+    readable. Checks run quietly because the gate runs on every gated
+    write; startup logs the reason once when it builds the instructions.
+    """
+    if skills_dir is None:
+        return None
+    skill_dir = skills_dir / BEST_PRACTICES_SKILL_NAME
+    if skill_dir.is_symlink() or "SKILL.md" not in list_skill_files(
+        skill_dir, warn=False
+    ):
+        return None
+    frontmatter = parse_skill_frontmatter(skill_dir / "SKILL.md", warn=False)
+    if not frontmatter:
+        return None
+    return (skill_dir.name, skill_dir, frontmatter)
+
+
 def get_skills_dir() -> Path | None:
     """Return the bundled skills root path, or ``None`` if not present.
 
@@ -152,15 +309,16 @@ def resolve_skill_files(
     Each entry in ``files`` is either a bare file path or a path with a
     ``#anchor`` suffix:
 
-    * ``"references/automation-patterns.md"`` → full file body.
-    * ``"references/automation-patterns.md#native-conditions"`` → only the
+    * ``"references/triggers-and-conditions.md"`` → full file body.
+    * ``"references/triggers-and-conditions.md#native-conditions"`` → only the
       markdown section whose heading slugifies to ``native-conditions``.
 
     The same file requested both bare AND anchored produces two entries
     keyed by the original request strings. Each on-disk file is read at
     most once regardless of how many sections are requested from it.
 
-    Silently skips missing files, missing anchors, symlinks, and any path
+    Skips missing files, symlinks, and path-traversal attempts
+    silently; a missing anchor is skipped but logged at WARNING.
     that escapes the skill directory. Returns an empty dict when
     ``skills_dir`` is ``None`` (vendor submodule missing), when the named
     skill doesn't exist, or when nothing resolves.
@@ -236,8 +394,7 @@ def _read_file_safely(
     candidate = skill_dir / rel_path
     # Pre-resolve symlink check: ``resolve()`` returns the canonical
     # non-symlink path, so a post-resolve ``is_symlink()`` check would
-    # always be False. Matches the guard in
-    # ``server.py::_handle_skill_guide_call``.
+    # always be False.
     if candidate.is_symlink():
         logger.warning("Refusing symlink in skill (security): %s/%s", skill, rel_path)
         return None
@@ -275,3 +432,27 @@ def _read_file_safely(
         # propagate up and fail the write the agent just committed.
         logger.warning("Skill file %s/%s is not valid UTF-8: %s", skill, rel_path, e)
         return None
+
+
+def log_skill_registration_summary(status: dict[str, str | int]) -> None:
+    """Emit one-line summary of skill registration outcome.
+
+    ``info`` when both provider and tool registered AND at least one
+    skill bundle parsed; ``warning`` otherwise. The guidance>0 gate
+    catches the "tool registered but exposes nothing" case (skills
+    directory missing, empty, or every SKILL.md fails to parse) —
+    the tool stays present so the failure is reachable via a tool
+    call, but operators should grep for this warning when a user
+    reports missing skill features.
+    """
+    provider = status.get("provider")
+    tool = status.get("tool")
+    raw_guidance = status.get("guidance_count", 0)
+    guidance = raw_guidance if isinstance(raw_guidance, int) else 0
+
+    message = "Skill system summary: provider=%s, tool=%s, guidance_count=%d"
+    args = (provider, tool, guidance)
+    if provider == "ok" and tool == "ok" and guidance > 0:
+        logger.info(message, *args)
+    else:
+        logger.warning(message, *args)

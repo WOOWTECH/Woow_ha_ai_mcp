@@ -21,7 +21,9 @@ Set ENABLED_TOOL_MODULES environment variable to filter which tools are loaded:
 import logging
 import pkgutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+from ..client.rest_client import HomeAssistantClient
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,50 @@ logger = logging.getLogger(__name__)
 EXPLICIT_MODULES = {
     "backup": "register_backup_tools",
 }
+
+
+class _ServerLike(Protocol):
+    """Structural type for the object ``ToolsRegistry`` reads tool
+    dependencies from -- matches ``HomeAssistantSmartMCPServer`` without
+    importing it, which ``server.py``'s own lazy
+    ``from .tools.registry import ToolsRegistry`` (inside its
+    ``tools_registry`` property) exists specifically to avoid a circular
+    import for.
+
+    Only ``client`` is narrowed to its real type: it is the one attribute
+    every ``register_*_tools(mcp, client, **kwargs)`` plugin function reads
+    ``.get_states()``/``.send_websocket_message()``/etc. from, and a
+    dict-shaped response from the WRONG client implementation (e.g.
+    ``HomeAssistantWebSocketClient.get_states() -> dict[str, Any]``, vs.
+    the REST client's ``list[dict[str, Any]]``) silently fails open
+    downstream instead of raising -- see
+    ``_find_group_member_conflicts`` in ``tools_service.py``.
+    ``mcp``/``smart_tools``/``device_tools`` stay ``Any``, matching their
+    own already-``Any`` typing on ``HomeAssistantSmartMCPServer`` itself.
+
+    Declared as read-only ``@property`` methods, not plain attributes: a
+    bare ``client: HomeAssistantClient`` class-level annotation implies a
+    SETTABLE member, which ``HomeAssistantSmartMCPServer.client`` (a
+    getter-only ``@property``, lazily creating the client on first access)
+    does not satisfy.
+    """
+
+    @property
+    def client(self) -> HomeAssistantClient:
+        """The real Home Assistant client every register_*_tools plugin reads from."""
+
+    @property
+    def mcp(self) -> Any:
+        """The FastMCP server instance tools are registered against."""
+
+    @property
+    def smart_tools(self) -> Any:
+        """The lazily-created SmartSearchTools instance."""
+
+    @property
+    def device_tools(self) -> Any:
+        """The lazily-created DeviceControlTools instance."""
+
 
 # Preset module groups for common use cases
 MODULE_PRESETS = {
@@ -40,6 +86,15 @@ MODULE_PRESETS = {
         "tools_blueprints",
         "tools_search",  # Useful for finding entities in automations
     ],
+}
+
+# Module splits: a configured legacy module name keeps enabling every module
+# its tools moved to, so an existing ENABLED_TOOL_MODULES list keeps the same
+# tool surface across upgrades. The legacy name itself stays valid — it still
+# names a real (smaller) module.
+MODULE_SPLIT_EXPANSIONS = {
+    # ha_get_logs moved out of tools_utility in the #2279 split.
+    "tools_utility": {"tools_logs"},
 }
 
 
@@ -56,9 +111,9 @@ class ToolsRegistry:
     - Comma-separated list: Load specific modules
     """
 
-    def __init__(self, server: Any, enabled_modules: str = "all") -> None:
+    def __init__(self, server: _ServerLike, enabled_modules: str = "all") -> None:
         self.server = server
-        self.client = server.client
+        self.client: HomeAssistantClient = server.client
         self.mcp = server.mcp
         self._enabled_modules = enabled_modules
         # These are now lazily initialized via server properties
@@ -96,6 +151,9 @@ class ToolsRegistry:
 
         # Parse comma-separated list
         modules = {m.strip() for m in self._enabled_modules.split(",") if m.strip()}
+        for legacy, successors in MODULE_SPLIT_EXPANSIONS.items():
+            if legacy in modules:
+                modules |= successors
         return modules if modules else None
 
     def _discover_tool_modules(self) -> list[str]:
@@ -181,9 +239,10 @@ class ToolsRegistry:
         which happens after the MCP server is ready to accept connections.
 
         A module that fails to import or register is SKIPPED (logged loudly),
-        not fatal: the in-process server auto-updates the ha-mcp package inside
-        a running Home Assistant, and a mixed old/new module generation — or a
-        module needing a newer custom component — previously took the whole
+        not fatal: the in-process server can swap the ha-mcp package inside a
+        running Home Assistant (a pip-spec override), and a mixed old/new
+        module generation — or a module needing a newer custom component —
+        previously took the whole
         server down over one module (issues #1783/#1785). Only a TOTAL failure
         (zero modules registered) still raises: a tool-less server "running"
         would hide a genuinely broken install.
@@ -193,9 +252,15 @@ class ToolsRegistry:
             return
 
         # Build kwargs with all available dependencies (lazy access)
+        # ``server`` lets a register function reach the live server object
+        # (e.g. tools_dev needs server.approval_queue and the unfiltered
+        # tool registry to drive the settings-UI surfaces). Every
+        # register_*_tools takes **kwargs, so the extra key is ignored by
+        # the modules that don't need it.
         kwargs = {
             "smart_tools": self.smart_tools,
             "device_tools": self.device_tools,
+            "server": self.server,
         }
 
         # tools_*.py modules by convention, then the explicit modules (those
@@ -218,7 +283,7 @@ class ToolsRegistry:
             try:
                 if self._import_and_register_module(module_name, kwargs, func_name):
                     registered_count += 1
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 failed.append((module_name, e))
 
         self._raise_or_log_registration_failures(failed, registered_count)

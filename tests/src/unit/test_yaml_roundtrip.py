@@ -2,40 +2,19 @@
 
 from __future__ import annotations
 
-import sys
 from io import StringIO
-from unittest.mock import MagicMock
+from pathlib import Path
 
 import pytest
+from annotatedyaml import Secrets
+from annotatedyaml.loader import FastSafeLoader
+from homeassistant.config import load_yaml_config_file
 
-# Mock Home Assistant imports so the package __init__ can be loaded.
-sys.modules["voluptuous"] = MagicMock()
-homeassistant = MagicMock()
-sys.modules["homeassistant"] = homeassistant
-sys.modules["homeassistant.components"] = homeassistant.components
-sys.modules["homeassistant.config"] = homeassistant.config
-sys.modules["homeassistant.config_entries"] = homeassistant.config_entries
-# setdefault (not =): other test modules stub homeassistant.core with a real
-# `callback` identity function (production code decorates real closures with
-# it - a clobbered auto-mock attribute would silently replace them). This
-# file doesn't care what's already there, only that something importable is.
-sys.modules.setdefault("homeassistant.core", homeassistant.core)
-sys.modules["homeassistant.helpers"] = homeassistant.helpers
-sys.modules["homeassistant.helpers.config_validation"] = (
-    homeassistant.helpers.config_validation
-)
-# The package __init__ also imports these; without them this file only
-# collects cleanly when an earlier test file has already mocked them.
-sys.modules["homeassistant.components.persistent_notification"] = (
-    homeassistant.components.persistent_notification
-)
-sys.modules["homeassistant.helpers.storage"] = homeassistant.helpers.storage
-sys.modules["homeassistant.loader"] = homeassistant.loader
-
-from custom_components.ha_mcp_tools.yaml_rt import (  # noqa: E402
-    _TaggedScalar,
+from custom_components.ha_mcp_tools.yaml_rt import (
+    find_yaml_key_files,
     make_yaml,
     yaml_dumps,
+    yaml_jsonify,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,21 +74,15 @@ class TestSecretTag:
 
     def test_secret_value(self):
         ry, data = _load("api_key: !secret my_api_key\n")
-        assert isinstance(data["api_key"], _TaggedScalar)
         assert data["api_key"].tag == "!secret"
         assert data["api_key"].value == "my_api_key"
-
-    def test_tagged_scalar_str(self):
-        ts = _TaggedScalar("!secret", "my_api_key")
-        assert str(ts) == "my_api_key"
+        assert str(data["api_key"]) == "my_api_key"
 
     def test_tagged_scalar_equality(self):
-        a = _TaggedScalar("!secret", "key1")
-        b = _TaggedScalar("!secret", "key1")
-        c = _TaggedScalar("!secret", "key2")
-        assert a == b
-        assert a != c
-        assert a != "key1"
+        _ry, data = _load("a: !secret key1\nb: !secret key1\nc: !secret key2\n")
+        assert data["a"] == data["b"]
+        assert data["a"] != data["c"]
+        assert data["a"] != "key1"
 
 
 class TestIncludeTag:
@@ -141,6 +114,45 @@ class TestEnvVarTag:
         ry, data = _load("token: !env_var MY_TOKEN\n")
         out = yaml_dumps(ry, data)
         assert "!env_var MY_TOKEN" in out
+
+
+class TestCoreTagDiscovery:
+    def test_every_tag_core_loads_survives_a_round_trip(self):
+        """A tag Core's YAML loader knows is written back as it was read, so an
+        edit never drops or resolves one Core would have honoured."""
+        tags = [
+            tag
+            for tag in FastSafeLoader.yaml_constructors
+            if isinstance(tag, str) and tag.startswith("!")
+        ]
+        assert "!input" in tags
+        for tag in tags:
+            ry, data = _load(f"value: {tag} source\n")
+            assert f"{tag} source" in yaml_dumps(ry, data), tag
+
+
+class TestInputTag:
+    """Blueprint ``!input`` markers survive parsing and JSON projection."""
+
+    def test_input_tag_preserved(self):
+        ry, data = _load("target: !input target_entity\n")
+        assert data["target"].tag == "!input"
+        out = yaml_dumps(ry, data)
+        assert "!input target_entity" in out
+        ry2 = make_yaml()
+        data2 = ry2.load(StringIO(out))
+        assert data2["target"].tag == "!input"
+
+    def test_unknown_scalar_falls_back_to_str(self):
+        class Unknown:
+            def __str__(self):
+                return "unknown"
+
+        assert yaml_jsonify(Unknown()) == "unknown"
+
+    def test_input_tag_jsonifies_in_source_form(self):
+        _ry, data = _load("target: !input target_entity\n")
+        assert yaml_jsonify(data) == {"target": "!input target_entity"}
 
 
 # ---------------------------------------------------------------------------
@@ -396,3 +408,88 @@ class TestSeqIndentDetectionEdges:
 
         text = "name: My Home\ntemplate:\n  - sensor: []\n"
         assert detect_seq_indent(text) == (4, 2)
+
+
+@pytest.mark.parametrize(
+    ("main", "files", "key", "expected"),
+    [
+        ("template: {}\n", {}, "template", ["configuration.yaml"]),
+        (
+            "custom_packages: !include_dir_named packages\n",
+            {"packages/nested/mcp.yaml": "template: {}\n"},
+            "template",
+            ["packages/nested/mcp.yaml"],
+        ),
+        (
+            "homeassistant: {name: Home}\n",
+            {},
+            "homeassistant.name",
+            ["configuration.yaml"],
+        ),
+        ("sensor: {name: x}\n", {}, "sensor..name", []),
+        ("template: {}\n", {}, "", []),
+        ("template: {sensor: []}\n", {}, "sensor", []),
+        (
+            "shell_command: !secret commands\n",
+            {"secrets.yaml": "commands: {template: {}}\n"},
+            "template",
+            [],
+        ),
+        # The including file writes the first key; the read then reports
+        # that the rest of the path is not in that file.
+        (
+            "shell_command: !include commands.yaml\n",
+            {"commands.yaml": "mcp_secret: value\n"},
+            "shell_command.mcp_secret",
+            ["configuration.yaml"],
+        ),
+        (
+            "included: !include commands.yaml\n",
+            {"commands.yaml": "shell_command: {mcp_secret: value}\n"},
+            "shell_command.mcp_secret",
+            ["commands.yaml"],
+        ),
+        (
+            "custom_packages: !include_dir_named packages\n",
+            {
+                "packages/nested/mcp.yaml": "shell_command: {mcp_secret: !secret cmd}\n",
+                "secrets.yaml": "cmd: value\n",
+            },
+            "shell_command.mcp_secret",
+            ["packages/nested/mcp.yaml"],
+        ),
+        (
+            "automation: !include_dir_merge_list automations\n",
+            {"automations/night.yaml": "- alias: Night\n  variables: {mode: dim}\n"},
+            "variables.mode",
+            ["automations/night.yaml"],
+        ),
+        (
+            "automation: !include_dir_list automations\n",
+            {"automations/night.yaml": "alias: Night\nvariables: {mode: dim}\n"},
+            "variables.mode",
+            ["automations/night.yaml"],
+        ),
+    ],
+)
+def test_discovery_uses_cores_yaml_source_locations(
+    tmp_path: Path, main: str, files: dict[str, str], key: str, expected: list[str]
+) -> None:
+    for name, content in {"configuration.yaml": main, **files}.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    config = load_yaml_config_file(
+        str(tmp_path / "configuration.yaml"), Secrets(tmp_path)
+    )
+    assert find_yaml_key_files(config, key) == [
+        str(tmp_path / name) for name in expected
+    ]
+
+
+def test_discovery_walks_a_list_of_loaded_mappings(tmp_path: Path) -> None:
+    path = tmp_path / "configuration.yaml"
+    path.write_text("template: {}\n", encoding="utf-8")
+    config = load_yaml_config_file(str(path), Secrets(tmp_path))
+    config["cycle"] = config
+    assert find_yaml_key_files([config], "template") == [str(path)]

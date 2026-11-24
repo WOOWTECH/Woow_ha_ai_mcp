@@ -1,390 +1,497 @@
-"""Unit tests for flow error parsing (Bug 15 / issue #1150 + issue #1149).
+"""Home Assistant's answers to a flow step as structured tool errors.
 
-When Home Assistant returns a 400/422 during a flow create or update,
-the tool should surface a structured error with field-level detail AND
-the helper's ``data_schema`` so the caller has both "what failed" and
-"what's accepted" — together they're enough for self-correction. The
-pre-fix behaviour collapsed every 4xx into a generic
-``"API error: 400 - Bad Request"`` ToolError with no actionable detail.
-
-Tests in this module:
-
-1. HA returns ``{"errors": {...}}`` -> ToolError carries ``field_errors``
-   with the original keys/values AND ``data_schema`` (issue #1149: the
-   schema is now attached symmetrically with the unstructured branch
-   instead of being skipped when field_errors are present).
-2. HA returns an unstructured 400 (just ``{"message": "..."}``) ->
-   ToolError carries ``data_schema`` fetched via a fresh introspection
-   flow against the helper.
-3. The existing menu-helper "missing menu_option" path still raises
-   ``CONFIG_MISSING_REQUIRED_FIELDS`` and is not affected by the new
-   wrapping logic (regression guard).
+When Home Assistant rejects a step (a 400, a form back with ``errors``, an
+``abort``), the error carries what failed, Core's own text for it where Core
+ships one, and the rejected form's fields, so the caller can answer the step
+again (issues #1149, #1150). Every flow below is Core's own, driven through
+the server's client on a real ``hass``.
 """
 
 from __future__ import annotations
 
-import json
+from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+import probatio
 import pytest
-from fastmcp.exceptions import ToolError
-
-from ha_mcp.client.rest_client import HomeAssistantAPIError
-from ha_mcp.tools.config_entry_flow import (
-    _handle_flow_steps,
-    _parse_flow_api_error,
-    create_flow_helper,
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    ConfigSubentryDataWithId,
+    ConfigSubentryFlow,
+    OptionsFlow,
+    SubentryFlowResult,
 )
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import selector
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant.common import MockConfigEntry, mock_config_flow
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp.client.rest_client import HomeAssistantClient
+from ha_mcp.tools.config_entry_flow_errors import FlowRef
+from ha_mcp.tools.tools_config_helpers import HelperConfigTools
+from ha_mcp.tools.tools_integrations import IntegrationTools
+
+from ._mock_flow_integration import (
+    answer_translations,
+    mock_flow_integration,
+    open_flow_ids,
+)
+from ._tool_errors import error_body
+
+_DOMAIN = "flow_error_texts"
+_SHARED = "flow_error_shared"
+_ABORTING = "flow_error_aborting"
+_UNIQUE_ID = "flow-error-device"
+
+_STRINGS = {
+    "config": {"abort": {"another_device": "Wrong device."}},
+    "options": {"error": {"cannot_connect": "Cannot reach {host}."}},
+    "config_subentries": {
+        "conversation": {"abort": {"entry_not_loaded": "The entry is not loaded."}}
+    },
+}
 
 
-def _parse_tool_error(te: ToolError) -> dict[str, Any]:
-    """Parse the JSON body of a ToolError raised via raise_tool_error()."""
-    return json.loads(str(te))
-
-
-# ---------------------------------------------------------------------------
-# 1. Structured field-level errors
-# ---------------------------------------------------------------------------
-
-
-class TestStructuredFieldErrors:
-    """When HA returns a body with ``errors``, the tool surfaces it verbatim."""
-
-    def test_parse_extracts_field_errors_and_message(self) -> None:
-        api_err = HomeAssistantAPIError(
-            "API error: 400 - Bad Request",
-            status_code=400,
-            response_data={
-                "errors": {"entity_id": "invalid_entity"},
-                "description_placeholders": {"hint": "must be a sensor"},
-            },
-        )
-        parsed = _parse_flow_api_error(api_err)
-        assert parsed["field_errors"] == {"entity_id": "invalid_entity"}
-        assert "must be a sensor" in parsed["message"]
-        assert parsed["raw"]["errors"] == {"entity_id": "invalid_entity"}
-
-    async def test_create_flow_with_400_field_errors_raises_structured(self) -> None:
-        """End-to-end: a form submit failing with structured errors should
-        surface the field errors via the wrapping ToolError, and (issue
-        #1149) ALSO attach the data_schema so the LLM has both "what
-        failed" and "what's accepted" available."""
-        # The introspection flow fired by the new schema-attach branch is a
-        # second call to start_config_flow; sequence both.
-        intro_schema = [
-            {"name": "entity_id", "required": True, "selector": {"entity": {}}},
-            {
-                "name": "filter",
-                "required": True,
-                "selector": {"select": {"options": ["lowpass", "outlier"]}},
-            },
-        ]
-        start_calls: list[str] = []
-
-        async def start_flow(handler: str) -> dict[str, Any]:
-            start_calls.append(handler)
-            if len(start_calls) == 1:
-                return {
-                    "type": "form",
-                    "flow_id": "flow-1",
-                    "step_id": "user",
-                    "data_schema": [{"name": "entity_id"}],
-                }
-            return {
-                "type": "form",
-                "flow_id": "intro-flow",
-                "step_id": "user",
-                "data_schema": intro_schema,
-            }
-
-        client = AsyncMock()
-        client.start_config_flow = AsyncMock(side_effect=start_flow)
-
-        api_err = HomeAssistantAPIError(
-            "API error: 400 - Bad Request",
-            status_code=400,
-            response_data={"errors": {"entity_id": "not_a_sensor"}},
-        )
-        client.submit_config_flow_step = AsyncMock(side_effect=api_err)
-        client.abort_config_flow = AsyncMock(return_value={})
-
-        with pytest.raises(ToolError) as exc_info:
-            await create_flow_helper(client, "filter", {"entity_id": "light.foo"})
-
-        body = _parse_tool_error(exc_info.value)
-        assert body["success"] is False
-        assert body["error"]["code"] == "SERVICE_CALL_FAILED"
-        # Field errors are exposed at the top level (via context).
-        assert body.get("field_errors") == {"entity_id": "not_a_sensor"}
-        assert body.get("status_code") == 400
-        # Issue #1149: the data_schema is now attached even when
-        # structured field_errors are present — the LLM gets both
-        # "what failed" and "what's accepted" to self-correct.
-        assert body.get("data_schema") == intro_schema
-        # The original-flow + introspection-flow were both aborted.
-        client.abort_config_flow.assert_called()
-
-
-# ---------------------------------------------------------------------------
-# 2. Unstructured errors -> data_schema attached
-# ---------------------------------------------------------------------------
-
-
-class TestUnstructuredErrorAttachesSchema:
-    """When HA returns only a ``message`` (or nothing useful), the tool
-    fetches the helper's data_schema and attaches it to the error."""
-
-    async def test_create_flow_with_unstructured_400_attaches_data_schema(
-        self,
-    ) -> None:
-        # State machine for start_config_flow:
-        # call 1 -> the real create flow's initial form
-        # call 2 -> the introspection flow used to fetch the schema for
-        #           the error context (post-failure).
-        intro_schema = [
-            {"name": "entity_id", "required": True},
-            {"name": "state_characteristic", "required": True},
-        ]
-        start_calls: list[str] = []
-
-        async def start_flow(handler: str) -> dict[str, Any]:
-            start_calls.append(handler)
-            if len(start_calls) == 1:
-                # Real flow: form with one field, will be submitted and 400.
-                return {
-                    "type": "form",
-                    "flow_id": "real-flow",
-                    "step_id": "user",
-                    "data_schema": [{"name": "entity_id"}],
-                }
-            # Introspection flow used by error context.
-            return {
-                "type": "form",
-                "flow_id": "intro-flow",
-                "step_id": "user",
-                "data_schema": intro_schema,
-            }
-
-        api_err = HomeAssistantAPIError(
-            "API error: 400 - Bad Request",
-            status_code=400,
-            # No "errors" map — only a vague message.
-            response_data={"message": "Bad Request"},
-        )
-
-        client = AsyncMock()
-        client.start_config_flow = AsyncMock(side_effect=start_flow)
-        client.submit_config_flow_step = AsyncMock(side_effect=api_err)
-        client.abort_config_flow = AsyncMock(return_value={})
-
-        with pytest.raises(ToolError) as exc_info:
-            await create_flow_helper(client, "statistics", {"entity_id": "sensor.foo"})
-
-        body = _parse_tool_error(exc_info.value)
-        assert body["success"] is False
-        assert body["error"]["code"] == "SERVICE_CALL_FAILED"
-        # No structured field_errors because the body had none.
-        assert "field_errors" not in body
-        # data_schema must be attached so the LLM can correct itself.
-        assert body.get("data_schema") == intro_schema
-        # The error message should mention HA rejecting the request, with status.
-        assert "400" in body["error"]["message"]
-        # Two start_config_flow calls: one for the real flow, one for
-        # introspection during error-handling.
-        assert start_calls == ["statistics", "statistics"]
-
-    async def test_parse_falls_back_to_exception_message(self) -> None:
-        """When response_data is None or empty, parser still returns the
-        wrapper exception message rather than an empty string."""
-        api_err = HomeAssistantAPIError(
-            "API error: 400 - Bad Request",
-            status_code=400,
-            response_data=None,
-        )
-        parsed = _parse_flow_api_error(api_err)
-        assert parsed["field_errors"] == {}
-        assert "Bad Request" in parsed["message"]
-        # When HA returns no body, raw is normalised to {} (it's still a
-        # well-formed empty dict, distinguished by empty field_errors).
-        assert parsed["raw"] == {}
-
-
-# ---------------------------------------------------------------------------
-# 3. Existing menu helper good-error path is preserved
-# ---------------------------------------------------------------------------
-
-
-class TestMenuMissingOptionStillRaisesCorrectly:
-    """The new wrapping logic only kicks in for HomeAssistantAPIError; the
-    pre-existing CONFIG_MISSING_REQUIRED_FIELDS error for menu helpers is
-    raised before any submit happens and must remain unchanged."""
-
-    async def test_menu_helper_without_selection_raises_missing_fields(
-        self,
-    ) -> None:
-        client = AsyncMock()
-        # Real flow returns a menu — caller didn't supply a menu choice.
-        client.start_config_flow = AsyncMock(
-            return_value={
-                "type": "menu",
-                "flow_id": "menu-flow",
-                "step_id": "user",
-                "menu_options": ["sensor", "binary_sensor"],
-            }
-        )
-        # No submit should happen — the missing-option check fires first.
-        client.submit_config_flow_step = AsyncMock(
-            side_effect=AssertionError("submit must not be called")
-        )
-        client.abort_config_flow = AsyncMock(return_value={})
-
-        with pytest.raises(ToolError) as exc_info:
-            await create_flow_helper(client, "template", {"name": "x"})
-
-        body = _parse_tool_error(exc_info.value)
-        assert body["error"]["code"] == "CONFIG_MISSING_REQUIRED_FIELDS"
-        # Menu options must surface so the caller knows what to pick.
-        assert body.get("menu_options") == ["sensor", "binary_sensor"]
-        # The wrapping path's status_code field must NOT be present —
-        # this confirms we're still on the legacy code path.
-        assert "status_code" not in body
-        client.submit_config_flow_step.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 4. Direct test of _handle_flow_steps wrapper for options/update flows
-# ---------------------------------------------------------------------------
-
-
-class TestHandleFlowStepsOptionsFlowError:
-    """Options (update) flows go through _handle_flow_steps with a custom
-    submit_fn. The wrapping must still apply."""
-
-    async def test_options_flow_400_with_field_errors_is_wrapped(self) -> None:
-        """Direct exercise of _handle_flow_steps to ensure the options
-        submit_fn path also surfaces structured errors."""
-        api_err = HomeAssistantAPIError(
-            "API error: 400 - Bad Request",
-            status_code=400,
-            response_data={"errors": {"window_size": "value_too_small"}},
-        )
-        submit_fn = AsyncMock(side_effect=api_err)
-
-        initial_step = {
-            "type": "form",
-            "flow_id": "opt-flow",
-            "step_id": "init",
-            "data_schema": [{"name": "window_size"}],
+def _host_form(
+    flow: ConfigFlow | OptionsFlow | ConfigSubentryFlow,
+    step_id: str,
+    stored: dict[str, Any],
+    errors: dict[str, str] | None = None,
+    placeholders: dict[str, str] | None = None,
+) -> Any:
+    schema = probatio.Schema(
+        {
+            probatio.Required("host"): selector.TextSelector(),
+            probatio.Optional("api_key"): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
         }
+    )
+    return flow.async_show_form(
+        step_id=step_id,
+        data_schema=flow.add_suggested_values_to_schema(schema, stored),
+        errors=errors,
+        description_placeholders=placeholders,
+    )
 
-        # Issue #1149: the structured-error branch now also tries to fetch
-        # the data_schema for context. Wire the client mock so the
-        # introspection flow (`start_config_flow` -> a form with a usable
-        # `flow_id`) succeeds, and the matching `abort_config_flow` is
-        # awaitable. Without an explicit return value AsyncMock surfaces
-        # auto-generated coroutines that never await cleanly.
-        client = AsyncMock()
-        intro_schema = [{"name": "window_size", "selector": {"number": {}}}]
-        client.start_config_flow = AsyncMock(
-            return_value={
-                "type": "form",
-                "flow_id": "intro-opt",
-                "step_id": "init",
-                "data_schema": intro_schema,
-            }
+
+class _OptionsFlow(OptionsFlow):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is None:
+            return _host_form(self, "init", dict(self.config_entry.options))
+        return _host_form(
+            self,
+            "init",
+            dict(self.config_entry.options),
+            errors={"base": "cannot_connect", "host": "no_string_for_this"},
+            placeholders={"host": user_input["host"]},
         )
-        client.abort_config_flow = AsyncMock(return_value={})
 
-        with pytest.raises(ToolError) as exc_info:
-            await _handle_flow_steps(
-                client=client,
-                flow_id="opt-flow",
-                initial_step=initial_step,
-                config={"window_size": 1},
-                submit_fn=submit_fn,
-                helper_type="filter",
+
+class _DeviceFlow(ConfigSubentryFlow):
+    """Creates and reconfigures a ``device``; every answer is refused."""
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        errors = None if user_input is None else {"base": "cannot_connect"}
+        return _host_form(self, "user", {}, errors)
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        errors = None if user_input is None else {"base": "cannot_connect"}
+        return _host_form(self, "reconfigure", {"host": "h"}, errors)
+
+
+class _ConversationFlow(ConfigSubentryFlow):
+    """Aborts as its entry's ``abort`` data says."""
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        abort = self._get_entry().data["abort"]
+        return self.async_abort(
+            reason=abort["reason"], translation_domain=abort.get("translation_domain")
+        )
+
+
+class _ConfigFlow(ConfigFlow):
+    VERSION = 1
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        sensor = selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
+        return self.async_show_form(
+            step_id="user",
+            data_schema=probatio.Schema({probatio.Required("entity_id"): sensor}),
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        stored = dict(self._get_reconfigure_entry().data)
+        if user_input is None:
+            return _host_form(self, "reconfigure", stored)
+        if user_input["host"] == "10.0.0.3":
+            return self.async_abort(reason="another_device")
+        return _host_form(self, "reconfigure", stored, {"base": "not_valid"})
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return _OptionsFlow()
+
+    @classmethod
+    @callback
+    def async_get_supported_subentry_types(
+        cls, config_entry: ConfigEntry
+    ) -> dict[str, type[ConfigSubentryFlow]]:
+        return {"device": _DeviceFlow, "conversation": _ConversationFlow}
+
+
+class _AbortingFlow(ConfigFlow):
+    VERSION = 1
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return self.async_abort(reason="no_devices_found")
+
+
+@pytest.fixture
+def flows(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """The test integrations, with the strings ``_DOMAIN`` and ``_SHARED`` ship."""
+    mock_flow_integration(hass, _DOMAIN, tmp_path, monkeypatch, _STRINGS)
+    mock_flow_integration(
+        hass,
+        _SHARED,
+        tmp_path,
+        monkeypatch,
+        {"config": {"abort": {"cloud_not_connected": "Log in first."}}},
+    )
+    mock_flow_integration(hass, _ABORTING, tmp_path, monkeypatch)
+    with (
+        mock_config_flow(_DOMAIN, _ConfigFlow),
+        mock_config_flow(_ABORTING, _AbortingFlow),
+    ):
+        yield
+
+
+@pytest.fixture
+async def client(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient, flows: None
+) -> AsyncIterator[HomeAssistantClient]:
+    """The server's client on a ``hass`` that serves flows and their strings."""
+    assert await async_setup_component(hass, "config", {})
+    answer_translations(hass)
+    yield component_core_client
+    await hass.async_block_till_done()
+
+
+def _entry(hass: HomeAssistant, **data: Any) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=_DOMAIN,
+        unique_id=_UNIQUE_ID,
+        data={"host": "10.0.0.1", **data},
+        options={"host": "10.0.0.1", "api_key": "sk-LIVE"},
+        subentries_data=[
+            ConfigSubentryDataWithId(
+                data={"host": "h"},
+                subentry_id="s1",
+                subentry_type="device",
+                title="Device",
+                unique_id=None,
+            )
+        ],
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+def _translation_requests(sent: AsyncMock) -> list[tuple[str, list[str]]]:
+    return [
+        (c.args[0]["category"], c.args[0]["integration"])
+        for c in sent.await_args_list
+        if c.args[0].get("type") == "frontend/get_translations"
+    ]
+
+
+async def _reconfigure(
+    client: HomeAssistantClient, entry: MockConfigEntry, config: dict[str, Any]
+) -> Any:
+    return await IntegrationTools(client).ha_set_integration(
+        entry_id=entry.entry_id,
+        reconfigure=True,
+        expected_unique_id=_UNIQUE_ID,
+        config=config,
+    )
+
+
+async def _set_subentry(
+    client: HomeAssistantClient,
+    entry: MockConfigEntry,
+    subentry_type: str,
+    config: dict[str, Any],
+    subentry_id: str | None = None,
+) -> Any:
+    return await HelperConfigTools(client).ha_config_set_helper(
+        helper_type="config_subentry",
+        entry_id=entry.entry_id,
+        subentry_type=subentry_type,
+        subentry_id=subentry_id,
+        config=config,
+    )
+
+
+class TestRejectedSubmit:
+    """A 400 on a submit says what failed and shows the rejected form."""
+
+    async def test_field_errors_come_with_the_rejected_forms_schema(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        with (
+            patch.object(
+                client, "abort_config_flow", wraps=client.abort_config_flow
+            ) as aborted,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await IntegrationTools(client).ha_set_integration(
+                domain=_DOMAIN, config={"entity_id": "light.foo"}
             )
 
-        body = _parse_tool_error(exc_info.value)
-        assert body["error"]["code"] == "SERVICE_CALL_FAILED"
-        assert body.get("field_errors") == {"window_size": "value_too_small"}
-        assert body.get("status_code") == 400
-        # Issue #1149: data_schema is now attached alongside field_errors.
-        assert body.get("data_schema") == intro_schema
-        assert body.get("flow_id") == "opt-flow"
+        body = error_body(exc_info)
+        assert body["success"] is False
+        assert body["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert list(body["field_errors"]) == ["entity_id"]
+        assert body["status_code"] == 400
+        assert [f["name"] for f in body["data_schema"]] == ["entity_id"]
+        # The flow stays open to be answered again.
+        aborted.assert_not_called()
+        assert open_flow_ids(hass) == [body["flow_id"]]
+
+    async def test_a_rejected_reconfigure_submit_reports_nothing_applied(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        entry = _entry(hass)
+
+        with pytest.raises(ToolError) as exc_info:
+            await _reconfigure(client, entry, {"host": ["not", "text"]})
+
+        body = error_body(exc_info)
+        assert list(body["field_errors"]) == ["host"]
+        assert [f["name"] for f in body["data_schema"]] == ["host", "api_key"]
+        assert body["status"] == "apply_failed"
+        assert entry.data["host"] == "10.0.0.1"
 
 
-# ---------------------------------------------------------------------------
-# 5. Undrivable step types (issue #1814)
-# ---------------------------------------------------------------------------
+class TestFlowTextFromCore:
+    """The tool error carries Core's string for an abort reason or form error."""
 
+    async def test_abort_without_a_core_string_keeps_only_the_reason(
+        self, client: HomeAssistantClient
+    ) -> None:
+        with pytest.raises(ToolError) as exc_info:
+            await IntegrationTools(client).ha_set_integration(domain=_ABORTING)
 
-class TestUndrivableStepTypes:
-    """External (browser/OAuth) and progress steps cannot be driven over MCP.
+        body = error_body(exc_info)
+        assert "no_devices_found" in body["error"]["message"]
+        assert "reason_text" not in body
+        assert "warnings" not in body
 
-    ``_handle_flow_steps`` must surface them as SERVICE_CALL_FAILED with an
-    actionable "complete in the HA UI" suggestion — NOT fall through to the
-    INTERNAL_UNEXPECTED "Unexpected flow result type" branch, which loses
-    the error code the ha_set_integration docstring documents.
-    """
+    async def test_options_form_errors_carry_cores_text_with_placeholders(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        entry = _entry(hass)
+
+        with (
+            patch.object(
+                client, "send_websocket_message", wraps=client.send_websocket_message
+            ) as sent,
+            patch.object(
+                client,
+                "submit_options_flow_step",
+                wraps=client.submit_options_flow_step,
+            ) as submitted,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await IntegrationTools(client).ha_set_integration(
+                entry_id=entry.entry_id, config={"host": "10.0.0.2"}
+            )
+
+        body = error_body(exc_info)
+        assert body["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+        # The raw keys stay; a key Core ships no string for has no text.
+        assert body["errors"] == {
+            "base": "cannot_connect",
+            "host": "no_string_for_this",
+        }
+        assert body["error_text"] == {"base": "Cannot reach 10.0.0.2."}
+        assert [f["name"] for f in body["fields"]] == ["host", "api_key"]
+        assert "data_schema" not in body
+        assert _translation_requests(sent) == [("options", [_DOMAIN])]
+        submitted.assert_awaited_once()
+        assert open_flow_ids(hass) == [body["flow_id"]]
+
+    async def test_subentry_abort_reads_its_type_under_the_parent_domain(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        entry = _entry(hass, abort={"reason": "entry_not_loaded"})
+
+        with (
+            patch.object(
+                client, "send_websocket_message", wraps=client.send_websocket_message
+            ) as sent,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await _set_subentry(client, entry, "conversation", {})
+
+        assert error_body(exc_info)["reason_text"] == "The entry is not loaded."
+        assert _translation_requests(sent) == [("config_subentries", [_DOMAIN])]
+
+    async def test_abort_translation_domain_names_where_the_reason_lives(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        # translation_domain names the integration that owns the reason; a
+        # subentry flow then reads it under that domain's config strings, as
+        # the frontend does.
+        entry = _entry(
+            hass,
+            abort={"reason": "cloud_not_connected", "translation_domain": _SHARED},
+        )
+
+        with (
+            patch.object(
+                client, "send_websocket_message", wraps=client.send_websocket_message
+            ) as sent,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await _set_subentry(client, entry, "conversation", {})
+
+        assert error_body(exc_info)["reason_text"] == "Log in first."
+        assert _translation_requests(sent) == [("config", [_SHARED])]
+
+    async def test_reconfigure_abort_carries_cores_reason_text(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        entry = _entry(hass)
+
+        with pytest.raises(ToolError) as exc_info:
+            await _reconfigure(client, entry, {"host": "10.0.0.3"})
+
+        body = error_body(exc_info)
+        assert body["reason_text"] == "Wrong device."
+        assert body["status"] == "apply_failed"
+
+    async def test_a_reconfigure_form_back_with_errors_is_refused_and_stays_open(
+        self, hass: HomeAssistant, client: HomeAssistantClient
+    ) -> None:
+        entry = _entry(hass)
+
+        with (
+            patch.object(
+                client,
+                "submit_config_flow_step",
+                wraps=client.submit_config_flow_step,
+            ) as submitted,
+            patch.object(
+                client, "abort_config_flow", wraps=client.abort_config_flow
+            ) as aborted,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await _reconfigure(client, entry, {"host": "10.0.0.9"})
+
+        body = error_body(exc_info)
+        assert open_flow_ids(hass) == [body["flow_id"]]
+        assert body["errors"] == {"base": "not_valid"}
+        assert body["status"] == "apply_failed"
+        submitted.assert_awaited_once()
+        aborted.assert_not_awaited()
 
     @pytest.mark.parametrize(
-        "step_type", ["external", "external_done", "progress", "progress_done"]
+        ("subentry_id", "status"), [("s1", "apply_failed"), (None, None)]
     )
-    async def test_undrivable_step_raises_structured_error(
-        self, step_type: str
+    async def test_a_subentry_form_back_with_errors_is_refused(
+        self,
+        hass: HomeAssistant,
+        client: HomeAssistantClient,
+        subentry_id: str | None,
+        status: str | None,
     ) -> None:
-        client = AsyncMock()
-        initial_step = {
-            "type": step_type,
-            "flow_id": "oauth-flow",
-            "step_id": "auth",
-        }
+        entry = _entry(hass)
 
-        with pytest.raises(ToolError) as exc_info:
-            await _handle_flow_steps(
-                client=client,
-                flow_id="oauth-flow",
-                initial_step=initial_step,
-                config={},
-                helper_type="some_oauth_integration",
-            )
+        with (
+            patch.object(
+                client,
+                "submit_config_subentry_flow_step",
+                wraps=client.submit_config_subentry_flow_step,
+            ) as submitted,
+            patch.object(
+                client,
+                "abort_config_subentry_flow",
+                wraps=client.abort_config_subentry_flow,
+            ) as aborted,
+            pytest.raises(ToolError) as exc_info,
+        ):
+            await _set_subentry(client, entry, "device", {"host": "x"}, subentry_id)
 
-        body = _parse_tool_error(exc_info.value)
-        assert body["error"]["code"] == "SERVICE_CALL_FAILED"
-        assert "cannot be completed via MCP" in body["error"]["message"]
-        assert step_type in body["error"]["message"]
-        # The actionable pointer to the HA UI must survive. A single
-        # suggestion is emitted as the singular ``suggestion`` key.
-        assert "Home Assistant UI" in body["error"].get("suggestion", "")
-        # Nothing was submitted — the step is surfaced, not attempted.
-        client.submit_config_flow_step.assert_not_called()
+        body = error_body(exc_info)
+        assert body["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert body["errors"] == {"base": "cannot_connect"}
+        assert body.get("status") == status
+        submitted.assert_awaited_once()
+        aborted.assert_not_awaited()
+        assert open_flow_ids(hass) == [body["flow_id"]]
 
-    @pytest.mark.parametrize(
-        "reason", ["already_configured", "single_instance_allowed"]
-    )
-    async def test_benign_abort_carries_existing_entry_hint(self, reason: str) -> None:
-        # Add-mode drives arbitrary domains, so common benign aborts
-        # (integration already set up) must point the caller at the
-        # existing entry rather than surface as a bare failure.
-        client = AsyncMock()
-        initial_step = {
-            "type": "abort",
-            "flow_id": "dup-flow",
-            "reason": reason,
-        }
 
-        with pytest.raises(ToolError) as exc_info:
-            await _handle_flow_steps(
-                client=client,
-                flow_id="dup-flow",
-                initial_step=initial_step,
-                config={},
-                helper_type="sun",
-            )
+@pytest.mark.usefixtures("redact_on")
+async def test_form_errors_redact_the_schemas_password_value(
+    hass: HomeAssistant, client: HomeAssistantClient
+) -> None:
+    # The options form carries the stored api_key in suggested_value.
+    entry = _entry(hass)
 
-        body = _parse_tool_error(exc_info.value)
-        assert body["error"]["code"] == "SERVICE_CALL_FAILED"
-        assert reason in body["error"]["message"]
-        assert "already set up" in body["error"].get("suggestion", "")
+    with pytest.raises(ToolError) as exc_info:
+        await IntegrationTools(client).ha_set_integration(
+            entry_id=entry.entry_id, config={"host": "10.0.0.2"}
+        )
+
+    assert "sk-LIVE" not in str(exc_info.value)
+    assert "api_key" in [f["name"] for f in error_body(exc_info)["fields"]]
+
+
+@pytest.mark.parametrize("path", ["config", "options", "config_subentries.device"])
+def test_a_flow_ref_takes_the_flow_categories_core_has(path: str) -> None:
+    assert FlowRef("demo", path).path == path
+
+
+@pytest.mark.parametrize("path", ["", "option", "subentries.device"])
+def test_a_flow_ref_refuses_a_path_core_has_no_flow_for(path: str) -> None:
+    with pytest.raises(ValueError, match="flow path"):
+        FlowRef("demo", path)
+
+
+async def test_a_form_error_whose_strings_cannot_be_read_warns_at_top_level(
+    hass: HomeAssistant, component_core_client: HomeAssistantClient, flows: None
+) -> None:
+    # Nothing registered frontend/get_translations: Core refuses the read.
+    assert await async_setup_component(hass, "config", {})
+    entry = _entry(hass)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _reconfigure(component_core_client, entry, {"host": "10.0.0.9"})
+
+    body = error_body(exc_info)
+    assert body["errors"] == {"base": "not_valid"}
+    assert "error_text" not in body
+    assert any("could not be read" in w for w in body["warnings"])

@@ -1,28 +1,20 @@
-"""Unit tests for ``HomeAssistantClient.get_error_log`` three-way branch.
+"""What ``HomeAssistantClient.get_error_log`` reads, on each route to Core's log.
 
-The three branches:
-
-- **Addon context** (``is_running_in_addon()`` True) — Supervisor REST.
-  Covered by existing tests for ``_supervisor_logs_get``; we just
-  regression-check that the branch is still entered.
-- **External → Supervised/HAOS** (probe of ``/api/config`` returns
-  ``"hassio" in components``) — HA Core hassio proxy at
-  ``/api/hassio/core/logs``. New branch added in #1349 item 4 fix.
-- **External → Container/pip** (no hassio in components) — historical
-  ``/api/error_log`` path, now using ``_raw_request`` so plain-text
-  responses aren't lossily JSON-parsed.
-
-Also covers the ``_is_supervised_install`` cache invariant: both
-positive and negative outcomes of a successful probe are cached
-(definitive signals), only probe FAILURES leave the cache unset so the
-next call can re-probe.
+Inside the app the client reads Core's journal straight from Supervisor.
+Outside it, the client asks Core once whether ``hassio`` is loaded, then reads
+the journal through ``/api/hassio/core/logs`` or Core's own ``/api/error_log``
+file (``_error_log_routes_core.py``). Every route fetches the caller's window
+and nothing more (#2279): an unconditional 20,000-line journald request hung
+the call for 15+ minutes on a Supervisor-backed install.
 """
 
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from __future__ import annotations
 
-import httpx
+import asyncio
+from pathlib import Path
+
 import pytest
+from aiohttp import web
 
 from ha_mcp.client.rest_client import (
     HomeAssistantAPIError,
@@ -30,254 +22,260 @@ from ha_mcp.client.rest_client import (
     HomeAssistantConnectionError,
 )
 
+from ._error_log_core import log_file as log_file
+from ._error_log_core import serve_log
+from ._error_log_routes_core import ErrorLogRoute
+from ._error_log_routes_core import error_log_route as error_log_route
+from ._error_log_routes_core import journald_route as journald_route
+from ._error_log_routes_core import probing_route as probing_route
+from ._error_log_routes_core import (
+    supervised_journal_route as supervised_journal_route,
+)
+from ._gateway import Gateway
+from ._gateway import gateway as gateway
+from ._gateway import gateway_client as gateway_client
+from ._journal_gatewayd import gatewayd as gatewayd
+from ._journal_gatewayd import hassio_path_client as hassio_path_client
+from ._journal_gatewayd import in_app_client as in_app_client
+from ._journal_gatewayd import journal_proxy as journal_proxy
+
+LINES = [f"line{i}" for i in range(10)]
+# The client's deadline in seconds, shortened so a stalled read ends at once.
+DEADLINE = 0.01
+
+
+class Stall:
+    """An upstream that takes a request and never answers it."""
+
+    async def handle(self, request: web.Request) -> web.StreamResponse:
+        await asyncio.Event().wait()
+        raise AssertionError("a stalled upstream never answers")
+
 
 @pytest.fixture
-def client():
-    """``HomeAssistantClient`` with stubbed internals — no real network.
-
-    Mirrors the fixture pattern in ``test_tools_utility_supervisor_logs.py``;
-    sets every attribute the real ``__init__`` sets so production code can
-    use direct attribute access (no defensive ``getattr`` needed to paper
-    over a test-fixture omission).
-    """
-    with patch.object(HomeAssistantClient, "__init__", lambda self, **kwargs: None):
-        c = HomeAssistantClient()
-        c.base_url = "http://test.local:8123"
-        c.token = "test-token"
-        c.timeout = 30
-        c.verify_ssl = True
-        c.httpx_client = MagicMock()
-        c._supervised_detected = None
-        return c
+def stalled_error_log(gateway: Gateway) -> Gateway:
+    """The gateway stalling every ``/api/error_log``; taken before ``gateway_client``."""
+    gateway.routes.append(web.get("/api/error_log", Stall().handle))
+    return gateway
 
 
-# ----- _is_supervised_install probe semantics -----
+@pytest.fixture
+def stalled_probe(gateway: Gateway) -> Gateway:
+    """The gateway stalling every ``/api/config``; taken before ``gateway_client``."""
+    gateway.routes.append(web.get("/api/config", Stall().handle))
+    return gateway
 
 
-@pytest.mark.asyncio
-async def test_is_supervised_returns_true_when_hassio_loaded(client):
-    """`hassio` in /api/config["components"] → True, cached."""
-    client._request = AsyncMock(return_value={"components": ["sun", "hassio", "demo"]})
-    assert await client._is_supervised_install() is True
-    assert client._supervised_detected is True
-
-
-@pytest.mark.asyncio
-async def test_is_supervised_returns_false_when_hassio_absent_and_caches(client):
-    """`hassio` absent → False, CACHED (definitive non-supervised signal).
-
-    A successful /api/config response that doesn't list hassio is a
-    definitive Container/pip signal — caching it avoids re-probing on
-    every subsequent get_error_log call. Only probe FAILURES leave the
-    cache unset (see test_is_supervised_fails_open_on_probe_error).
-    """
-    client._request = AsyncMock(return_value={"components": ["sun", "demo"]})
-    assert await client._is_supervised_install() is False
-    assert client._supervised_detected is False
-    # Second call must NOT re-probe — cached negative is reused.
-    assert await client._is_supervised_install() is False
-    assert client._request.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_is_supervised_caches_positive_result(client):
-    """One probe per session once True — repeated calls don't re-GET /config."""
-    client._request = AsyncMock(return_value={"components": ["hassio"]})
-    assert await client._is_supervised_install() is True
-    assert await client._is_supervised_install() is True
-    assert await client._is_supervised_install() is True
-    assert client._request.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_is_supervised_fails_open_on_probe_error(client):
-    """Probe transport-layer error → False, NOT cached (next call re-probes)."""
-    client._request = AsyncMock(side_effect=httpx.ConnectError("boom"))
-    assert await client._is_supervised_install() is False
-    assert client._supervised_detected is None
-
-
-@pytest.mark.asyncio
-async def test_is_supervised_fails_open_on_ha_api_error(client):
-    """Probe HomeAssistantAPIError (non-2xx) → False, not cached."""
-    client._request = AsyncMock(
-        side_effect=HomeAssistantAPIError("503 Service Unavailable")
+class TestTheWindow:
+    @pytest.mark.parametrize(
+        ("lines", "offset", "expected", "has_more"),
+        [
+            pytest.param(3, 2, LINES[5:8], True, id="ends-offset-lines-back"),
+            pytest.param(500, 0, LINES, False, id="larger-than-the-log"),
+            pytest.param(5, 5, LINES[:5], False, id="exactly-reaches-the-start"),
+            pytest.param(4, 5, LINES[1:5], True, id="one-short-of-the-start"),
+            # A journald Range cannot anchor one entry at the newest end.
+            pytest.param(1, 0, LINES[8:], True, id="one-line-is-floored-to-two"),
+        ],
     )
-    assert await client._is_supervised_install() is False
-    assert client._supervised_detected is None
+    async def test_every_route_serves_the_same_slice_of_the_log(
+        self,
+        error_log_route: ErrorLogRoute,
+        lines: int,
+        offset: int,
+        expected: list[str],
+        has_more: bool,
+    ) -> None:
+        """A caller paging back gets the same lines on every install.
 
+        Off by one at the start either loops forever on an empty page or drops
+        the oldest lines.
+        """
+        await error_log_route.serve(LINES)
 
-@pytest.mark.asyncio
-async def test_is_supervised_propagates_runtime_bugs(client):
-    """Programming errors (TypeError, etc.) must NOT be swallowed by fail-open.
+        page = await error_log_route.client.get_error_log(lines=lines, offset=offset)
 
-    Narrow-except contract: only catch HTTP/transport/auth layer errors;
-    runtime bugs like ``TypeError`` from a misshaped mock or
-    ``AttributeError`` from a misuse signal real issues and must surface
-    loudly.
-    """
-    client._request = AsyncMock(side_effect=TypeError("oops"))
-    with pytest.raises(TypeError):
-        await client._is_supervised_install()
+        assert page.text.splitlines() == expected
+        assert page.has_more is has_more
 
-
-@pytest.mark.asyncio
-async def test_is_supervised_handles_unexpected_response_shape(client):
-    """Probe returns dict without `components` key → False (cached).
-
-    ``_request`` returns ``{}`` on a JSON-empty response (rest_client.py
-    line 240); that's the realistic edge case. The branch defensively
-    handles missing or wrong-typed ``components`` without raising.
-    """
-    client._request = AsyncMock(return_value={})
-    assert await client._is_supervised_install() is False
-    # Empty-dict response IS a successful probe — counts as definitive non-supervised.
-    assert client._supervised_detected is False
-
-    # Wrong-typed components — also fail-closed without raising.
-    client2_response = {"components": "not a list"}
-    client._supervised_detected = None
-    client._request = AsyncMock(return_value=client2_response)
-    assert await client._is_supervised_install() is False
-    assert client._supervised_detected is False
-
-
-# ----- get_error_log three-way branch -----
-
-
-@pytest.mark.asyncio
-async def test_get_error_log_addon_branch(client):
-    """Addon (`is_running_in_addon()` True) → `_supervisor_logs_get('core')`."""
-    client._supervisor_logs_get = AsyncMock(return_value="addon-log-content")
-    client._request = AsyncMock()
-    client._raw_request = AsyncMock()
-
-    with patch("ha_mcp.client.rest_client.is_running_in_addon", return_value=True):
-        result = await client.get_error_log()
-
-    assert result == "addon-log-content"
-    client._supervisor_logs_get.assert_awaited_once_with("core")
-    # Must NOT have touched the external-branch paths.
-    client._request.assert_not_called()
-    client._raw_request.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_get_error_log_supervised_external_branch(client):
-    """External + hassio loaded → `/hassio/core/logs` via _raw_request."""
-    response = SimpleNamespace(text="supervised-log-content")
-    client._raw_request = AsyncMock(return_value=response)
-    client._request = AsyncMock(return_value={"components": ["hassio", "sun"]})
-    client._supervisor_logs_get = AsyncMock()
-
-    with patch("ha_mcp.client.rest_client.is_running_in_addon", return_value=False):
-        result = await client.get_error_log()
-
-    assert result == "supervised-log-content"
-    # /api/config probe (1) + /hassio/core/logs fetch (1).
-    assert client._request.await_count == 1
-    client._request.assert_awaited_with("GET", "/config")
-    client._raw_request.assert_awaited_once_with(
-        "GET",
-        "/hassio/core/logs?lines=20000",
-        headers={"Accept": "text/plain"},
+    @pytest.mark.parametrize(
+        ("lines", "offset", "expected"),
+        [
+            pytest.param(3, 10, [], id="past-the-start"),
+            pytest.param(5, 8, LINES[:2], id="partial-last-page"),
+        ],
     )
-    # Must NOT have entered the addon branch.
-    client._supervisor_logs_get.assert_not_called()
+    async def test_a_container_page_at_the_start_holds_only_what_remains(
+        self,
+        log_file: Path,
+        core_client: HomeAssistantClient,
+        lines: int,
+        offset: int,
+        expected: list[str],
+    ) -> None:
+        """The page after the last one is empty, not a wrapped-around window."""
+        await serve_log(log_file, "".join(f"{line}\n" for line in LINES))
+
+        page = await core_client.get_error_log(lines=lines, offset=offset)
+
+        assert page.text.splitlines() == expected
+        assert page.has_more is False
 
 
-@pytest.mark.asyncio
-async def test_get_error_log_container_external_branch(client):
-    """External + hassio NOT loaded → ``/error_log`` via _raw_request.
+class TestTheJournal:
+    async def test_the_window_is_sent_as_a_range_with_no_lines_query(
+        self, journald_route: ErrorLogRoute
+    ) -> None:
+        """Supervisor serves ``?lines=`` instead of the ``Range`` when both are sent."""
+        await journald_route.client.get_error_log(lines=100, offset=250)
 
-    The Container/pip branch must use ``_raw_request`` so the plain-text
-    response from ``/api/error_log`` reaches the caller verbatim. The
-    older implementation used ``_request`` which JSON-parses the body and
-    silently returned ``"{}"`` on the JSONDecodeError fallback — fixed
-    by the Gemini-flagged HIGH-priority bug in PR #1360.
-    """
-    container_response = SimpleNamespace(text="real container log line\n")
-    client._request = AsyncMock(return_value={"components": ["sun", "demo"]})
-    client._raw_request = AsyncMock(return_value=container_response)
-    client._supervisor_logs_get = AsyncMock()
+        (seen,) = journald_route.journal.requests
+        assert seen.path.endswith("/core/logs")
+        assert seen.range == "entries=:-349:100"
+        assert seen.query == {"no_colors": "true"}
 
-    with patch("ha_mcp.client.rest_client.is_running_in_addon", return_value=False):
-        result = await client.get_error_log()
+    async def test_a_short_window_ends_the_journal_without_a_probe(
+        self, journald_route: ErrorLogRoute
+    ) -> None:
+        """Nothing shortens a window but the journal's start, so short means done."""
+        await journald_route.serve(LINES[:2])
 
-    assert result == "real container log line\n"
-    # Probe via _request, log fetch via _raw_request — symmetry with supervised branch.
-    client._request.assert_awaited_once_with("GET", "/config")
-    client._raw_request.assert_awaited_once_with(
-        "GET", "/error_log", headers={"Accept": "text/plain"}
-    )
-    client._supervisor_logs_get.assert_not_called()
+        page = await journald_route.client.get_error_log(lines=10)
+
+        assert page.has_more is False
+        assert len(journald_route.journal.ranges) == 1
+
+    async def test_a_cursor_token_reads_the_entries_behind_its_resume_point(
+        self, journald_route: ErrorLogRoute
+    ) -> None:
+        """The token's skip is where the page ends, not where it starts."""
+        journal = journald_route.journal
+        entries = [f"line{i}" for i in range(20)]
+        await journald_route.serve(entries)
+
+        page = await journald_route.client.get_error_log(
+            lines=3, offset=f"cursor:{journal.cursor(5)}:7"
+        )
+
+        assert page.text.splitlines() == entries[9:12]
+        assert page.has_more is True
+        assert page.first_cursor == journal.cursor(9)
+
+    async def test_a_cursor_page_clamped_to_the_head_stops_at_the_resume_point(
+        self, journald_route: ErrorLogRoute
+    ) -> None:
+        """A block clamped to the journal's head must not run past the resume point.
+
+        The resume point is seven entries in; gatewayd clamps the ten-entry
+        block to the head and reads forward past it. Returning that block whole
+        would repeat entries the previous page returned and hide none behind.
+        """
+        journal = journald_route.journal
+        entries = [f"line{i}" for i in range(20)]
+        await journald_route.serve(entries)
+
+        page = await journald_route.client.get_error_log(
+            lines=10, offset=f"cursor:{journal.cursor(2)}:5"
+        )
+
+        assert page.text.splitlines() == entries[:7]
+        assert page.has_more is False
+
+    async def test_a_cursor_page_before_the_head_returns_nothing(
+        self, journald_route: ErrorLogRoute
+    ) -> None:
+        journal = journald_route.journal
+        await journald_route.serve(LINES)
+
+        page = await journald_route.client.get_error_log(
+            lines=5, offset=f"cursor:{journal.cursor(0)}:0"
+        )
+
+        assert page.text == ""
+        assert page.has_more is False
 
 
-@pytest.mark.asyncio
-async def test_get_error_log_uses_cached_supervised_flag(client):
-    """Second `get_error_log` call on a supervised install reuses the cache."""
-    response = SimpleNamespace(text="cached-call-log")
-    client._raw_request = AsyncMock(return_value=response)
-    # First call's probe returns hassio loaded; second call MUST NOT re-probe.
-    client._request = AsyncMock(return_value={"components": ["hassio"]})
+class TestTheInstallClass:
+    async def test_the_install_class_is_asked_once_per_client(
+        self, probing_route: ErrorLogRoute
+    ) -> None:
+        """Core's answer, ``hassio`` loaded or not, holds for the client's life.
 
-    with patch("ha_mcp.client.rest_client.is_running_in_addon", return_value=False):
-        await client.get_error_log()
-        await client.get_error_log()
-        await client.get_error_log()
+        The log itself is read anew on every call.
+        """
+        assert probing_route.gateway is not None
+        texts = []
+        for line in ("first", "second", "third"):
+            await probing_route.serve([line])
+            texts.append((await probing_route.client.get_error_log(lines=10)).text)
 
-    # /api/config probe fired exactly once across 3 get_error_log calls.
-    assert client._request.await_count == 1
-    # /hassio/core/logs fetched on every call (no caching of log content).
-    assert client._raw_request.await_count == 3
+        assert texts == ["first", "second", "third"]
+        assert probing_route.gateway.requests.count("GET /api/config") == 1
 
+    async def test_a_failed_probe_reads_cores_own_log_and_asks_again(
+        self,
+        log_file: Path,
+        gateway_client: HomeAssistantClient,
+        gateway: Gateway,
+    ) -> None:
+        """A Core that fails to say its install class is asked again next call."""
+        await serve_log(log_file, "line0\n")
+        gateway.outages = [500]
 
-@pytest.mark.asyncio
-async def test_get_error_log_caches_negative_supervised_flag(client):
-    """Container HA: probe runs once across N get_error_log calls.
+        first = await gateway_client.get_error_log(lines=10)
+        second = await gateway_client.get_error_log(lines=10)
 
-    Definitive non-supervised signal is cached, so subsequent calls go
-    straight to /error_log without re-probing /api/config. Avoids the
-    extra round-trip Gemini flagged as a MEDIUM efficiency issue.
-    """
-    container_response = SimpleNamespace(text="log content\n")
-    client._request = AsyncMock(return_value={"components": ["sun", "demo"]})
-    client._raw_request = AsyncMock(return_value=container_response)
-
-    with patch("ha_mcp.client.rest_client.is_running_in_addon", return_value=False):
-        await client.get_error_log()
-        await client.get_error_log()
-        await client.get_error_log()
-
-    # /api/config probe fired exactly once.
-    assert client._request.await_count == 1
-    # /error_log fetched on every call.
-    assert client._raw_request.await_count == 3
+        assert first.text == second.text == "line0"
+        assert gateway.requests.count("GET /api/config") == 2
+        assert gateway.requests.count("GET /api/error_log") == 2
 
 
-@pytest.mark.asyncio
-async def test_get_error_log_supervised_probe_failure_falls_to_container(client):
-    """Probe transport failure on first call drops to the Container branch.
+@pytest.mark.timeout(10)
+class TestTheDeadline:
+    """``httpx.Timeout`` is per I/O operation, so an upstream trickling bytes
+    never trips it (#2279); one deadline over the whole call must."""
 
-    Fail-open contract: a transient /api/config failure must not break
-    get_error_log entirely. It falls through to the historical
-    /error_log path. (On HAOS that path then 404s — same status quo
-    as before the fix, but with a clearer error than swallowing the
-    probe exception would surface.) The probe failure is NOT cached, so
-    the next call re-probes.
-    """
-    container_response = SimpleNamespace(text="container fallback log\n")
-    client._request = AsyncMock(side_effect=HomeAssistantConnectionError("boom"))
-    client._raw_request = AsyncMock(return_value=container_response)
+    async def test_a_stalled_journal_ends_at_the_deadline(
+        self, journald_route: ErrorLogRoute, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = journald_route.client
+        await journald_route.serve(LINES)
+        # The install class is asked here, before anything stalls.
+        await client.get_error_log(lines=5)
+        journald_route.journal.hang = True
+        monkeypatch.setattr(client, "timeout", DEADLINE)
 
-    with patch("ha_mcp.client.rest_client.is_running_in_addon", return_value=False):
-        result = await client.get_error_log()
+        with pytest.raises(HomeAssistantConnectionError, match=r"after 0\.01s"):
+            await client.get_error_log(lines=5)
 
-    assert result == "container fallback log\n"
-    # Probe was attempted, then /error_log fetched via _raw_request.
-    client._request.assert_awaited_once_with("GET", "/config")
-    client._raw_request.assert_awaited_once_with(
-        "GET", "/error_log", headers={"Accept": "text/plain"}
-    )
-    # Probe failure must NOT have poisoned the cache.
-    assert client._supervised_detected is None
+    async def test_a_stalled_container_log_ends_at_the_deadline(
+        self,
+        stalled_error_log: Gateway,
+        gateway_client: HomeAssistantClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The container route transfers the whole file, and is bounded too."""
+        # A cursor token is refused once Core says it has no hassio, before the
+        # log is read: the install class is known before anything stalls.
+        with pytest.raises(HomeAssistantAPIError, match="Supervisor-backed"):
+            await gateway_client.get_error_log(lines=5, offset="cursor:c:0")
+        monkeypatch.setattr(gateway_client, "timeout", DEADLINE)
+
+        with pytest.raises(HomeAssistantConnectionError, match=r"after 0\.01s"):
+            await gateway_client.get_error_log(lines=5)
+
+    async def test_a_stalled_install_class_probe_ends_at_the_deadline(
+        self,
+        stalled_probe: Gateway,
+        gateway_client: HomeAssistantClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A connection already open: a 10 ms deadline must land on the stalled
+        # read, not on the connection being made.
+        await gateway_client.get_states()
+        monkeypatch.setattr(gateway_client, "timeout", DEADLINE)
+
+        with pytest.raises(HomeAssistantConnectionError, match=r"after 0\.01s"):
+            await gateway_client.get_error_log(lines=5)
+
+        assert "GET /api/error_log" not in stalled_probe.requests

@@ -14,7 +14,6 @@ import pytest
 
 from ...utilities.assertions import (
     assert_mcp_success,
-    extract_error_message,
     parse_mcp_result,
     safe_call_tool,
 )
@@ -337,7 +336,7 @@ class TestInputBooleanCRUD:
             {
                 "helper_type": "input_boolean",
                 "name": "E2E Initial On Boolean",
-                "initial": "on",
+                "config": {"initial": "on"},
             },
         )
 
@@ -374,7 +373,6 @@ class TestInputNumberCRUD:
 
     async def test_input_number_full_lifecycle(self, mcp_client, cleanup_tracker):
         """Test complete input_number lifecycle with numeric settings."""
-        logger.info("Testing input_number full lifecycle")
 
         helper_name = "E2E Test Number"
 
@@ -384,11 +382,13 @@ class TestInputNumberCRUD:
             {
                 "helper_type": "input_number",
                 "name": helper_name,
-                "min_value": 0,
-                "max_value": 100,
-                "step": 5,
-                "unit_of_measurement": "%",
-                "mode": "slider",
+                "config": {
+                    "min": 0,
+                    "max": 100,
+                    "step": 5,
+                    "unit_of_measurement": "%",
+                    "mode": "slider",
+                },
             },
         )
 
@@ -424,16 +424,13 @@ class TestInputNumberCRUD:
 
     async def test_input_number_box_mode(self, mcp_client, cleanup_tracker):
         """Test creating input_number with box mode."""
-        logger.info("Testing input_number with box mode")
 
         result = await mcp_client.call_tool(
             "ha_config_set_helper",
             {
                 "helper_type": "input_number",
                 "name": "E2E Box Mode Number",
-                "min_value": -50,
-                "max_value": 50,
-                "mode": "box",
+                "config": {"min": -50, "max": 50, "mode": "box"},
             },
         )
 
@@ -481,8 +478,7 @@ class TestInputSelectCRUD:
             {
                 "helper_type": "input_select",
                 "name": helper_name,
-                "options": options,
-                "initial": "Option B",
+                "config": {"options": options, "initial": "Option B"},
             },
         )
 
@@ -518,22 +514,6 @@ class TestInputSelectCRUD:
         )
         logger.info("Input select cleanup complete")
 
-    async def test_input_select_requires_options(self, mcp_client):
-        """Test that input_select requires options."""
-        logger.info("Testing input_select without options (should fail)")
-
-        data = await safe_call_tool(
-            mcp_client,
-            "ha_config_set_helper",
-            {
-                "helper_type": "input_select",
-                "name": "E2E No Options Select",
-                # Missing required options
-            },
-        )
-        assert data.get("success") is False, f"Should fail without options: {data}"
-        logger.info("Input select properly requires options")
-
 
 @pytest.mark.asyncio
 @pytest.mark.config
@@ -555,7 +535,6 @@ class TestInputTextCRUD:
 
     async def test_input_text_full_lifecycle(self, mcp_client, cleanup_tracker):
         """Test complete input_text lifecycle with text settings."""
-        logger.info("Testing input_text full lifecycle")
 
         helper_name = "E2E Test Text"
 
@@ -565,10 +544,12 @@ class TestInputTextCRUD:
             {
                 "helper_type": "input_text",
                 "name": helper_name,
-                "min_value": 1,  # Min length
-                "max_value": 100,  # Max length
-                "mode": "text",
-                "initial": "Hello E2E",
+                "config": {
+                    "min": 1,
+                    "max": 100,
+                    "mode": "text",
+                    "initial": "Hello E2E",
+                },
             },
         )
 
@@ -591,14 +572,13 @@ class TestInputTextCRUD:
 
     async def test_input_text_password_mode(self, mcp_client, cleanup_tracker):
         """Test creating input_text with password mode."""
-        logger.info("Testing input_text with password mode")
 
         result = await mcp_client.call_tool(
             "ha_config_set_helper",
             {
                 "helper_type": "input_text",
                 "name": "E2E Password Text",
-                "mode": "password",
+                "config": {"mode": "password"},
             },
         )
 
@@ -635,15 +615,13 @@ class TestInputDatetimeCRUD:
 
     async def test_input_datetime_date_only(self, mcp_client, cleanup_tracker):
         """Test creating input_datetime with date only."""
-        logger.info("Testing input_datetime date only")
 
         result = await mcp_client.call_tool(
             "ha_config_set_helper",
             {
                 "helper_type": "input_datetime",
                 "name": "E2E Date Only",
-                "has_date": True,
-                "has_time": False,
+                "config": {"has_date": True, "has_time": False},
             },
         )
 
@@ -668,8 +646,7 @@ class TestInputDatetimeCRUD:
             {
                 "helper_type": "input_datetime",
                 "name": "E2E Time Only",
-                "has_date": False,
-                "has_time": True,
+                "config": {"has_date": False, "has_time": True},
             },
         )
 
@@ -694,8 +671,7 @@ class TestInputDatetimeCRUD:
             {
                 "helper_type": "input_datetime",
                 "name": "E2E Full Datetime",
-                "has_date": True,
-                "has_time": True,
+                "config": {"has_date": True, "has_time": True},
             },
         )
 
@@ -838,9 +814,7 @@ class TestInputButtonCRUD:
         )
         delete_data = assert_mcp_success(delete_result, "Delete disabled helper")
 
-        # Standard registry-driven delete path ran — unique_id was resolved
-        # and no fallback fired. Tighter than `!= "already_deleted"`: also
-        # rejects `direct_id` and any future fallback variant.
+        # Standard registry-driven delete path ran — unique_id was resolved.
         assert delete_data.get("method") == "websocket_delete", (
             f"Expected websocket_delete via unique_id; got "
             f"method={delete_data.get('method')}, data={delete_data}"
@@ -848,27 +822,19 @@ class TestInputButtonCRUD:
         assert "unique_id" in delete_data, (
             f"Standard path not taken (no unique_id in response): {delete_data}"
         )
-        assert delete_data.get("fallback_used") is None, (
-            f"Expected no fallback; got fallback_used="
-            f"{delete_data.get('fallback_used')!r}, data={delete_data}"
-        )
         logger.info(
             f"Disabled helper deleted via "
             f"{delete_data.get('method')} (unique_id={delete_data.get('unique_id')})"
         )
 
-        # Verify entity is gone — error code varies (ENTITY_NOT_FOUND vs
-        # SERVICE_CALL_FAILED), so the assertion targets the message.
+        # Verify entity is gone: ha_get_entity reports it not found.
         get_data = await safe_call_tool(
             mcp_client, "ha_get_entity", {"entity_id": entity_id}
         )
         assert get_data.get("success", True) is False, (
             f"Entity still present in registry after delete: {get_data}"
         )
-        err_msg = extract_error_message(get_data).lower()
-        assert "not found" in err_msg, (
-            f"Expected 'not found' in error message, got: {get_data}"
-        )
+        assert get_data["error"]["code"] == "ENTITY_NOT_FOUND", get_data
 
         logger.info(
             f"Issue #1057 regression test passed: disabled "
@@ -970,10 +936,7 @@ class TestCounterCRUD:
                 "helper_type": "counter",
                 "name": helper_name,
                 "icon": "mdi:counter",
-                "initial": 5,
-                "min_value": 0,
-                "max_value": 100,
-                "step": 2,
+                "config": {"initial": 5, "minimum": 0, "maximum": 100, "step": 2},
             },
         )
 
@@ -1062,8 +1025,7 @@ class TestTimerCRUD:
                 "helper_type": "timer",
                 "name": helper_name,
                 "icon": "mdi:timer",
-                "duration": "0:05:00",
-                "restore": True,
+                "config": {"duration": "0:05:00", "restore": True},
             },
         )
 
@@ -1153,12 +1115,14 @@ class TestScheduleCRUD:
                 "helper_type": "schedule",
                 "name": helper_name,
                 "icon": "mdi:calendar-clock",
-                "monday": [{"from": "09:00", "to": "17:00"}],
-                "tuesday": [{"from": "09:00", "to": "17:00"}],
-                "wednesday": [
-                    {"from": "09:00", "to": "12:00"},
-                    {"from": "13:00", "to": "17:00"},
-                ],
+                "config": {
+                    "monday": [{"from": "09:00", "to": "17:00"}],
+                    "tuesday": [{"from": "09:00", "to": "17:00"}],
+                    "wednesday": [
+                        {"from": "09:00", "to": "12:00"},
+                        {"from": "13:00", "to": "17:00"},
+                    ],
+                },
             },
         )
 
@@ -1227,13 +1191,15 @@ class TestScheduleCRUD:
                 "helper_type": "schedule",
                 "name": helper_name,
                 "icon": "mdi:calendar-clock",
-                "monday": [
-                    {"from": "07:00", "to": "22:00", "data": {"mode": "comfort"}},
-                    {"from": "22:00", "to": "23:59", "data": {"mode": "sleep"}},
-                ],
-                "tuesday": [
-                    {"from": "07:00", "to": "22:00", "data": {"mode": "comfort"}},
-                ],
+                "config": {
+                    "monday": [
+                        {"from": "07:00", "to": "22:00", "data": {"mode": "comfort"}},
+                        {"from": "22:00", "to": "23:59", "data": {"mode": "sleep"}},
+                    ],
+                    "tuesday": [
+                        {"from": "07:00", "to": "22:00", "data": {"mode": "comfort"}},
+                    ],
+                },
             },
         )
 
@@ -1318,10 +1284,12 @@ class TestScheduleCRUD:
             {
                 "helper_type": "schedule",
                 "name": helper_name,
-                "monday": [
-                    {"from": "07:00", "to": "22:00", "data": {"mode": "comfort"}},
-                    {"from": "22:00", "to": "23:59", "data": {"mode": "sleep"}},
-                ],
+                "config": {
+                    "monday": [
+                        {"from": "07:00", "to": "22:00", "data": {"mode": "comfort"}},
+                        {"from": "22:00", "to": "23:59", "data": {"mode": "sleep"}},
+                    ]
+                },
             },
         )
 
@@ -1340,10 +1308,12 @@ class TestScheduleCRUD:
                 "helper_type": "schedule",
                 "name": helper_name,
                 "helper_id": entity_id,
-                "monday": [
-                    {"from": "07:00", "to": "22:00", "data": {"mode": "away"}},
-                    {"from": "22:00", "to": "23:59", "data": {"mode": "comfort"}},
-                ],
+                "config": {
+                    "monday": [
+                        {"from": "07:00", "to": "22:00", "data": {"mode": "away"}},
+                        {"from": "22:00", "to": "23:59", "data": {"mode": "comfort"}},
+                    ]
+                },
             },
         )
 
@@ -1417,10 +1387,12 @@ class TestZoneCRUD:
                 "helper_type": "zone",
                 "name": helper_name,
                 "icon": "mdi:map-marker",
-                "latitude": 37.7749,
-                "longitude": -122.4194,
-                "radius": 150,
-                "passive": False,
+                "config": {
+                    "latitude": 37.7749,
+                    "longitude": -122.4194,
+                    "radius": 150,
+                    "passive": False,
+                },
             },
         )
 
@@ -1486,10 +1458,12 @@ class TestZoneCRUD:
             {
                 "helper_type": "zone",
                 "name": "E2E Zone Update Test",
-                "latitude": 40.7128,
-                "longitude": -74.0060,
-                "radius": 200,
-                "passive": False,
+                "config": {
+                    "latitude": 40.7128,
+                    "longitude": -74.0060,
+                    "radius": 200,
+                    "passive": False,
+                },
             },
         )
         create_data = assert_mcp_success(create_result, "Create zone for update test")
@@ -1511,9 +1485,7 @@ class TestZoneCRUD:
                 "helper_type": "zone",
                 "helper_id": entity_id,
                 "name": "E2E Zone Update Test",
-                "latitude": 51.5074,
-                "longitude": -0.1278,
-                "radius": 500,
+                "config": {"latitude": 51.5074, "longitude": -0.1278, "radius": 500},
             },
         )
         update_data = assert_mcp_success(update_result, "Update zone coordinates")
@@ -1709,8 +1681,10 @@ class TestTagCRUD:
             {
                 "helper_type": "tag",
                 "name": helper_name,
-                "tag_id": test_tag_id,
-                "description": "Test tag for E2E testing",
+                "config": {
+                    "tag_id": test_tag_id,
+                    "description": "Test tag for E2E testing",
+                },
             },
         )
 
@@ -1755,8 +1729,7 @@ class TestTagCRUD:
             {
                 "helper_type": "tag",
                 "name": "E2E Tag Update Test",
-                "tag_id": test_tag_id,
-                "description": "Initial description",
+                "config": {"tag_id": test_tag_id, "description": "Initial description"},
             },
         )
         create_data = assert_mcp_success(create_result, "Create tag for update test")
@@ -1772,7 +1745,7 @@ class TestTagCRUD:
                 "helper_type": "tag",
                 "helper_id": tag_id,
                 "name": "E2E Tag Update Test Renamed",
-                "description": "Updated description",
+                "config": {"description": "Updated description"},
             },
         )
         update_data = assert_mcp_success(
@@ -1814,74 +1787,21 @@ class TestTagCRUD:
 @pytest.mark.config
 @pytest.mark.helper
 class TestSetHelperNegativeInputs:
-    """Negative-input tests for ha_config_set_helper pre-flight guards."""
+    """Negative-input tests for ha_config_set_helper pre-flight guards.
+
+    Field values Home Assistant judges itself are in test_helper_core_validation.py.
+    """
 
     async def test_create_requires_name(self, mcp_client) -> None:
         """Rejects a create call when name is empty.
 
-        Guard: tools_config_helpers.py — raises VALIDATION_INVALID_PARAMETER
+        Guard: config_helpers/create.py — raises VALIDATION_INVALID_PARAMETER
         before any WebSocket I/O when action is "create" and name is falsy.
         """
         result = await safe_call_tool(
             mcp_client,
             "ha_config_set_helper",
             {"helper_type": "input_boolean", "name": ""},
-        )
-        assert result["success"] is False
-        assert result["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
-
-    async def test_input_number_invalid_range(self, mcp_client) -> None:
-        """Rejects input_number when min_value > max_value.
-
-        Guard: tools_config_helpers.py — raises VALIDATION_INVALID_PARAMETER
-        when min_value is greater than max_value.
-        """
-        result = await safe_call_tool(
-            mcp_client,
-            "ha_config_set_helper",
-            {
-                "helper_type": "input_number",
-                "name": "Invalid Range",
-                "min_value": 100,
-                "max_value": 0,
-            },
-        )
-        assert result["success"] is False
-        assert result["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
-
-    async def test_input_datetime_both_date_and_time_false(self, mcp_client) -> None:
-        """Rejects input_datetime when both has_date and has_time are False.
-
-        Guard: tools_config_helpers.py — raises VALIDATION_INVALID_PARAMETER
-        when both fields are explicitly False.
-        """
-        result = await safe_call_tool(
-            mcp_client,
-            "ha_config_set_helper",
-            {
-                "helper_type": "input_datetime",
-                "name": "Invalid DateTime",
-                "has_date": False,
-                "has_time": False,
-            },
-        )
-        assert result["success"] is False
-        assert result["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
-
-    async def test_input_select_requires_options(self, mcp_client) -> None:
-        """Rejects input_select when options is absent.
-
-        Guard: tools_config_helpers.py — raises VALIDATION_INVALID_PARAMETER
-        before any WebSocket I/O when helper_type is "input_select" and
-        options is falsy.
-        """
-        result = await safe_call_tool(
-            mcp_client,
-            "ha_config_set_helper",
-            {
-                "helper_type": "input_select",
-                "name": "Missing Options",
-            },
         )
         assert result["success"] is False
         assert result["error"]["code"] == "VALIDATION_INVALID_PARAMETER"

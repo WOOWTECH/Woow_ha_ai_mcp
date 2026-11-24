@@ -3,11 +3,18 @@
 # WITHOUT Chromium: it returns a synthetic, viewport-sized PNG and gates
 # rendering on validating the configured access_token against Home Assistant
 # (a bad token fails, exactly like the real engine reaching only the login
-# screen). python:3.13-slim is the same fast, reliable base the dev +
+# screen). python:3.14-slim is the same fast, reliable base the dev +
 # webhook-proxy add-ons build from in this bake. No apt, no npm, no Chromium.
-# Digest-pinned (matches the webhook-proxy addon) so the in-Supervisor build is
-# reproducible and Renovate-bumpable — an unpinned tag would reintroduce the
-# floating-base bake failure this change exists to eliminate.
-FROM python:3.13-slim@sha256:3de9a8d7aedbb7984dc18f2dff178a7850f16c1ae7c34ba9d7ecc23d0755e35f
+# Digest-pinned (tracks the coordinated Python base every managed Dockerfile
+# shares -- see the "python" packageRule in renovate.json) so the
+# in-Supervisor build is reproducible and Renovate-bumpable. The
+# webhook-proxy add-ons are excluded from that automation and update only
+# through their own dev-first promotion workflow, so their pin can lag this
+# one. An unpinned tag here would reintroduce the floating-base bake failure
+# this change exists to eliminate.
+# PYTHON_BASE lets CI point the runtime base at another registry holding the
+# same digest when ECR Public rate-limits the pull; the default is the pin.
+ARG PYTHON_BASE=public.ecr.aws/docker/library/python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+FROM ${PYTHON_BASE}
 COPY server.py /server.py
 CMD ["python", "/server.py"]

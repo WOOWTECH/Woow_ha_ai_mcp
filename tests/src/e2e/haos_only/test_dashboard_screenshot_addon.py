@@ -45,9 +45,11 @@ import time
 from typing import Any
 
 import pytest
-from fastmcp.exceptions import ToolError
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 
 from ..utilities.assertions import parse_mcp_result, safe_call_tool
+from ..utilities.cleanup import CleanupSteps
 from ..utilities.wait_helpers import _POLLING_TRANSIENT_ERRORS
 
 LOG = logging.getLogger(__name__)
@@ -107,7 +109,7 @@ def _extract_png_bytes(result: Any) -> bytes | None:
             if isinstance(data, str):
                 try:
                     return base64.b64decode(data)
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     continue
             if isinstance(data, (bytes, bytearray)):
                 return bytes(data)
@@ -153,12 +155,12 @@ async def _screenshot(mcp_client: Any, path: str, **kw: Any) -> bytes:
 
 
 async def _get_addon_detail(mcp_client: Any, slug: str) -> dict[str, Any]:
-    raw = await mcp_client.call_tool("ha_get_addon", {"slug": slug})
+    raw = await mcp_client.call_tool("ha_get_app", {"slug": slug})
     payload = parse_mcp_result(raw)
-    assert payload.get("success"), f"ha_get_addon({slug!r}) failed: {payload}"
+    assert payload.get("success"), f"ha_get_app({slug!r}) failed: {payload}"
     detail = payload.get("addon")
     assert isinstance(detail, dict), (
-        f"ha_get_addon({slug!r}) returned no addon dict: {payload}"
+        f"ha_get_app({slug!r}) returned no addon dict: {payload}"
     )
     return detail
 
@@ -201,11 +203,11 @@ async def _wait_for_state(
 
 async def _set_options(mcp_client: Any, slug: str, options: dict[str, Any]) -> None:
     raw = await mcp_client.call_tool(
-        "ha_manage_addon", {"slug": slug, "options": dict(options)}
+        "ha_manage_app", {"slug": slug, "options": dict(options)}
     )
     payload = parse_mcp_result(raw)
     ok = payload.get("success") is True or payload.get("status") == "pending_restart"
-    assert ok, f"ha_manage_addon options write failed: {payload}"
+    assert ok, f"ha_manage_app options write failed: {payload}"
 
 
 async def _engine_diagnostics(mcp_client: Any) -> str:
@@ -218,7 +220,7 @@ async def _engine_diagnostics(mcp_client: Any) -> str:
     try:
         detail = await _get_addon_detail(mcp_client, SCREENSHOT_ADDON_SLUG)
         parts.append(f"addon state={detail.get('state')!r}")
-    except Exception as exc:  # pragma: no cover - diagnostics are best-effort
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostics are best-effort
         parts.append(f"(could not read addon state: {exc})")
     try:
         raw = await mcp_client.call_tool(
@@ -227,7 +229,7 @@ async def _engine_diagnostics(mcp_client: Any) -> str:
         log_text = parse_mcp_result(raw).get("log", "")
         if isinstance(log_text, str) and log_text.strip():
             parts.append("engine log tail:\n" + log_text[-2000:])
-    except Exception as exc:  # pragma: no cover - diagnostics are best-effort
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostics are best-effort
         parts.append(f"(could not read engine log: {exc})")
     return " | ".join(parts)
 
@@ -301,44 +303,31 @@ async def screenshot_engine_started(
         await _wait_engine_serving(mcp_client)
         yield
     finally:
-        cleanup_errors: list[str] = []
-        try:
-            await _set_options(mcp_client, SCREENSHOT_ADDON_SLUG, original_options)
-        except Exception as exc:
-            cleanup_errors.append(f"options restore failed: {exc!r}")
-
-        restore_action = "restart" if original_state == "started" else "stop"
-        try:
-            restore_result = await _addon_action(
-                mcp_client, SCREENSHOT_ADDON_SLUG, restore_action
-            )
-            if not restore_result.get("success"):
-                cleanup_errors.append(
+        # A fixture teardown sees no test outcome, so a failed step fails here
+        # even after a failed test.
+        with CleanupSteps() as cleanup:
+            with cleanup.step():
+                await _set_options(mcp_client, SCREENSHOT_ADDON_SLUG, original_options)
+            with cleanup.step():
+                restore_action = "restart" if original_state == "started" else "stop"
+                restore_result = await _addon_action(
+                    mcp_client, SCREENSHOT_ADDON_SLUG, restore_action
+                )
+                assert restore_result.get("success"), (
                     f"state restore action failed: {restore_result!r}"
                 )
-        except Exception as exc:
-            cleanup_errors.append(f"state restore action failed: {exc!r}")
-
-        expected_state: str | frozenset[str] = (
-            "started" if original_state == "started" else STOPPED_STATES
-        )
-        try:
-            await _wait_for_state(
-                mcp_client, SCREENSHOT_ADDON_SLUG, expected_state, timeout=30.0
-            )
-        except Exception as exc:
-            cleanup_errors.append(f"state verification failed: {exc!r}")
-
-        try:
-            restored_detail = await _get_addon_detail(mcp_client, SCREENSHOT_ADDON_SLUG)
-            if dict(restored_detail.get("options") or {}) != original_options:
-                cleanup_errors.append("options verification failed")
-        except Exception as exc:
-            cleanup_errors.append(f"options verification failed: {exc!r}")
-
-        assert not cleanup_errors, (
-            "Fixture failed to restore screenshot engine: " + "; ".join(cleanup_errors)
-        )
+            with cleanup.step():
+                expected_state: str | frozenset[str] = (
+                    "started" if original_state == "started" else STOPPED_STATES
+                )
+                await _wait_for_state(
+                    mcp_client, SCREENSHOT_ADDON_SLUG, expected_state, timeout=30.0
+                )
+            with cleanup.step():
+                restored = await _get_addon_detail(mcp_client, SCREENSHOT_ADDON_SLUG)
+                assert dict(restored.get("options") or {}) == original_options, (
+                    "options verification failed"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -517,17 +506,18 @@ async def test_token_is_what_authenticates(
                 "authenticates (both produced the same image)."
             )
     finally:
-        await _set_options(mcp_client, slug, {"access_token": good_token})
-        restore_result = await _addon_action(mcp_client, slug, "restart")
-        assert restore_result.get("success"), "Valid-token restore restart failed"
-        await _wait_for_state(mcp_client, slug, "started")
-        await _wait_engine_serving(mcp_client, context="token restore")
-        # Confirm the valid token actually re-committed, so a leaked invalid
-        # token can't poison a retry's baseline within the session.
-        detail = await _get_addon_detail(mcp_client, slug)
-        assert (detail.get("options") or {}).get("access_token", "") == good_token, (
-            "Restore of the valid token did not commit"
-        )
+        with CleanupSteps() as cleanup, cleanup.step():
+            await _set_options(mcp_client, slug, {"access_token": good_token})
+            restore_result = await _addon_action(mcp_client, slug, "restart")
+            assert restore_result.get("success"), "Valid-token restore restart failed"
+            await _wait_for_state(mcp_client, slug, "started")
+            await _wait_engine_serving(mcp_client, context="token restore")
+            # Confirm the valid token actually re-committed, so a leaked invalid
+            # token can't poison a retry's baseline within the session.
+            detail = await _get_addon_detail(mcp_client, slug)
+            assert (detail.get("options") or {}).get(
+                "access_token", ""
+            ) == good_token, "Restore of the valid token did not commit"
 
 
 async def _engine_outcome_after_restart(mcp_client: Any) -> bytes | None:
@@ -546,7 +536,7 @@ async def _engine_outcome_after_restart(mcp_client: Any) -> bytes | None:
         except ToolError as exc:
             try:
                 payload = json.loads(str(exc))
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError, TypeError:
                 payload = None
             error = payload.get("error") if isinstance(payload, dict) else None
             code = error.get("code") if isinstance(error, dict) else None

@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from ...utilities.assertions import assert_mcp_success, safe_call_tool
+from ...utilities.forecast_solar import create_forecast_solar_entry
 
 LOG = logging.getLogger(__name__)
 
@@ -58,20 +59,7 @@ async def test_forecast_solar_config_subentry_create_list_delete(
     modules_power = 1200 + int(unique[:2], 16)
 
     try:
-        flow_init = await ha_client.start_config_flow("forecast_solar")
-        assert flow_init.get("type") == "form", (
-            f"Unexpected forecast_solar flow init shape: {flow_init}"
-        )
-        flow_done = await ha_client.submit_config_flow_step(
-            flow_init["flow_id"],
-            {
-                "latitude": 52.0,
-                "longitude": 5.0,
-                "declination": 30,
-                "azimuth": 180,
-                "modules_power": 1000,
-            },
-        )
+        flow_done = await create_forecast_solar_entry(ha_client)
         assert flow_done.get("type") == "create_entry", (
             f"forecast_solar flow did not create an entry: {flow_done}"
         )
@@ -90,12 +78,22 @@ async def test_forecast_solar_config_subentry_create_list_delete(
             f"forecast_solar options flow did not complete: {options_done}"
         )
 
+        # One form per call: the sources form (its defaults), then the plane.
+        plane = {
+            "helper_type": "config_subentry",
+            "entry_id": entry_id,
+            "subentry_type": "plane",
+        }
+        sources_raw = await mcp_client.call_tool(
+            "ha_config_set_helper", {**plane, "config": {}}
+        )
+        plane_form = assert_mcp_success(sources_raw, "Answer the sources form")
+        assert plane_form.get("step_id") == "plane", plane_form
         create_raw = await mcp_client.call_tool(
             "ha_config_set_helper",
             {
-                "helper_type": "config_subentry",
-                "entry_id": entry_id,
-                "subentry_type": "plane",
+                **plane,
+                "flow_id": plane_form["flow_id"],
                 "config": {
                     "declination": 35,
                     "azimuth": 190,

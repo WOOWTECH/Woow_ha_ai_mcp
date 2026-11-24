@@ -1,15 +1,17 @@
 """Unit tests for the webhook-proxy promote/reset transform engine.
 
-These exercise the pure helpers of ``scripts/webhook_proxy_sync.py`` without
-touching the filesystem: the semver bump math, the monotonic dev-reset rule
-(including the case where stable's base is *behind* dev's), and the assertion
-that the STABLE and DEV identity profiles are exact inverses of each other.
+Most tests exercise the pure string transforms of ``scripts/webhook_proxy_sync.py``:
+the semver bump math, the monotonic dev-reset rule (including the case where
+stable's base is *behind* dev's) and the per-file transforms.
 
-The full round-trip (that ``reset``/``promote`` produce a version-only diff on
-a clean tree) is guaranteed by the acceptance gate in the build spec, not here.
+The dev version rewrite runs on files the test writes under ``tmp_path``. The
+round-trip tests (``reset``/``promote`` of a copy of one committed add-on tree
+reproduces the other) run only at sync points; see the note on
+``_sync_point_only`` below.
 """
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -37,6 +39,7 @@ _sync_point_only = pytest.mark.skipif(
 
 def _load_sync():
     spec = importlib.util.spec_from_file_location("webhook_proxy_sync", SYNC_PATH)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec so the module's @dataclass can resolve its own
     # __module__ (dataclasses looks it up in sys.modules during processing).
@@ -86,13 +89,22 @@ def test_bump_stable_tuple_math():
 # ---------------------------------------------------------------------------
 # Reset: dev version must ALWAYS strictly increase
 # ---------------------------------------------------------------------------
-def test_reset_bumps_dev_counter_when_bases_equal():
-    assert sync.reset_version("1.2.3.dev1", "1.2.3") == "1.2.3.dev2"
+def test_reset_moves_to_next_stable_patch_with_fresh_counter():
+    # homeassistant-addon-webhook-proxy/AGENTS.md § Versioning: the dev base is
+    # the NEXT stable patch, so the dev channel
+    # sorts AHEAD of the stable it will promote into (PEP 440 puts
+    # 1.2.3.devN BEHIND 1.2.3). Counter restarts on the base jump.
+    assert sync.reset_version("1.2.3.dev1", "1.2.3") == "1.2.4.dev1"
 
 
-def test_reset_takes_stable_base_when_stable_is_ahead():
-    # stable ahead of dev's base -> base climbs, counter still advances
-    assert sync.reset_version("1.0.0.dev3", "1.5.0") == "1.5.0.dev4"
+def test_reset_takes_next_patch_above_stable_when_stable_is_ahead():
+    # stable ahead of dev's base -> base climbs past it, counter restarts
+    assert sync.reset_version("1.0.0.dev3", "1.5.0") == "1.5.1.dev1"
+
+
+def test_reset_advances_counter_when_dev_base_already_next_patch():
+    # dev already sits on the next stable patch -> same base, counter advances
+    assert sync.reset_version("1.2.4.dev2", "1.2.3") == "1.2.4.dev3"
 
 
 def test_reset_still_increases_when_stable_base_is_behind_dev():
@@ -119,34 +131,118 @@ def test_reset_monotonic_across_a_range_of_pairs():
         assert _version_key(new) > _version_key(current_dev), (
             f"reset({current_dev}, {current_stable}) = {new} did not increase"
         )
+        # The doc invariant the old max-base rule silently violated: the new
+        # dev version must sort AHEAD of the stable it will promote into
+        # (_version_key models PEP 440's devN-before-release ordering).
+        assert _version_key(new) > _version_key(current_stable), (
+            f"reset({current_dev}, {current_stable}) = {new} sorts behind stable"
+        )
+
+
+def test_rebase_dev_version_writes_both_files_in_place(tmp_path):
+    """The promote transform's in-PR dev version rebase: only the two
+    version-bearing dev files change, onto the next-stable-patch line."""
+    stable_cfg = (
+        'name: "x"\ndescription: "y"\nversion: "2.1.0"\n'
+        'slug: "s"\nurl: "u"\narch:\n  - amd64\nboot: auto\n'
+    )
+    dev_dir = tmp_path / sync.DEV.addon_dir
+    (dev_dir / sync.DEV.component).mkdir(parents=True)
+    (dev_dir / "config.yaml").write_text(
+        sync.transform_config_yaml(stable_cfg, sync.DEV, "2.0.5.dev3"),
+        encoding="utf-8",
+    )
+    manifest = dev_dir / sync.DEV.component / "manifest.json"
+    manifest.write_text(
+        '{\n  "domain": "mcp_proxy_dev",\n  "name": "n",\n'
+        '  "version": "2.0.5.dev3"\n}\n',
+        encoding="utf-8",
+    )
+
+    new_dev = sync.rebase_dev_version("2.1.0", root=tmp_path)
+
+    assert new_dev == "2.1.1.dev1"
+    cfg_text = (dev_dir / "config.yaml").read_text(encoding="utf-8")
+    assert 'version: "2.1.1.dev1"' in cfg_text
+    # Idempotent identity rewrite: still exactly one stage line, dev-shaped.
+    assert cfg_text.split("\n").count("stage: experimental") == 1
+    assert '"version": "2.1.1.dev1"' in manifest.read_text(encoding="utf-8")
+    assert _version_key(new_dev) > _version_key("2.1.0")
 
 
 # ---------------------------------------------------------------------------
-# The STABLE and DEV identity profiles are exact inverses
+# The STABLE and DEV identity profiles
 # ---------------------------------------------------------------------------
-def test_profiles_are_exact_inverses():
-    assert sync.profiles_are_inverse(sync.STABLE, sync.DEV)
-    assert sync.profiles_are_inverse(sync.DEV, sync.STABLE)
+def test_dev_component_is_the_stable_component_with_a_dev_suffix():
+    assert sync.DEV.component == sync.STABLE.component + "_dev"
 
 
-def test_inverse_swappable_identity_fields():
-    stable, dev = sync.STABLE, sync.DEV
-    # each flavor's slug is the other's sibling-slug-base
-    assert stable.slug == dev.sibling_slug_base
-    assert dev.slug == stable.sibling_slug_base
-    # each flavor's own mutex id is the other's sibling-mutex id
-    assert stable.mutex_notification_id == dev.sibling_mutex_notification_id
-    assert dev.mutex_notification_id == stable.sibling_mutex_notification_id
-    # flavor/sibling words cross over
-    assert stable.flavor_word.lower() == dev.sibling_word
-    assert dev.flavor_word.lower() == stable.sibling_word
-    # the component token differs by exactly the "_dev" suffix
-    assert dev.component == stable.component + "_dev"
+_START_PY_IDENTITY = (
+    "# This is the {word} flavor: its sibling is the {sibling_word} add-on.\n"
+    'SIBLING_SLUG_BASE = "{slug}"\n'
+    'MUTEX_NOTIFICATION_ID = "{mutex}"\n'
+    'SIBLING_MUTEX_NOTIFICATION_ID = "{sibling_mutex}"\n'
+    'SIBLING_LABEL = "{label}"\n'
+)
 
 
-def test_profiles_not_inverse_of_themselves():
-    assert not sync.profiles_are_inverse(sync.STABLE, sync.STABLE)
-    assert not sync.profiles_are_inverse(sync.DEV, sync.DEV)
+# Expected values are the ones the committed start.py of each flavor carries.
+@pytest.mark.parametrize(
+    ("dst", "expected"),
+    [
+        (
+            sync.DEV,
+            {
+                "word": "DEV",
+                "sibling_word": "stable",
+                "slug": "ha_mcp_webhook_proxy",
+                "mutex": "mcp_proxy_dev_mutex",
+                "sibling_mutex": "mcp_proxy_mutex",
+                "label": "Webhook Proxy",
+            },
+        ),
+        (
+            sync.STABLE,
+            {
+                "word": "STABLE",
+                "sibling_word": "dev",
+                "slug": "ha_mcp_webhook_proxy_dev",
+                "mutex": "mcp_proxy_mutex",
+                "sibling_mutex": "mcp_proxy_dev_mutex",
+                "label": "Webhook Proxy (Dev)",
+            },
+        ),
+    ],
+    ids=["DEV", "STABLE"],
+)
+def test_start_py_identity_names_the_other_flavor_as_sibling(dst, expected):
+    source = _START_PY_IDENTITY.format(
+        word="X", sibling_word="y", slug="", mutex="", sibling_mutex="", label=""
+    )
+    flipped = sync.apply_start_py_identity(source, dst)
+    assert flipped == _START_PY_IDENTITY.format(**expected)
+
+
+@pytest.mark.parametrize("dst", [sync.DEV, sync.STABLE], ids=["DEV", "STABLE"])
+def test_dockerfile_labels_take_the_flavor_values(dst):
+    labels = sync.apply_dockerfile_labels(
+        'io.hass.name="x"\nio.hass.description="y"\n', dst
+    )
+    assert labels == (
+        f'io.hass.name="{dst.dockerfile_hass_name}"\n'
+        f'io.hass.description="{dst.dockerfile_hass_description}"\n'
+    )
+
+
+@pytest.mark.parametrize("dst", [sync.DEV, sync.STABLE], ids=["DEV", "STABLE"])
+def test_manifest_takes_the_flavor_identity_and_the_version(dst):
+    manifest = '{"domain": "a", "name": "b", "version": "0", "iot_class": "c"}'
+    assert json.loads(sync.apply_manifest(manifest, dst, "9.9.9")) == {
+        "domain": dst.component,
+        "name": dst.manifest_name,
+        "version": "9.9.9",
+        "iot_class": "c",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +308,14 @@ def _docs_text(flavor) -> str:
 
 
 def test_docs_banners_match_canonical():
-    """Each committed DOCS.md must carry exactly its flavor's canonical banner.
+    """Each committed DOCS.md must carry its flavor's canonical banner.
 
     The banner is identity, owned by DOCS_BANNERS in the sync script (like the
     start.py mutex constants). A hand edit to a committed banner without
     updating the constant would be silently reverted at the next promote/reset
-    — fail immediately instead.
+    — fail immediately instead. This checks presence only; the transform tests
+    below fail when a DOCS.md carries the banner other than once
+    (``transform_docs`` refuses any other count).
     """
     for flavor in (sync.STABLE, sync.DEV):
         text = _docs_text(flavor)
@@ -226,7 +324,6 @@ def test_docs_banners_match_canonical():
             f"{flavor.addon_dir}/DOCS.md banner diverged from "
             "DOCS_BANNERS in scripts/webhook_proxy_sync.py — edit them together"
         )
-        assert len(sync._DOCS_BANNER_RE.findall(text)) == 1
 
 
 def test_transform_docs_promote_direction():
@@ -340,6 +437,47 @@ def _assert_committed_equals_transform(tmp_path, direction, src, dst, bump=None)
         f"transform({src.addon_dir}) — regenerate it with "
         f"scripts/webhook_proxy_sync.py: {drifted}"
     )
+
+
+def _stage_both_trees(root: Path) -> None:
+    """Copy both committed app trees and the ruff config under ``root``."""
+    import shutil
+
+    for flavor in (sync.STABLE, sync.DEV):
+        shutil.copytree(
+            REPO_ROOT / flavor.addon_dir,
+            root / flavor.addon_dir,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+    shutil.copy2(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
+
+
+def test_promote_carries_a_sibling_module_with_its_tokens_renamed(tmp_path):
+    """start.py imports its sibling modules from the image root; a promote
+    that left one behind would ship a stable app that cannot start."""
+    _stage_both_trees(tmp_path)
+    (tmp_path / sync.DEV.addon_dir / "extra_module.py").write_text(
+        'STATE = "/config/.mcp_proxy_dev_state.json"\n', encoding="utf-8"
+    )
+
+    sync.sync("promote", bump="patch", root=tmp_path)
+
+    carried = tmp_path / sync.STABLE.addon_dir / "extra_module.py"
+    assert carried.read_text(encoding="utf-8") == (
+        'STATE = "/config/.mcp_proxy_state.json"\n'
+    )
+
+
+def test_promote_removes_a_module_the_source_no_longer_has(tmp_path):
+    """A module dev deleted must not linger in stable, where nothing keeps it
+    in step with the code that replaced it."""
+    _stage_both_trees(tmp_path)
+    stale = tmp_path / sync.STABLE.addon_dir / "retired_module.py"
+    stale.write_text("RETIRED = True\n", encoding="utf-8")
+
+    sync.sync("promote", bump="patch", root=tmp_path)
+
+    assert not stale.exists()
 
 
 @_sync_point_only

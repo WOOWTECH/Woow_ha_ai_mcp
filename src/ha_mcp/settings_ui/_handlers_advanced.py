@@ -3,8 +3,8 @@
 Factory returning the ``get_advanced_settings`` / ``save_advanced_settings``
 handlers over the ``ADVANCED_SETTINGS_FIELDS`` registry. Most advanced
 fields write to the shared ``feature_flags.json`` override file;
-``ADDON_SYNCED_ADVANCED_FIELDS`` (``backup_hint``, ``verify_ssl``) route
-through the Supervisor add-on options in add-on mode instead.
+``ADDON_SYNCED_ADVANCED_FIELDS`` (the advanced fields that are also app
+options) route through the Supervisor add-on options in add-on mode instead.
 
 Handlers are module-level (own C901 budget); ``build_advanced_handlers``
 binds ``server`` into request-only wrappers.
@@ -21,7 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .._version import is_running_in_addon
-from ..config import _reset_global_settings, get_global_settings
+from ..config import get_global_settings, reset_global_settings
 from ..errors import ErrorCode, create_error_response
 from . import _persistence, _supervisor
 
@@ -82,11 +82,12 @@ def _advanced_field_row(
 ) -> dict[str, Any]:
     """Build one ``_get_advanced_settings`` field row (value + origin + bounds)."""
     from ..config import (
-        _ADVANCED_SETTINGS_BOUNDS,
         _ADVANCED_SETTINGS_CHOICES,
         _ADVANCED_SETTINGS_SENTINELS,
+        ADVANCED_SETTINGS_BOUNDS,
         OAUTH_MODE_TOKEN,
     )
+    from ..config_registry import ADVANCED_MULTILINE, ADVANCED_RESTART_REQUIRED
 
     origin = _origin_for_advanced_field(env_name, overrides=overrides)
     value: Any = getattr(settings, fname, None)
@@ -106,19 +107,22 @@ def _advanced_field_row(
         # Env-pin makes the field read-only regardless of the registry's
         # ``editable`` flag. Display-only rows stay locked forever.
         "editable": registry_editable and origin != "env",
+        # The UI shows the restart banner after saving such a field.
+        "restart_required": fname in ADVANCED_RESTART_REQUIRED,
     }
-    bounds = _ADVANCED_SETTINGS_BOUNDS.get(fname)
+    bounds = ADVANCED_SETTINGS_BOUNDS.get(fname)
     if bounds is not None:
         row["min"], row["max"] = bounds
-        # Sentinel fields (e.g. sidecar_pin_port: 0 = off) need the number
-        # input to reach below the bounded range, so expose the sentinel
-        # as the UI minimum.
+        # A value outside the range with its own meaning (sidecar_pin_port:
+        # 0 picks a free port); the UI lets the number input reach it.
         sentinel = _ADVANCED_SETTINGS_SENTINELS.get(fname)
         if sentinel is not None:
-            row["min"] = sentinel
+            row["off_value"] = sentinel
     choices = _ADVANCED_SETTINGS_CHOICES.get(fname)
     if choices is not None:
         row["choices"] = list(choices)
+    if fname in ADVANCED_MULTILINE:
+        row["multiline"] = True
     return row
 
 
@@ -131,10 +135,10 @@ async def _get_advanced_settings(
     Mirrors ``_get_feature_flags`` / ``_get_backup_config`` but for the
     ``ADVANCED_SETTINGS_FIELDS`` registry. Most advanced fields write to
     ``feature_flags.json`` via the shared override file in either deployment
-    mode. ``ADDON_SYNCED_ADVANCED_FIELDS`` (``backup_hint``, ``verify_ssl``)
-    are an exception: in addon mode they have ``origin="addon"`` (editable)
-    and saves route through Supervisor so the add-on Configuration tab and
-    the web UI share state.
+    mode. ``ADDON_SYNCED_ADVANCED_FIELDS`` (the advanced fields that are
+    also app options) are an exception: in addon mode
+    they have ``origin="addon"`` (editable) and saves route through Supervisor
+    so the add-on Configuration tab and the web UI share state.
     """
     from ha_mcp.settings_ui import is_http_settings_mounted
 
@@ -166,7 +170,7 @@ async def _get_advanced_settings(
         )
     ]
     # is_stdio: the sidecar-port field only applies when this settings page
-    # is served by the stdio settings-UI sidecar. In HTTP/SSE/OAuth/addon
+    # is served by the stdio settings-UI sidecar. In HTTP/OAuth/addon
     # deployments there is no sidecar, so the UI greys the section.
     return JSONResponse(
         {
@@ -255,10 +259,10 @@ def _coerce_advanced_value(
 
 def _check_advanced_bounds_choices(fname: str, coerced: Any) -> JSONResponse | None:
     """Enforce the bounds + choices constraints for a coerced value."""
-    from ..config import _ADVANCED_SETTINGS_BOUNDS, _ADVANCED_SETTINGS_CHOICES
+    from ..config import _ADVANCED_SETTINGS_CHOICES, ADVANCED_SETTINGS_BOUNDS
     from ..config import _ADVANCED_SETTINGS_SENTINELS as _SENTINELS
 
-    bounds = _ADVANCED_SETTINGS_BOUNDS.get(fname)
+    bounds = ADVANCED_SETTINGS_BOUNDS.get(fname)
     sentinel = _SENTINELS.get(fname)
     if (
         bounds is not None
@@ -289,6 +293,23 @@ def _check_advanced_bounds_choices(fname: str, coerced: Any) -> JSONResponse | N
             status_code=400,
         )
     return None
+
+
+def _check_ipv6_networks(fname: str, value: str) -> JSONResponse | None:
+    """Reject allowlist entries that are not IPv6 networks, naming them."""
+    from ..ipv6_lan_guard import invalid_allowed_networks
+
+    invalid = invalid_allowed_networks(value)
+    if not invalid:
+        return None
+    return JSONResponse(
+        create_error_response(
+            ErrorCode.VALIDATION_INVALID_PARAMETER,
+            f"{fname!r} has entries that are not IPv6 networks: {', '.join(invalid)}.",
+            suggestions=["Enter IPv6 networks such as 2001:db8:5::/48."],
+        ),
+        status_code=400,
+    )
 
 
 def _validate_one_advanced_field(
@@ -327,7 +348,7 @@ def _validate_one_advanced_field(
                 status_code=409,
             ),
         )
-    # Addon-synced fields (e.g. backup_hint, verify_ssl) are editable in
+    # Addon-synced fields (``ADDON_SYNCED_ADVANCED_FIELDS``) are editable in
     # addon mode even though their env vars are set — start.py rewrites them
     # from /data/options.json on every boot, so route the write through
     # Supervisor instead of the override file.
@@ -339,6 +360,8 @@ def _validate_one_advanced_field(
     if coerce_err is not None:
         return None, is_addon_synced, coerce_err
     bounds_err = _check_advanced_bounds_choices(fname, coerced)
+    if bounds_err is None and fname == "ipv6_allowed_networks":
+        bounds_err = _check_ipv6_networks(fname, coerced)
     if bounds_err is not None:
         return None, is_addon_synced, bounds_err
     return coerced, is_addon_synced, None
@@ -399,8 +422,8 @@ async def _save_advanced_addon(
                     f"into separate POSTs ({sorted(file_only)})."
                 ),
                 suggestions=[
-                    "Submit addon-synced fields (e.g. backup_hint, "
-                    "verify_ssl) and override-file fields in separate "
+                    "Submit addon-synced fields (e.g. verify_ssl, "
+                    "ha_tool_concurrency) and override-file fields in separate "
                     "save requests.",
                 ],
             ),
@@ -468,10 +491,11 @@ async def _write_advanced_overrides_file(
     single file holds both advanced + feature-flag overrides.
     """
     from ..config import _FEATURE_FLAG_OVERRIDE_FILENAME
+    from ..utils.config_write_lock import config_write_guard
     from ..utils.data_paths import get_data_dir
 
     path = get_data_dir() / _FEATURE_FLAG_OVERRIDE_FILENAME
-    async with _persistence._get_override_file_lock():
+    async with config_write_guard():
         existing: dict[str, Any] = {}
         try:
             existing_raw = path.read_text()
@@ -525,17 +549,17 @@ async def _save_advanced_settings(
 ) -> JSONResponse:
     """Persist UI-edited advanced settings.
 
-    Addon-synced fields (``backup_hint``, ``verify_ssl``) in add-on mode
-    route through Supervisor; everything else atomically merges into the
-    shared ``feature_flags.json`` override file. Either sink responds with
-    ``restart_required=True`` (most advanced fields gate one-time startup
-    paths).
+    Addon-synced fields (``ADDON_SYNCED_ADVANCED_FIELDS``) in add-on mode
+    route through Supervisor; everything else
+    atomically merges into the shared ``feature_flags.json`` override file.
+    Either sink responds with ``restart_required=True`` (most advanced fields
+    gate one-time startup paths).
     """
     from ..config import ADVANCED_SETTINGS_FIELDS
 
     try:
         body = await request.json()
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return JSONResponse(
             create_error_response(
                 ErrorCode.VALIDATION_INVALID_JSON, "Invalid JSON body"
@@ -571,7 +595,7 @@ async def _save_advanced_settings(
     if write_err is not None:
         return write_err
 
-    _reset_global_settings()
+    reset_global_settings()
     return JSONResponse(
         {
             "success": True,

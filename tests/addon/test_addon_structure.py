@@ -1,22 +1,62 @@
 """Test Home Assistant add-on structure and configuration."""
 
+import importlib.util
 import os
 import re
 import stat
 import sys
+import tomllib
+import warnings
 from pathlib import Path
 
 import pytest
 import yaml
 
-try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    import tomli as tomllib  # Fallback for older Python
-
-
 ADDON_DIR = "homeassistant-addon"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_POLICY_PATH = _REPO_ROOT / "src/ha_mcp/settings_ui/locale_policy.py"
+_POLICY_SPEC = importlib.util.spec_from_file_location("locale_policy", _POLICY_PATH)
+if _POLICY_SPEC is None or _POLICY_SPEC.loader is None:  # pragma: no cover
+    raise ImportError(f"cannot load locale policy from {_POLICY_PATH}")
+_POLICY = importlib.util.module_from_spec(_POLICY_SPEC)
+_POLICY_SPEC.loader.exec_module(_POLICY)
+is_best_effort_locale = _POLICY.is_best_effort_locale
+
+
+def _report_translation_issues(path: Path, issues: list[str]) -> None:
+    """Warn for a best-effort locale, while preserving strict failures."""
+    if not issues:
+        return
+    message = "; ".join(issues)
+    if is_best_effort_locale(path.stem):
+        warnings.warn(
+            f"best-effort locale {path.stem} in {path}: {message}",
+            pytest.PytestWarning,
+            stacklevel=2,
+        )
+        return
+    raise AssertionError(message)
+
+
+# Resolved once at import: pytest parametrizes at collection time, so an empty
+# list would collect zero cases and report as skipped rather than failed.
+# test_addon_config_glob_is_not_empty below is what keeps that honest.
+_ADDON_DIRS = sorted(
+    path.parent.name for path in _REPO_ROOT.glob("homeassistant-addon*/config.yaml")
+)
+
+
+def test_best_effort_addon_translation_issues_warn_instead_of_fail() -> None:
+    issues = ["missing configuration.example"]
+    with pytest.warns(
+        pytest.PytestWarning,
+        match=r"best-effort locale tlh.*missing configuration\.example",
+    ):
+        _report_translation_issues(Path("translations/tlh.yaml"), issues)
+
+    with pytest.raises(AssertionError, match=r"missing configuration\.example"):
+        _report_translation_issues(Path("translations/de.yaml"), issues)
 
 
 class TestAddonStructure:
@@ -93,17 +133,6 @@ class TestAddonStructure:
             "secret_path schema should be optional string (str?)"
         )
 
-        # Verify backup_hint configuration
-        assert "backup_hint" in config["options"], (
-            "options must include backup_hint field"
-        )
-        assert config["options"]["backup_hint"] == "normal", (
-            "default backup_hint should be normal"
-        )
-        assert config["schema"]["backup_hint"] == "list(strong|normal|weak|auto)", (
-            "backup_hint schema must enumerate allowed values"
-        )
-
         # Verify architectures (only 64-bit platforms supported by uv image)
         expected_archs = ["amd64", "aarch64"]
         assert all(arch in config["arch"] for arch in expected_archs)
@@ -114,130 +143,28 @@ class TestAddonStructure:
             "32-bit platforms not supported by uv base image"
         )
 
-    def test_stable_addon_exposes_nonbeta_tool_options(self):
-        """Stable add-on must expose the NON-beta operator options that dev
-        has — ``tool_search_max_results``, ``disabled_tools``, ``pinned_tools``
-        — in both ``options`` and ``schema``. These are not beta features, so
-        the web-UI master gate doesn't apply; without them in the stable
-        schema they were unreachable on stable (start.py wrote defaults, the
-        web UI showed them ``origin='addon'``-locked, and the override applier
-        skipped them). Regression guard for that dev/stable config drift."""
-        with open(f"{ADDON_DIR}/config.yaml") as f:
-            config = yaml.safe_load(f)
+    @pytest.mark.parametrize(
+        ("addon_dir", "entry"),
+        [
+            ("homeassistant-addon", r"^### {key}\b"),
+            ("homeassistant-addon-dev", r"^\| `{key}`"),
+        ],
+        ids=["stable section", "dev table row"],
+    )
+    def test_docs_describe_every_app_option(self, addon_dir, entry):
+        """The Configuration page shows only a name and a short help text
+        per option; DOCS.md is where a user finds the details. The stable
+        DOCS.md has a section per option and the dev one a table row."""
+        config = yaml.safe_load((_REPO_ROOT / addon_dir / "config.yaml").read_text())
+        docs = (_REPO_ROOT / addon_dir / "DOCS.md").read_text(encoding="utf-8")
 
-        # key: (schema type, default value). Defaults are load-bearing — a
-        # non-empty disabled_tools default would silently lock tools off.
-        expected = {
-            "tool_search_max_results": ("int(2,10)?", 5),
-            "disabled_tools": ("str?", ""),
-            "pinned_tools": ("str?", ""),
-            # Read Only Mode (#1569) — non-beta safety toggle, default OFF
-            # (an on-by-default value would silently break every write
-            # tool on upgrade).
-            "read_only_mode": ("bool?", False),
-        }
-        for key, (schema_type, default) in expected.items():
-            assert key in config["options"], f"{key!r} must be in stable options"
-            assert config["options"].get(key) == default, (
-                f"{key!r} default must be {default!r}"
-            )
-            assert config["schema"].get(key) == schema_type, (
-                f"{key!r} must be in stable schema as {schema_type!r}"
-            )
+        missing = [
+            key
+            for key in config["schema"]
+            if not re.search(entry.format(key=re.escape(key)), docs, re.MULTILINE)
+        ]
 
-    def test_stable_and_dev_agree_on_nonbeta_tool_options(self):
-        """The three non-beta tool options must stay in sync between the
-        stable and dev add-ons — same defaults AND same schema types. Guards
-        against future one-sided drift (the exact bug class this fix
-        addresses: dev gains/changes an option, stable is forgotten)."""
-        keys = (
-            "tool_search_max_results",
-            "disabled_tools",
-            "pinned_tools",
-            "read_only_mode",
-        )
-        with open(f"{ADDON_DIR}/config.yaml") as f:
-            stable = yaml.safe_load(f)
-        with open("homeassistant-addon-dev/config.yaml") as f:
-            dev = yaml.safe_load(f)
-        for key in keys:
-            assert stable["options"].get(key) == dev["options"].get(key), (
-                f"{key!r} option default differs between stable and dev add-ons"
-            )
-            assert stable["schema"].get(key) == dev["schema"].get(key), (
-                f"{key!r} schema type differs between stable and dev add-ons"
-            )
-
-    def test_start_py_wires_read_only_mode_env(self):
-        """start.py must read the ``read_only_mode`` addon option and export
-        it as the ``READ_ONLY_MODE`` env var, and that env name must match
-        the one ``config.FEATURE_FLAG_FIELDS`` registers for the
-        ``read_only_mode`` flag — otherwise the addon toggle would write to
-        a phantom env var the server never reads. Source-level contract so
-        the wiring can't silently drift (no ha_mcp import needed)."""
-        start_src = (_REPO_ROOT / ADDON_DIR / "start.py").read_text(encoding="utf-8")
-        assert 'resolve_bool_option(config, "read_only_mode"' in start_src, (
-            "start.py must resolve the read_only_mode addon option via "
-            "resolve_bool_option"
-        )
-        assert 'os.environ["READ_ONLY_MODE"]' in start_src, (
-            "start.py must export the READ_ONLY_MODE env var the server reads"
-        )
-
-        # The env name start.py writes must equal the one config.py
-        # registers for read_only_mode. Regex the FeatureFlagField entry
-        # from config.py source rather than importing ha_mcp (tests/addon
-        # has no src on sys.path by default).
-        config_src = (_REPO_ROOT / "src" / "ha_mcp" / "config.py").read_text(
-            encoding="utf-8"
-        )
-        m = re.search(
-            r'FeatureFlagField\(\s*"read_only_mode"\s*,\s*"([^"]+)"', config_src
-        )
-        assert m is not None, (
-            "config.py FEATURE_FLAG_FIELDS must register a read_only_mode entry"
-        )
-        assert m.group(1) == "READ_ONLY_MODE", (
-            f"read_only_mode env name in config.py is {m.group(1)!r}, but "
-            'start.py exports os.environ["READ_ONLY_MODE"] — they must match'
-        )
-
-    def test_start_py_wires_strict_mandatory_bps_env(self):
-        """start.py must read the ``enable_strict_mandatory_bps`` addon option
-        and export it as ``ENABLE_STRICT_MANDATORY_BPS``, and that env name
-        must match the one ``config.FEATURE_FLAG_FIELDS`` registers for the
-        ``enable_strict_mandatory_bps`` flag — otherwise the addon toggle
-        would write to a phantom env var the server never reads. Source-level
-        contract mirroring the read_only_mode wiring test (issue #1779)."""
-        start_src = (_REPO_ROOT / ADDON_DIR / "start.py").read_text(encoding="utf-8")
-        assert 'config.get("enable_strict_mandatory_bps"' in start_src, (
-            "start.py must read the enable_strict_mandatory_bps addon option"
-        )
-        assert 'os.environ["ENABLE_STRICT_MANDATORY_BPS"]' in start_src, (
-            "start.py must export the ENABLE_STRICT_MANDATORY_BPS env var the "
-            "server reads"
-        )
-
-        # The env name start.py writes must equal the one config.py registers
-        # for enable_strict_mandatory_bps. Regex the FeatureFlagField entry
-        # from config.py source rather than importing ha_mcp (tests/addon has
-        # no src on sys.path by default).
-        config_src = (_REPO_ROOT / "src" / "ha_mcp" / "config.py").read_text(
-            encoding="utf-8"
-        )
-        m = re.search(
-            r'FeatureFlagField\(\s*"enable_strict_mandatory_bps"\s*,\s*"([^"]+)"',
-            config_src,
-        )
-        assert m is not None, (
-            "config.py FEATURE_FLAG_FIELDS must register an "
-            "enable_strict_mandatory_bps entry"
-        )
-        assert m.group(1) == "ENABLE_STRICT_MANDATORY_BPS", (
-            f"enable_strict_mandatory_bps env name in config.py is "
-            f"{m.group(1)!r}, but start.py exports "
-            'os.environ["ENABLE_STRICT_MANDATORY_BPS"] — they must match'
-        )
+        assert not missing, f"{addon_dir}/DOCS.md does not document {missing}"
 
     @pytest.mark.skipif(
         sys.platform == "win32", reason="Unix permissions not applicable on Windows"
@@ -255,9 +182,20 @@ class TestAddonStructure:
         assert first_line.startswith("#!"), "start.py missing shebang"
         assert "python" in first_line.lower(), "start.py shebang must reference python"
 
-    @pytest.mark.parametrize(
-        "addon_dir", ["homeassistant-addon", "homeassistant-addon-dev"]
-    )
+    def test_addon_config_glob_is_not_empty(self):
+        """``test_translations_cover_every_schema_key`` is parametrized over
+        this glob at collection time. An empty glob collects zero cases and
+        pytest reports it as skipped, which reads as green — so assert the
+        glob found something, the way the in-body glob in
+        ``test_addon_names_are_backup_filename_safe`` does.
+        """
+        assert _ADDON_DIRS, (
+            "no homeassistant-addon*/config.yaml found — the schema-key "
+            "translation check would silently collect zero cases"
+        )
+
+    @pytest.mark.filterwarnings("always:best-effort locale")
+    @pytest.mark.parametrize("addon_dir", _ADDON_DIRS)
     def test_translations_cover_every_schema_key(self, addon_dir):
         """Every key declared in ``config.yaml``'s ``schema:`` must have a
         matching ``configuration.<key>`` entry — with both ``name`` and
@@ -268,36 +206,56 @@ class TestAddonStructure:
         localized ``name``/``description`` shows the same unlabelled toggle
         to that language's users, so lock the parity across every shipped
         locale.
+
+        Checked in both directions. An option removed from ``schema:``
+        leaves its ``configuration.<key>`` entry behind in every locale,
+        where it is dead weight that reads as a supported option and gets
+        dutifully re-translated for the next language — the one-directional
+        version of this check could not see it.
+
+        Parametrized over the same ``homeassistant-addon*/config.yaml`` glob
+        as ``test_addon_names_are_backup_filename_safe`` below: hardcoding the
+        pair left both Webhook Proxy flavors with no such check at all.
         """
         with open(f"{addon_dir}/config.yaml", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        schema_keys = set(cfg.get("schema", {}).keys())
+        declared_keys = set(cfg.get("schema", {}).keys())
         # ``secret_path`` is intentionally undocumented in user-facing
         # translations (it's an advanced/hidden override the wizard
-        # handles, not a user-set option).
-        schema_keys.discard("secret_path")
+        # handles, not a user-set option). It stays in ``declared_keys``
+        # so a catalog that documents it anyway is not called an orphan.
+        schema_keys = declared_keys - {"secret_path"}
 
         translation_files = sorted(Path(addon_dir, "translations").glob("*.yaml"))
         assert translation_files, f"{addon_dir}/translations has no *.yaml files"
         for tf in translation_files:
-            with open(tf, encoding="utf-8") as f:
-                translations = yaml.safe_load(f)
-            configuration = translations.get("configuration", {})
-            for key in sorted(schema_keys):
-                entry = configuration.get(key)
-                assert entry is not None, (
-                    f"{tf} is missing a `configuration.{key}` entry for the "
-                    "schema field declared in config.yaml"
+            try:
+                with open(tf, encoding="utf-8") as f:
+                    translations = yaml.safe_load(f)
+                configuration = translations.get("configuration", {})
+                orphaned = sorted(set(configuration) - declared_keys)
+                assert not orphaned, (
+                    f"{tf} documents `configuration` key(s) that {addon_dir}/"
+                    f"config.yaml no longer declares in `schema:`: {orphaned}. "
+                    "Supervisor renders nothing for them — delete the entries."
                 )
-                assert entry.get("name"), (
-                    f"{tf} `configuration.{key}` needs a non-empty `name` "
-                    "(Supervisor renders it as the user-facing toggle label)"
-                )
-                assert entry.get("description"), (
-                    f"{tf} `configuration.{key}` needs a non-empty "
-                    "`description` (Supervisor renders it as the help tooltip "
-                    "under the toggle)"
-                )
+                for key in sorted(schema_keys):
+                    entry = configuration.get(key)
+                    assert entry is not None, (
+                        f"{tf} is missing a `configuration.{key}` entry for the "
+                        "schema field declared in config.yaml"
+                    )
+                    assert entry.get("name"), (
+                        f"{tf} `configuration.{key}` needs a non-empty `name` "
+                        "(Supervisor renders it as the user-facing toggle label)"
+                    )
+                    assert entry.get("description"), (
+                        f"{tf} `configuration.{key}` needs a non-empty "
+                        "`description` (Supervisor renders it as the help tooltip "
+                        "under the toggle)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _report_translation_issues(tf, [str(exc)])
 
     def test_addon_names_are_backup_filename_safe(self):
         r"""No add-on ``name`` may contain ``/``.

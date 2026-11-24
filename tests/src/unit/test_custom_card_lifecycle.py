@@ -1,0 +1,154 @@
+"""Resource replacement and timed-out refreshes must retain their budgets."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from homeassistant.core import HomeAssistant
+
+from custom_components.ha_mcp_tools import custom_cards as cc
+
+# Room for exactly one runtime (``BUNDLE_MEMORY``), so a replacement can only
+# start once the runtime it replaces is gone.
+_ONE_BUNDLE = 32 * 1024 * 1024
+
+
+def test_replacement_disposes_runtime_after_its_last_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "card.js"
+    path.write_text("first")
+    entered, release, replacement = (threading.Event() for _ in range(3))
+    events = []
+
+    def form(tag):
+        entered.set()
+        assert release.wait(5)
+        events.append("reader finished")
+        return []
+
+    def load(*args, **kwargs):
+        if events:
+            events.append("replacement allocated")
+            replacement.set()
+        else:
+            events.append("first allocated")
+        return MagicMock(
+            tags=["test-card"],
+            cards=[],
+            form=form,
+            close=lambda: events.append("runtime disposed"),
+        )
+
+    monkeypatch.setattr(cc, "CardBundle", load)
+    monkeypatch.setattr(cc, "TOTAL_MEMORY", _ONE_BUNDLE)
+    custom = cc.CustomCards("dom")
+    custom.refresh([path])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reader = pool.submit(custom.describe, "test-card")
+        assert entered.wait(5)
+        stamp = path.stat().st_mtime + 1
+        os.utime(path, (stamp, stamp))
+        refresh = pool.submit(custom.refresh, [path])
+        try:
+            assert not replacement.wait(0.2), "replacement overlaps active runtime"
+        finally:
+            release.set()
+        reader.result(5)
+        refresh.result(5)
+    assert events == [
+        "first allocated",
+        "reader finished",
+        "runtime disposed",
+        "replacement allocated",
+    ]
+
+
+def test_refresh_stops_starting_bundles_when_total_budget_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = [tmp_path / f"broken-{i}.js" for i in range(10)]
+    for path in files:
+        path.write_text("broken")
+    clock = [0.0]
+    attempts = []
+
+    def load(dom, source, **kwargs):
+        attempts.append(source)
+        clock[0] += 4
+        raise ValueError("broken card")
+
+    monkeypatch.setattr(cc.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cc, "CardBundle", load)
+    custom = cc.CustomCards("dom")
+    custom.refresh(files)
+    first_pass = len(attempts)
+    assert 0 < first_pass < len(files)
+    custom.refresh(files)
+    assert first_pass < len(attempts) <= 2 * first_pass
+
+
+@pytest.mark.asyncio
+async def test_timed_out_callers_share_one_background_refresh(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = asyncio.Event()
+    result = object()
+
+    async def refresh(hass: HomeAssistant) -> object:
+        await release.wait()
+        return result
+
+    worker = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(cc, "async_refresh_custom_cards", worker)
+    try:
+        responses = await asyncio.gather(
+            *(cc.async_get_custom_cards(hass, timeout=0.01) for _ in range(10))
+        )
+        assert responses == [None] * 10
+        assert worker.await_count == 1
+        release.set()
+        assert await cc.async_get_custom_cards(hass, timeout=1) is result
+    finally:
+        release.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+
+def test_partial_budget_failure_gets_a_full_budget_before_being_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = [tmp_path / f"card-{i}.js" for i in range(2)]
+    for i, path in enumerate(files):
+        path.write_text(str(i))
+    clock = [0.0]
+    started = [0.0]
+    attempts = []
+
+    def load(dom: str, source: str, **kwargs: Any) -> MagicMock:
+        attempts.append(source)
+        # Each bundle takes 60% of a refresh's whole budget.
+        clock[0] += (kwargs["deadline"] - started[0]) * 0.6
+        if clock[0] >= kwargs["deadline"]:
+            raise TimeoutError("partial budget")
+        return MagicMock(cards=[{"type": f"card-{source}"}])
+
+    monkeypatch.setattr(cc.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cc, "CardBundle", load)
+    custom = cc.CustomCards("dom")
+    for _ in range(2):
+        started[0] = clock[0]
+        custom.refresh(files)
+    assert attempts == ["0", "1", "1"]
+    # Both bundles are loaded and cached, none skipped.
+    assert [card["type"] for card in custom.card_types()] == [
+        "custom:card-0",
+        "custom:card-1",
+    ]
+    assert custom.status() == {"state": "ready", "resources": []}

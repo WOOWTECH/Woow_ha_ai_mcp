@@ -1,6 +1,6 @@
 """Regression tests for issue #1784 — the Attempt-C per-request timeout
 and fetch batch size must be first-class, UI-tunable ``Settings`` fields
-rather than constants hardcoded in ``tools/smart_search/_config.py``.
+rather than constants hardcoded in ``tools/smart_search/smart_search.py``.
 
 Before #1784 these two knobs were hardcoded (5.0 s / 10), so on HA
 servers that serve the per-id config endpoint serially — where a batch's
@@ -17,11 +17,11 @@ import json
 import pytest
 
 from ha_mcp.config import (
-    _ADVANCED_SETTINGS_BOUNDS,
+    ADVANCED_SETTINGS_BOUNDS,
     ADVANCED_SETTINGS_FIELDS,
     Settings,
-    _reset_global_settings,
     get_global_settings,
+    reset_global_settings,
 )
 
 # (settings field name, env alias, default, python type)
@@ -68,18 +68,18 @@ def test_knob_field_is_editable_in_advanced_search_section(field, env, default, 
     assert row.editable is True
     assert row.section == "search"
     # Numeric advanced fields must carry UI/POST bounds.
-    assert field in _ADVANCED_SETTINGS_BOUNDS
+    assert field in ADVANCED_SETTINGS_BOUNDS
 
 
 @pytest.mark.parametrize("field,env,default,ftype", KNOB_FIELDS)
 def test_env_var_flows_to_resolved_settings(field, env, default, ftype, monkeypatch):
     _clear_knob_envs(monkeypatch)
     monkeypatch.setenv(env, "3")
-    _reset_global_settings()
+    reset_global_settings()
     try:
         assert getattr(get_global_settings(), field) == ftype(3)
     finally:
-        _reset_global_settings()
+        reset_global_settings()
 
 
 @pytest.mark.parametrize("field,env,default,ftype", KNOB_FIELDS)
@@ -90,11 +90,11 @@ def test_override_file_value_is_applied(
     ``feature_flags.json``; ``get_global_settings`` must apply them."""
     _clear_knob_envs(monkeypatch)
     (isolated_data_dir / "feature_flags.json").write_text(json.dumps({field: 2}))
-    _reset_global_settings()
+    reset_global_settings()
     try:
         assert getattr(get_global_settings(), field) == ftype(2)
     finally:
-        _reset_global_settings()
+        reset_global_settings()
 
 
 @pytest.mark.parametrize("field,env,default,ftype", KNOB_FIELDS)
@@ -151,11 +151,11 @@ def test_smart_search_constants_track_settings_field_defaults():
     sourced from ``Settings`` (issue #1784), not re-hardcoded. Asserts
     against the static ``Settings`` field defaults (see the #1538 twin in
     ``test_search_time_budget_settings.py`` for the rationale)."""
-    from ha_mcp.tools.smart_search import _config
+    from ha_mcp.tools import smart_search
 
     constants = {
-        "individual_config_timeout": _config.INDIVIDUAL_CONFIG_TIMEOUT,
-        "individual_fetch_batch_size": _config.INDIVIDUAL_FETCH_BATCH_SIZE,
+        "individual_config_timeout": smart_search.INDIVIDUAL_CONFIG_TIMEOUT,
+        "individual_fetch_batch_size": smart_search.INDIVIDUAL_FETCH_BATCH_SIZE,
     }
     for field, _env, default, _ftype in KNOB_FIELDS:
         assert constants[field] == default

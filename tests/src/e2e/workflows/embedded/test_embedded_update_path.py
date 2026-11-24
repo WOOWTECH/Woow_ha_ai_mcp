@@ -48,12 +48,10 @@ surface the #1783 / #1785 incident corrupted (that purge-and-reimport is the
 precise mechanism those issues broke), which makes it the most authoritative
 in-container proof the update actually took.
 
-Scope: this lane deliberately drives the options-flow ``pip_spec`` injection, NOT
-the automatic coordinator update path. A locally built wheel cannot ride
-auto-update (the coordinator only ever installs the published PyPI dist), and the
-auto-update decision logic — including the #1792 hold-back gate — is unit-tested.
-Both triggers converge on the same reload → install → purge → restart pipeline,
-which is what this lane proves end to end.
+Scope: this lane drives the options-flow ``pip_spec`` override, the one way a
+running component swaps its server without a component release (the stable
+component's automatic PyPI update path converges on the same reload → install →
+purge → restart pipeline; the working-tree component no longer has one, #2427).
 
 Gating: this lane is expensive (a full container bring-up plus a PyPI install of
 the whole fastmcp dependency tree per scenario, run for both scenarios). It runs
@@ -90,8 +88,8 @@ _UPDATE_PATH_ENV = "E2E_UPDATE_PATH"
 # test_embedded_server.py), so a minutes-scale budget.
 _PHASE1_READY_TIMEOUT_S = 600
 # Phase 2 force-installs only the ha-mcp wheel (its deps are already satisfied
-# from phase 1) and restarts the worker; bounded like conftest's
-# _EMBEDDED_BRINGUP_TIMEOUT.
+# from phase 1) and restarts the worker; bounded like
+# _conftest_testcontainer._EMBEDDED_BRINGUP_TIMEOUT.
 _PHASE2_READY_TIMEOUT_S = 300
 _READY_POLL_S = 5
 _API_READY_TIMEOUT_S = 120
@@ -104,8 +102,8 @@ _API_READY_TIMEOUT_S = 120
 # is backend-agnostic and must run whatever E2E_BACKEND the CI job selects (its
 # dedicated job leaves it unset so the unavoidable autouse session backend boots
 # the cheap container variant) — those markers would skip it on some backends.
-# ``timeout``: pytest.ini sets ``timeout_func_only = true``, so this per-test
-# marker bills ONLY the test FUNCTION — fixture setup (the phase-1 bring-up and
+# ``timeout``: pyproject.toml sets ``timeout_func_only = true``, so this
+# per-test marker bills ONLY the test FUNCTION — fixture setup (phase-1 bring-up and
 # its PyPI install) is never counted against it, and the fixture's own poll
 # deadlines self-enforce there. The ceiling therefore only needs to cover the
 # IN-TEST phase-2 work: the options-flow submit that triggers the reload, the
@@ -173,7 +171,7 @@ def _docker_probe_error() -> str | None:
         import docker as docker_sdk
 
         docker_sdk.from_env().ping()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return f"{type(exc).__name__}: {exc}"
     return None
 
@@ -288,12 +286,14 @@ def _seed_config(config_path: Path, component_src: Path) -> None:
                 "entry_type": "server",
                 "webhook_id": _WEBHOOK_ID,
                 "secret_path": _SECRET_PATH,
+                "admin_token": TEST_TOKEN,
             },
             "disabled_by": None,
             "discovery_keys": {},
             "domain": _DOMAIN,
             "entry_id": _ENTRY_ID,
-            "minor_version": 1,
+            # 2: past the one-time migration that clears pip_spec.
+            "minor_version": 2,
             "modified_at": "2025-09-07T23:56:28.040747+00:00",
             "options": {
                 # Empty => bare ``ha-mcp`` dist => newest PyPI stable on bring-up.
@@ -428,6 +428,36 @@ def _dump_logs(container: Any) -> Any:
     return logs
 
 
+# Container stdout carries HA's console handler only. The component's own
+# install / LLM-API / bring-up errors land in ``home-assistant.log`` under the
+# bind-mounted /config, and on 2026-09-04 a phase-1 timeout was diagnosable
+# only from there — the container log showed nothing about the real cause.
+_HA_LOG_TAIL_CHARS = 4000
+
+
+def _dump_ha_log(config_path: Path) -> str:
+    """Return a labelled tail of ``home-assistant.log``; never raises.
+
+    Empty string when the file does not exist yet (HA never got far enough to
+    write one) or is empty; a labelled reason when it exists but cannot be
+    read, since silence there would read as "nothing to show". The caller
+    concatenates the result unconditionally.
+    """
+    log_file = config_path / "home-assistant.log"
+    if not log_file.is_file():
+        return ""
+    try:
+        text = log_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as err:
+        return f"\n(could not read {log_file}: {err})"
+    if not text:
+        return ""
+    return (
+        f"\nhome-assistant.log (last {_HA_LOG_TAIL_CHARS} chars of "
+        f"{log_file}):\n{text[-_HA_LOG_TAIL_CHARS:]}"
+    )
+
+
 def _submit_options_update(
     base_url: str, entry_id: str, user_input: dict[str, Any], container: Any
 ) -> dict[str, Any]:
@@ -460,11 +490,17 @@ def _submit_options_update(
             f"options-flow start failed: {start.status_code} {start.text[:500]}\n"
             f"Container logs:\n{_dump_logs(container)}"
         )
-    flow_id = start.json()["flow_id"]
+    form = start.json()
+    flow_id = form["flow_id"]
+    # Echo only the fields this component version's form declares: the stable
+    # component still has the channel / auto-update fields the working-tree
+    # component retired (#2427), and a strict form rejects unknown keys.
+    declared = {field["name"] for field in form.get("data_schema") or []}
+    payload = {key: value for key, value in user_input.items() if key in declared}
     submit = requests.post(
         f"{base_url}/api/config/config_entries/options/flow/{flow_id}",
         headers=headers,
-        data=json.dumps(user_input),
+        data=json.dumps(payload),
         timeout=120,
     )
     if submit.status_code >= 400:
@@ -489,7 +525,7 @@ def update_path_ha(request):
       tag (git-archive export) — proves a new server release won't break existing
       installs.
     - ``head``: the working tree's ``custom_components/ha_mcp_tools`` (the same
-      source conftest's ``_install_custom_component`` copies) — proves the PR's
+      source ``_conftest_seed._install_custom_component`` copies) — proves the PR's
       own component update machinery still works.
 
     Both containers run sequentially in one job. Yields a context dict once the
@@ -516,8 +552,8 @@ def update_path_ha(request):
         if request.param == "stable":
             component_src = _export_released_component(work_dir / "released")
         else:
-            # Working-tree component, sourced the same way conftest's
-            # _install_custom_component does (the copytree in _seed_config below
+            # Working-tree component, sourced the same way
+            # _conftest_seed._install_custom_component does (the copytree in _seed_config below
             # installs it into the container's custom_components).
             component_src = _REPO_ROOT / "custom_components" / _DOMAIN
             if not component_src.is_dir():
@@ -548,7 +584,15 @@ def update_path_ha(request):
         base_url = f"http://{host}:{port}"
         headers = {"Authorization": f"Bearer {TEST_TOKEN}"}
 
-        _wait_http_ok(f"{base_url}/api/", headers, _API_READY_TIMEOUT_S)
+        try:
+            _wait_http_ok(f"{base_url}/api/", headers, _API_READY_TIMEOUT_S)
+        except AssertionError as err:
+            # Same reason as the phase-1 raise below: the component's failures
+            # are in home-assistant.log, not on container stdout.
+            raise AssertionError(
+                f"{err}\nContainer logs:\n{_dump_logs(container)}"
+                f"{_dump_ha_log(config_path)}"
+            ) from err
 
         phase1_version, _ = _wait_for_server(base_url, _PHASE1_READY_TIMEOUT_S)
         # Reject the "unknown" fallback as well as None: a server that answers
@@ -559,6 +603,7 @@ def update_path_ha(request):
                 "the PyPI-installed in-process server never reported a usable "
                 f"version within {_PHASE1_READY_TIMEOUT_S}s (got "
                 f"{phase1_version!r}). Container logs:\n{_dump_logs(container)}"
+                f"{_dump_ha_log(config_path)}"
             )
         yield {
             "base_url": base_url,
@@ -601,8 +646,9 @@ class TestEmbeddedUpdatePath:
         # Drive the component's REAL update path: save an options-flow pip_spec
         # override pointing at the checkout-built wheel staged under /config.
         # Saving reloads the entry, which force-installs the wheel and restarts
-        # the worker — the production sequence from #1783 / #1785. All schema keys
-        # are echoed with their defaults; only pip_spec changes.
+        # the worker — the production sequence from #1783 / #1785. Every field
+        # the form declares is echoed with its default; only pip_spec changes
+        # (_submit_options_update drops the ones this component lacks).
         user_input = {
             _OPT_CHANNEL: "stable",
             _OPT_AUTO_UPDATE: True,

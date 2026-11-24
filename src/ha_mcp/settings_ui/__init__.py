@@ -20,12 +20,13 @@ from typing import TYPE_CHECKING, Any
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
-from .._version import is_running_in_addon
+from .._version import is_embedded, is_running_in_addon
 from ..transforms import DEFAULT_PINNED_TOOLS
 from ..utils.data_paths import get_data_dir
 from ._handlers_advanced import build_advanced_handlers
 from ._handlers_backups import build_backups_handlers
 from ._handlers_fs import build_fs_handlers
+from ._handlers_oauth_callbacks import build_oauth_callback_handlers
 from ._handlers_server import (
     _PROCESS_INSTANCE_ID,
     _PROCESS_STARTED_AT,
@@ -33,17 +34,11 @@ from ._handlers_server import (
 )
 from ._handlers_theme import build_theme_handlers
 from ._handlers_tools import build_tools_handlers
-from ._i18n import (
-    LOCALE_COOKIE,
-    build_payload,
-    select_locale,
-    serialize_payload,
-)
+from ._handlers_transfer import build_transfer_handlers
 from ._persistence import (
     _atomic_write_json,
     _get_backup_settings_override_path,
     _get_config_path,
-    _get_override_file_lock,
     _load_backup_settings_override,
     _save_backup_settings_override,
     dump_tool_metadata_cache,
@@ -55,7 +50,6 @@ from ._persistence import (
 )
 from ._supervisor import (
     _BACKGROUND_RESTART_TASKS,
-    _SUPERVISOR_SELF_RESTART_FLUSH_DELAY_S,
     _schedule_supervisor_self_restart,
     _supervisor_fetch_current_options,
     _supervisor_merge_and_post_options,
@@ -72,10 +66,17 @@ from ._tools_meta import (
     _get_tool_metadata,
     apply_tool_visibility,
     effective_mandatory_tools,
+    primary_tag,
+)
+from .i18n import (
+    LOCALE_COOKIE,
+    build_payload,
+    select_locale,
+    serialize_payload,
 )
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from ha_mcp._vendor.fastmcp import FastMCP
 
     from ..config import Settings
     from ..server import HomeAssistantSmartMCPServer
@@ -83,36 +84,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The settings-UI client script lives in settings.js (a real file for
-# editor/JS tooling). It is a template with two sentinel tokens for the
+# The settings-UI client script lives in the numbered part files under
+# settings_js/ (real files for editor/JS tooling). The parts are one script
+# split at top-level statement boundaries; joining them in file-name order
+# gives the whole script. It is a template with two sentinel tokens for the
 # Python-injected constant lists; substitute them with the same values the
 # inline literal used so the rendered HTML is byte-identical. Injected
 # inline (not served) -- the serving model is unchanged.
 #
 # This is a module-import-time file read: importing settings_ui (done by
-# server.py / __main__.py / the sidecar) now depends on settings.js being
-# present. If packaging drops it, fail with a packaging-specific ImportError
+# server.py / __main__.py / the sidecar) now depends on the parts being
+# present. If packaging drops them, fail with a packaging-specific ImportError
 # rather than a bare FileNotFoundError so the cause is obvious.
-_SETTINGS_JS_PATH = Path(__file__).parent / "settings.js"
+_SETTINGS_JS_DIR = Path(__file__).parent / "settings_js"
 try:
-    _settings_js_template = _SETTINGS_JS_PATH.read_text(encoding="utf-8")
+    _settings_js_parts = sorted(_SETTINGS_JS_DIR.glob("*.js"))
+    _settings_js_template = "".join(
+        part.read_text(encoding="utf-8") for part in _settings_js_parts
+    )
 except OSError as exc:  # pragma: no cover - packaging guard
     raise ImportError(
-        f"settings.js missing at {_SETTINGS_JS_PATH}. It must ship in "
-        "package-data (wheel), MANIFEST.in (sdist), and the PyInstaller datas "
-        "(binary) -- this is a packaging bug, not a usage error."
+        f"settings_js/ missing at {_SETTINGS_JS_DIR}. It must ship in "
+        "the wheel and the sdist -- this is a packaging bug, not a usage error."
     ) from exc
+if not _settings_js_template:  # pragma: no cover - packaging guard
+    raise ImportError(
+        f"settings_js/ at {_SETTINGS_JS_DIR} holds no .js parts. They must "
+        "ship in the wheel and the sdist -- this is a packaging bug, not a "
+        "usage error."
+    )
 # str.replace() silently no-ops on an absent token, and a *renamed* sentinel
 # (e.g. PINNED_DEFAULTS) slips past both the "__HA_MCP_" not-in test and the
 # esbuild/jsdom JS harness (tests/js/harness.mjs) -- `const DEFAULT_PINNED =
 # PINNED_DEFAULTS;` is valid JS (only a runtime ReferenceError), so a drifted
-# settings.js would ship a broken page green. Assert both sentinels are present
+# settings_js/ would ship a broken page green. Assert both sentinels are present
 # before substituting.
 for _sentinel in ("__HA_MCP_DEFAULT_PINNED__", "__HA_MCP_MANDATORY__"):
     if _sentinel not in _settings_js_template:
         raise ImportError(
-            f"settings.js is out of sync: sentinel {_sentinel} not found. "
-            "The Python injection and settings.js have drifted."
+            f"settings_js/ is out of sync: sentinel {_sentinel} not found. "
+            "The Python injection and settings_js/ have drifted."
         )
 # sorted(), not list(): DEFAULT_PINNED_TOOLS / MANDATORY_TOOLS are sets, so
 # json.dumps(list(...)) is per-process-ordered -- the only reason proving the
@@ -124,10 +135,10 @@ _SETTINGS_JS = _settings_js_template.replace(
 
 
 # The settings-UI CSS lives in settings.css, extracted the same way as
-# settings.js. Unlike the JS it has no Python injection points -- a plain
+# the settings_js/ parts. Unlike the JS it has no Python injection points -- a plain
 # read, no token substitution -- and is injected inline between the same
 # <style>/</style> tags so the served page stays byte-identical. It carries
-# the same import-time packaging dependency as settings.js, so the same
+# the same import-time packaging dependency as settings_js/, so the same
 # OSError -> ImportError packaging guard applies.
 _SETTINGS_CSS_PATH = Path(__file__).parent / "settings.css"
 try:
@@ -135,32 +146,30 @@ try:
 except OSError as exc:  # pragma: no cover - packaging guard
     raise ImportError(
         f"settings.css missing at {_SETTINGS_CSS_PATH}. It must ship in "
-        "package-data (wheel), MANIFEST.in (sdist), and the PyInstaller datas "
-        "(binary) -- this is a packaging bug, not a usage error."
+        "the wheel and the sdist -- this is a packaging bug, not a usage error."
     ) from exc
 
 
 # The settings page HTML lives in settings.html, extracted the same way as
-# settings.js / settings.css (a real file for editor/HTML tooling). It carries
+# settings_js/ / settings.css (real files for editor/HTML tooling). It carries
 # six substitution markers — two filled once at import, four per request:
 #   __HA_MCP_CSS__         -> settings.css contents (inside <style>)
-#   __HA_MCP_JS__          -> settings.js contents (inside <script>)
+#   __HA_MCP_JS__          -> settings_js/ contents (inside <script>)
 #   __HA_MCP_THEME_PREFS__ -> per-request server-seeded theme prefs JSON,
-#                             substituted in _render_settings_html()
+#                             substituted in render_settings_html()
 #   __HA_MCP_I18N__        -> selected merged translation catalog JSON
 #   __HA_MCP_LANG__        -> selected locale code for the html lang attribute
 #   __HA_MCP_DIR__         -> selected catalog text direction (ltr / rtl)
-# Same import-time packaging dependency as settings.js/css (wheel package-data,
-# MANIFEST.in, PyInstaller datas) and the same OSError guard -- but this loader
-# raises RuntimeError, not the ImportError that settings.js/css raise.
+# Same import-time packaging dependency as settings_js/css (wheel and
+# sdist) and the same OSError guard -- but this loader
+# raises RuntimeError, not the ImportError that settings_js/css raise.
 _SETTINGS_HTML_PATH = Path(__file__).parent / "settings.html"
 try:
     _settings_html_template = _SETTINGS_HTML_PATH.read_text(encoding="utf-8")
 except OSError as exc:  # pragma: no cover - packaging guard
     raise RuntimeError(
         f"settings.html missing at {_SETTINGS_HTML_PATH}. It must ship in "
-        "package-data (wheel), MANIFEST.in (sdist), and the PyInstaller datas "
-        "(binary) -- this is a packaging bug, not a usage error."
+        "the wheel and the sdist -- this is a packaging bug, not a usage error."
     ) from exc
 
 # Fail fast if a marker was renamed in settings.html but not here (or vice
@@ -182,10 +191,27 @@ for _sentinel in (
         )
 
 # CSS and JS are injected once at import; __HA_MCP_THEME_PREFS__ remains in the
-# string and is substituted per-request in _render_settings_html().
+# string and is substituted per-request in render_settings_html().
 _SETTINGS_HTML = _settings_html_template.replace(
     "__HA_MCP_CSS__", _SETTINGS_CSS
 ).replace("__HA_MCP_JS__", _SETTINGS_JS)
+
+
+# Body of the 503 the five live-approval routes — pending, approve, deny,
+# tool-schema and value-source — answer with whenever these stub handlers are
+# in use: the stdio sidecar, but equally a main server with no approval queue
+# (feature off, or the policy package failed to import). Config GET/PUT are
+# served for real even then. Module-level so the guard on the settings-UI copy
+# pins the string the server actually sends, rather than a hand-copied
+# paraphrase that drifts away from it.
+POLICY_UNAVAILABLE_MESSAGE = (
+    "Tool security policies live approvals are not active. "
+    "Either the feature is turned off in App (add-on) config, the "
+    "settings UI is running in stdio-sidecar mode, or the "
+    "policy package failed to import at startup. Check the "
+    "App (add-on) log for ImportError / RuntimeError details if you "
+    "expected gating to be on."
+)
 
 
 def _build_stub_policy_handlers(*, data_dir: Path) -> dict[str, Any]:
@@ -198,19 +224,19 @@ def _build_stub_policy_handlers(*, data_dir: Path) -> dict[str, Any]:
     """
     from pydantic import ValidationError
 
-    from ..policy.model import Policy
+    from ..policy.decision_pin import is_pin_set
+    from ..policy.handlers import (
+        build_decision_pin_handlers,
+        policy_file_corrupt_response,
+    )
+    from ..policy.model import ALLOW_LIST_OMITTED_MESSAGE, Policy, drops_allow_list
     from ..policy.persistence import load_policy, save_policy
 
     async def get_config(_: Request) -> JSONResponse:
         try:
             return JSONResponse(load_policy(data_dir).model_dump(mode="json"))
         except ValueError as e:
-            # Mirror the main-server handler: surface corruption rather
-            # than crash the sidecar tab on a 500.
-            return JSONResponse(
-                {"error": str(e), "policy_file_corrupt": True},
-                status_code=500,
-            )
+            return policy_file_corrupt_response(e)
 
     async def put_config(request: Request) -> JSONResponse:
         try:
@@ -218,18 +244,48 @@ def _build_stub_policy_handlers(*, data_dir: Path) -> dict[str, Any]:
         except (ValidationError, ValueError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         # Mirror main-server optimistic concurrency: reject if on-disk
-        # version moved between this caller's GET and PUT.
-        current = load_policy(data_dir)
-        if new_policy.version != current.version:
-            return JSONResponse(
-                {
-                    "error": "Policy version mismatch. Reload before saving.",
-                    "current_version": current.version,
-                    "current_policy": current.model_dump(mode="json"),
-                },
-                status_code=409,
-            )
-        save_policy(data_dir, new_policy)
+        # version moved between this caller's GET and PUT. The guard is
+        # what makes that check a real compare-and-swap: this handler runs
+        # in the SIDECAR process, so without the cross-process file lock it
+        # could read version N, lose the race to the main server's policy
+        # tools, and overwrite their commit with no version bump visible.
+        from ..utils.config_write_lock import config_write_guard
+
+        async with config_write_guard():
+            try:
+                current = load_policy(data_dir)
+            except ValueError as e:
+                return policy_file_corrupt_response(e)
+            if drops_allow_list(new_policy, current):
+                return JSONResponse(
+                    {"error": ALLOW_LIST_OMITTED_MESSAGE}, status_code=400
+                )
+            # Mirror the main-server PIN guard, and for the same reason it
+            # sits inside the lock there: the PIN delete runs under this
+            # lock and leaves the policy version untouched when the switch
+            # was already off, so a check taken before the lock can be stale
+            # by the time this write lands.
+            if new_policy.event_decisions_enabled and not is_pin_set(data_dir):
+                return JSONResponse(
+                    {
+                        "error": (
+                            "set an approval PIN before allowing approve/deny "
+                            "over the Home Assistant event bus"
+                        ),
+                        "pin_required": True,
+                    },
+                    status_code=400,
+                )
+            if new_policy.version != current.version:
+                return JSONResponse(
+                    {
+                        "error": "Policy version mismatch. Reload before saving.",
+                        "current_version": current.version,
+                        "current_policy": current.model_dump(mode="json"),
+                    },
+                    status_code=409,
+                )
+            save_policy(data_dir, new_policy)
         return JSONResponse({"saved": True, "version": new_policy.version + 1})
 
     async def unavailable(_: Request) -> JSONResponse:
@@ -243,19 +299,7 @@ def _build_stub_policy_handlers(*, data_dir: Path) -> dict[str, Any]:
         # Either way, point users at the addon log for the real reason
         # (a startup ImportError on the policy package surfaces here as
         # the same 503 with a "ModuleNotFoundError" in the log).
-        return JSONResponse(
-            {
-                "error": (
-                    "Tool security policies live approvals are not active. "
-                    "Either the feature is turned off in App (add-on) config, the "
-                    "settings UI is running in stdio-sidecar mode, or the "
-                    "policy package failed to import at startup. Check the "
-                    "App (add-on) log for ImportError / RuntimeError details if you "
-                    "expected gating to be on."
-                )
-            },
-            status_code=503,
-        )
+        return JSONResponse({"error": POLICY_UNAVAILABLE_MESSAGE}, status_code=503)
 
     return {
         "policy_get_config": get_config,
@@ -265,6 +309,9 @@ def _build_stub_policy_handlers(*, data_dir: Path) -> dict[str, Any]:
         "policy_post_deny": unavailable,
         "policy_get_tool_schema": unavailable,
         "policy_get_value_source": unavailable,
+        # Served for real: the PIN is a file in the shared data dir, and the
+        # config PUT above refuses the toggle without one.
+        **build_decision_pin_handlers(data_dir=data_dir),
     }
 
 
@@ -300,21 +347,25 @@ def _build_visibility_handlers(*, data_dir: Path) -> dict[str, Any]:
             new_config = VisibilityConfig.model_validate(await request.json())
         except (ValidationError, ValueError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        # Optimistic concurrency: reject if the on-disk version moved between
-        # this caller's GET and PUT.
-        current = load_visibility_config(data_dir)
-        if new_config.version != current.version:
-            return JSONResponse(
-                {
-                    "error": (
-                        "Visibility config version mismatch. Reload before saving."
-                    ),
-                    "current_version": current.version,
-                    "current_config": current.model_dump(mode="json"),
-                },
-                status_code=409,
-            )
-        save_visibility_config(data_dir, new_config)
+        # The guard makes the version check a real cross-process
+        # compare-and-swap: the stdio settings sidecar and main MCP process can
+        # both write this file.
+        from ..utils.config_write_lock import config_write_guard
+
+        async with config_write_guard():
+            current = load_visibility_config(data_dir)
+            if new_config.version != current.version:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Visibility config version mismatch. Reload before saving."
+                        ),
+                        "current_version": current.version,
+                        "current_config": current.model_dump(mode="json"),
+                    },
+                    status_code=409,
+                )
+            save_visibility_config(data_dir, new_config)
         return JSONResponse({"saved": True, "version": new_config.version + 1})
 
     return {
@@ -323,9 +374,11 @@ def _build_visibility_handlers(*, data_dir: Path) -> dict[str, Any]:
     }
 
 
-def _render_settings_html(request: Request | None = None) -> str:
-    """Substitute theme preferences and the request-selected locale.
+def render_settings_html(request: Request | None = None) -> str:
+    """Render the settings page every settings-page route serves.
 
+    Substitutes theme preferences and the request-selected locale. Public
+    because the JS behaviour tests load the served page from here.
     The ``server-prefs`` head script carries a ``data-prefs`` attribute
     with a placeholder token; request-time substitution keeps
     ``_SETTINGS_HTML`` a static import-time constant (and keeps the script
@@ -405,10 +458,10 @@ def build_settings_handlers(
     """
 
     async def _root_page(request: Request) -> HTMLResponse:
-        return HTMLResponse(_render_settings_html(request))
+        return HTMLResponse(render_settings_html(request))
 
     async def _settings_page(request: Request) -> HTMLResponse:
-        return HTMLResponse(_render_settings_html(request))
+        return HTMLResponse(render_settings_html(request))
 
     handlers: dict[str, Any] = {
         "root_page": _root_page,
@@ -444,6 +497,8 @@ def build_settings_handlers(
     handlers.update(build_backups_handlers(server))
     handlers.update(build_server_handlers(server, is_sidecar=is_sidecar))
     handlers.update(build_advanced_handlers(server))
+    handlers.update(build_oauth_callback_handlers(server))
+    handlers.update(build_transfer_handlers(server))
 
     return handlers
 
@@ -508,11 +563,11 @@ def _ingress_only(handler: _SettingsRoute) -> _SettingsRoute:
 
 
 # Mount prefix the settings UI is served under in long-lived HTTP transports
-# (Docker / standalone ha-mcp-web / OAuth / the add-on's secret-path mount).
-# Recorded by register_settings_routes so ha_get_overview can point users at
-# the settings page in modes that have no stdio sidecar URL file to surface
-# (issue #1458). Stays None in pure stdio mode, where the sidecar writes
-# ~/.ha-mcp/ui.url instead.
+# (Docker / standalone ha-mcp-web). Recorded by register_settings_routes so
+# ha_get_overview can point users at the settings page in modes that have no
+# managed UI entry point or stdio sidecar URL file to surface (issue #1458).
+# Stays None in managed HA deployments and pure stdio mode, where the sidebar /
+# ingress entry point or ~/.ha-mcp/ui.url already provides discovery.
 _http_settings_prefix: str | None = None
 
 
@@ -523,8 +578,8 @@ def get_http_settings_prefix() -> str | None:
     long-lived HTTP server *and* advertising is enabled. ``ha_get_overview``
     reads it to hint at the settings page when there is no stdio sidecar URL to
     hand the user. It is None when the mount is deliberately not advertised
-    (OAuth/OIDC dedicated-secret mode) — use :func:`is_http_settings_mounted`,
-    not this, to tell HTTP from the stdio sidecar.
+    (managed HA or OAuth/OIDC dedicated-secret mode) — use
+    :func:`is_http_settings_mounted`, not this, to tell HTTP from the sidecar.
     """
     return _http_settings_prefix
 
@@ -541,6 +596,73 @@ _http_settings_mounted: bool = False
 def is_http_settings_mounted() -> bool:
     """Return True when the settings UI is HTTP-mounted (not the stdio sidecar)."""
     return _http_settings_mounted
+
+
+def reset_http_settings_state() -> None:
+    """Forget process-local route advertisement between isolated server starts."""
+    global _http_settings_prefix, _http_settings_mounted
+    _http_settings_prefix = None
+    _http_settings_mounted = False
+
+
+# Every settings route except the add-on-only root mount is defined once in
+# this table. register_settings_routes mounts it under each active prefix: at
+# root in add-on mode (so HA ingress can proxy localhost:9583/), and under the
+# secret path when one is set (Docker / standalone direct access); the stdio
+# sidecar mounts it too. Deriving every mount from one table keeps them from
+# drifting; the frontend uses relative fetches (./api/settings/...) so the
+# handlers work at any prefix.
+SETTINGS_ROUTES: tuple[tuple[str, list[str], str], ...] = (
+    ("/settings", ["GET"], "settings_page"),
+    ("/api/settings/tools", ["GET"], "get_tools"),
+    ("/api/settings/tools", ["POST"], "save_tools"),
+    ("/api/settings/restart", ["POST"], "restart_addon"),
+    ("/api/settings/info", ["GET"], "settings_info"),
+    ("/api/settings/features", ["GET"], "get_feature_flags"),
+    ("/api/settings/features", ["POST"], "save_feature_flags"),
+    # Theme / accessibility prefs (#1574 review) — server-side copy so
+    # they survive a stdio sidecar origin change (stable by default
+    # since #2131, but fresh on first spawn / lost ui.state / pin
+    # change / taken remembered port)
+    ("/api/settings/theme", ["GET"], "get_theme_prefs"),
+    ("/api/settings/theme", ["POST"], "save_theme_prefs"),
+    # Advanced settings endpoints
+    ("/api/settings/advanced", ["GET"], "get_advanced_settings"),
+    ("/api/settings/advanced", ["POST"], "save_advanced_settings"),
+    # Auto-backup endpoints (#1288)
+    ("/api/settings/backups", ["GET"], "list_backups"),
+    ("/api/settings/backups", ["DELETE"], "delete_backups_bulk"),
+    ("/api/settings/backups/{name}", ["GET"], "view_backup"),
+    ("/api/settings/backups/{name}/diff", ["GET"], "diff_backup"),
+    ("/api/settings/backups/{name}/restore", ["POST"], "restore_backup"),
+    ("/api/settings/backups/{name}", ["DELETE"], "delete_backup"),
+    ("/api/settings/backup-config", ["GET"], "get_backup_config"),
+    ("/api/settings/backup-config", ["POST"], "save_backup_config"),
+    # Custom filesystem directories (issue #1567) — component-owned list
+    ("/api/settings/fs-custom-paths", ["GET"], "get_fs_custom_paths"),
+    ("/api/settings/fs-custom-paths", ["POST"], "save_fs_custom_paths"),
+    # None-mode OAuth callback allowlist (#2427) — component-owned list
+    ("/api/settings/oauth-callbacks", ["GET"], "get_oauth_callbacks"),
+    ("/api/settings/oauth-callbacks", ["POST"], "save_oauth_callbacks"),
+    # Settings export / import (#3099); the HA sidebar panel answers these
+    # itself so it can also move the component's config entries.
+    ("/api/settings/transfer/export", ["POST"], "export_settings"),
+    ("/api/settings/transfer/import", ["POST"], "import_settings"),
+    # Tool security policies endpoints
+    ("/api/policy/config", ["GET"], "policy_get_config"),
+    ("/api/policy/config", ["PUT"], "policy_put_config"),
+    ("/api/policy/pending", ["GET"], "policy_get_pending"),
+    ("/api/policy/approve", ["POST"], "policy_post_approve"),
+    ("/api/policy/deny", ["POST"], "policy_post_deny"),
+    ("/api/policy/decision-pin", ["GET"], "policy_get_decision_pin"),
+    ("/api/policy/decision-pin", ["POST"], "policy_post_decision_pin"),
+    ("/api/policy/decision-pin", ["DELETE"], "policy_delete_decision_pin"),
+    ("/api/policy/tool-schema", ["GET"], "policy_get_tool_schema"),
+    ("/api/policy/value-source", ["GET"], "policy_get_value_source"),
+    # Entity visibility filter endpoints (issue #1728)
+    ("/api/visibility/config", ["GET"], "visibility_get_config"),
+    ("/api/visibility/config", ["PUT"], "visibility_put_config"),
+)
 
 
 def register_settings_routes(
@@ -561,6 +683,15 @@ def register_settings_routes(
     and serve the "Open Web UI" button. Stdio transports use a separate
     side-process sidecar instead — see :mod:`ha_mcp.stdio_settings_sidecar`.
 
+    The ``RequireAuthMiddleware`` bypass is the documented posture, not an
+    oversight: SECURITY.md § "OAuth Mode — Beta Warning" states that the
+    settings UI "is **not** gated by the OAuth token", and its Scope section
+    excludes "The web settings UI not being gated by the OAuth/OIDC token".
+    OAuth and OIDC modes compensate by passing a *dedicated* secret path here
+    rather than the client-known MCP path (GHSA-mx64-982r-65vg); standard mode
+    and the add-on pass the MCP secret path, which already gates the whole
+    tool surface.
+
     Args:
         mcp: The FastMCP instance to register routes on.
         server: The HomeAssistantSmartMCPServer wrapping ``mcp``.
@@ -569,12 +700,18 @@ def register_settings_routes(
             non-add-on mode, the function logs a warning and registers
             nothing rather than expose the routes publicly.
         advertise_prefix: When True (default), record the secret-path mount in
-            ``_http_settings_prefix`` so ``ha_get_overview`` can hint at the
-            settings URL. OAuth/OIDC modes pass False: there the settings UI
-            sits under a *dedicated* secret path that must never be handed to
-            MCP clients (GHSA-mx64-982r-65vg), so the mount happens but the
-            prefix is not recorded.
+            ``_http_settings_prefix`` for unmanaged HTTP deployments so
+            ``ha_get_overview`` can hint at the settings URL. The managed app
+            (add-on) and embedded deployments never record it because Home Assistant
+            supplies their settings entry points. OAuth/OIDC callers pass False
+            because they use a dedicated settings secret.
     """
+    global _http_settings_mounted, _http_settings_prefix
+
+    # Never let a rejected or non-advertised registration inherit another
+    # server's credential-bearing hint.
+    _http_settings_prefix = None
+
     handlers = build_settings_handlers(server)
     secret_prefix = secret_path.rstrip("/") if secret_path else ""
     if secret_prefix and ("{" in secret_prefix or "}" in secret_prefix):
@@ -602,61 +739,13 @@ def register_settings_routes(
     # Past this point at least one HTTP mount happens (add-on root and/or the
     # secret path). Record that so consumers can distinguish HTTP from the stdio
     # sidecar even when the prefix itself is not advertised (advertise_prefix=False).
-    global _http_settings_mounted
     _http_settings_mounted = True
-
-    # Every route this function mounts except the add-on-only root mount is defined
-    # once in this table and mounted under each active prefix below: at root
-    # in add-on mode (so HA ingress can proxy localhost:9583/), and under the
-    # secret path when one is set (Docker / standalone direct access). A
-    # deployment hits either, both, or — guarded above — neither. Deriving
-    # the mounts from one table keeps them from drifting; the frontend uses
-    # relative fetches (./api/settings/...) so the handlers work at any prefix.
-    routes: list[tuple[str, list[str], str]] = [
-        ("/settings", ["GET"], "settings_page"),
-        ("/api/settings/tools", ["GET"], "get_tools"),
-        ("/api/settings/tools", ["POST"], "save_tools"),
-        ("/api/settings/restart", ["POST"], "restart_addon"),
-        ("/api/settings/info", ["GET"], "settings_info"),
-        ("/api/settings/features", ["GET"], "get_feature_flags"),
-        ("/api/settings/features", ["POST"], "save_feature_flags"),
-        # Theme / accessibility prefs (#1574 review) — server-side copy so
-        # they survive the stdio sidecar's per-spawn origin change
-        ("/api/settings/theme", ["GET"], "get_theme_prefs"),
-        ("/api/settings/theme", ["POST"], "save_theme_prefs"),
-        # Advanced settings endpoints
-        ("/api/settings/advanced", ["GET"], "get_advanced_settings"),
-        ("/api/settings/advanced", ["POST"], "save_advanced_settings"),
-        # Auto-backup endpoints (#1288)
-        ("/api/settings/backups", ["GET"], "list_backups"),
-        ("/api/settings/backups", ["DELETE"], "delete_backups_bulk"),
-        ("/api/settings/backups/{name}", ["GET"], "view_backup"),
-        ("/api/settings/backups/{name}/diff", ["GET"], "diff_backup"),
-        ("/api/settings/backups/{name}/restore", ["POST"], "restore_backup"),
-        ("/api/settings/backups/{name}", ["DELETE"], "delete_backup"),
-        ("/api/settings/backup-config", ["GET"], "get_backup_config"),
-        ("/api/settings/backup-config", ["POST"], "save_backup_config"),
-        # Custom filesystem directories (issue #1567) — component-owned list
-        ("/api/settings/fs-custom-paths", ["GET"], "get_fs_custom_paths"),
-        ("/api/settings/fs-custom-paths", ["POST"], "save_fs_custom_paths"),
-        # Tool security policies endpoints
-        ("/api/policy/config", ["GET"], "policy_get_config"),
-        ("/api/policy/config", ["PUT"], "policy_put_config"),
-        ("/api/policy/pending", ["GET"], "policy_get_pending"),
-        ("/api/policy/approve", ["POST"], "policy_post_approve"),
-        ("/api/policy/deny", ["POST"], "policy_post_deny"),
-        ("/api/policy/tool-schema", ["GET"], "policy_get_tool_schema"),
-        ("/api/policy/value-source", ["GET"], "policy_get_value_source"),
-        # Entity visibility filter endpoints (issue #1728)
-        ("/api/visibility/config", ["GET"], "visibility_get_config"),
-        ("/api/visibility/config", ["PUT"], "visibility_put_config"),
-    ]
 
     def _mount(prefix: str, *, guard: bool = False) -> None:
         # guard=True wraps each handler in _ingress_only so the route only
         # answers HA ingress (the Supervisor) — used for the add-on root
         # mount, whose port 9583 is reachable without the MCP secret.
-        for path, methods, handler_key in routes:
+        for path, methods, handler_key in SETTINGS_ROUTES:
             handler = handlers[handler_key]
             if guard:
                 handler = _ingress_only(handler)
@@ -678,10 +767,10 @@ def register_settings_routes(
         # need the same secret to reach the UI as they do for the MCP
         # endpoint.
         _mount(secret_prefix)
-        if advertise_prefix:
+        if advertise_prefix and not is_addon and not is_embedded():
             # Record the mount so ha_get_overview can point users at the
-            # settings page in HTTP transports that have no stdio sidecar URL
-            # file (#1458). Suppressed in OAuth/OIDC modes, where the dedicated
-            # secret path must not leak to MCP clients (GHSA-mx64-982r-65vg).
-            global _http_settings_prefix
+            # settings page in unmanaged HTTP transports that have no stdio
+            # sidecar URL file (#1458). The managed app (add-on) and embedded deployments
+            # already have Home Assistant settings entry points; OAuth/OIDC
+            # callers suppress their dedicated settings secret explicitly.
             _http_settings_prefix = secret_prefix

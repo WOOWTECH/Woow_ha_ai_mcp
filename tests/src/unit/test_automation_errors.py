@@ -1,0 +1,372 @@
+"""Errors for an automation Home Assistant rejected.
+
+The rejection text, the ``validate_config`` verdicts and the trigger keys come
+from Core on the real ``hass`` through ``core_client``; the component's own
+describe answer comes from ``component_core_client``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from homeassistant.components.websocket_api import commands as ws_commands
+from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp.client.rest_client import (
+    HomeAssistantAPIError,
+    HomeAssistantClient,
+)
+from ha_mcp.client.websocket_client import get_websocket_client
+from ha_mcp.tools import automation_errors
+from ha_mcp.tools.automation_errors import (
+    REJECTION_PREFIX,
+    closest_matches,
+    core_rejection_text,
+    failed_section_from_core,
+    platform_descriptions,
+    raise_core_rejection,
+    section_from_status,
+    text_suggestions,
+)
+from ha_mcp.tools.best_practice_checker import check_automation_config
+from ha_mcp.visibility.result_payloads import serialize_error
+
+# --- the failed section ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "section"),
+    [
+        # Core's automation ValidationStatus failures.
+        ("failed_schema", "schema"),
+        ("failed_triggers", "triggers"),
+        ("failed_conditions", "conditions"),
+        ("failed_actions", "actions"),
+        ("failed_blueprint", "blueprint"),
+        ("unknown", None),
+        (None, None),
+    ],
+)
+def test_rejection_names_the_section_cores_status_names(
+    status: str | None, section: str | None
+) -> None:
+    """The caller is told where to look from Core's own status; a status that
+    names no failure names no section."""
+    assert section_from_status(status) == section
+
+
+async def test_blueprint_automation_failure_is_the_blueprint(
+    core_client: HomeAssistantClient,
+) -> None:
+    """A blueprint automation has no sections of its own for Core to check,
+    so its rejection points at the blueprint without asking Core."""
+    config = {"use_blueprint": {"path": "motion.yaml", "input": {}}}
+
+    with patch.object(
+        core_client,
+        "send_websocket_message",
+        AsyncMock(wraps=core_client.send_websocket_message),
+    ) as ask_core:
+        assert await failed_section_from_core(core_client, config) == "blueprint"
+
+    ask_core.assert_not_awaited()
+
+
+async def test_legacy_root_keys_are_checked_under_cores_names(
+    core_client: HomeAssistantClient,
+) -> None:
+    """A config written with ``trigger``/``action`` still has its sections
+    checked: ``validate_config`` takes only the plural names."""
+    triggers = [{"trigger": "state", "entity_id": "light.porch"}]
+    actions = [{"delay": {"seconds": 1}, "bogus": 1}]
+
+    with patch.object(
+        core_client,
+        "send_websocket_message",
+        AsyncMock(wraps=core_client.send_websocket_message),
+    ) as ask_core:
+        got = await failed_section_from_core(
+            core_client, {"trigger": triggers, "action": actions}
+        )
+
+    assert got == "actions"
+    ask_core.assert_awaited_once_with(
+        {"type": "validate_config", "triggers": triggers, "actions": actions}
+    )
+
+
+async def test_no_answer_from_core_names_no_section(
+    unreachable_client: HomeAssistantClient,
+) -> None:
+    """Without Core's verdicts any section named would be a guess."""
+    assert await failed_section_from_core(unreachable_client, {"triggers": []}) is None
+
+
+# --- Core's rejection text --------------------------------------------------------
+
+
+async def _core_rejection(
+    hass: HomeAssistant, core_client: HomeAssistantClient, config: dict[str, Any]
+) -> str:
+    """Core's own text for ``config``, from the write Core refuses with a 400."""
+    assert await async_setup_component(hass, "config", {})
+    with pytest.raises(HomeAssistantAPIError) as rejected:
+        await core_client.upsert_automation_config(config, None, _resolved=True)
+    text = core_rejection_text(rejected.value)
+    assert text is not None
+    return text
+
+
+async def _rejection(
+    client: HomeAssistantClient, core_text: str, config: dict[str, Any]
+) -> dict[str, Any]:
+    with pytest.raises(ToolError) as exc:
+        await raise_core_rejection(
+            client,
+            core_text,
+            config,
+            failed_section="triggers",
+            context={},
+            bp_warnings=[],
+        )
+    body: dict[str, Any] = json.loads(str(exc.value))
+    return body
+
+
+@pytest.fixture
+async def schedule_triggers(hass: HomeAssistant) -> None:
+    """Load the integrations whose trigger keys Core describes."""
+    assert await async_setup_component(hass, "homeassistant", {})
+    assert await async_setup_component(hass, "schedule", {})
+    await hass.async_block_till_done()
+
+
+async def test_rejection_offers_the_registered_trigger_closest_to_the_typo(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    schedule_triggers: None,
+) -> None:
+    """A trigger key one letter off gets Core's registered key as its match,
+    read from the platforms Core describes."""
+    config = {
+        "alias": "porch",
+        "triggers": [{"trigger": "schedule.block_strt"}],
+        "actions": [],
+    }
+    core_text = await _core_rejection(hass, core_client, config)
+
+    body = await _rejection(core_client, core_text, config)
+
+    assert body["error"]["message"] == f"{REJECTION_PREFIX}{core_text}"
+    assert body["closest_matches"] == ["schedule.block_started", "schedule.block_ended"]
+
+
+async def test_component_describe_offers_the_same_closest_trigger(
+    hass: HomeAssistant,
+    component_core_client: HomeAssistantClient,
+    schedule_triggers: None,
+) -> None:
+    """With the component installed its describe command answers the match."""
+    config = {
+        "alias": "porch",
+        "triggers": [{"trigger": "schedule.block_strt"}],
+        "actions": [],
+    }
+    core_text = await _core_rejection(hass, component_core_client, config)
+
+    body = await _rejection(component_core_client, core_text, config)
+
+    assert body["closest_matches"] == ["schedule.block_started", "schedule.block_ended"]
+
+
+async def test_unreachable_core_still_raises_cores_rejection(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    unreachable_client: HomeAssistantClient,
+    schedule_triggers: None,
+) -> None:
+    """Failing to reach Home Assistant for the closest keys must not replace
+    Core's rejection with a connection error."""
+    config = {
+        "alias": "porch",
+        "triggers": [{"trigger": "schedule.block_strt"}],
+        "actions": [],
+    }
+    core_text = await _core_rejection(hass, core_client, config)
+
+    body = await _rejection(unreachable_client, core_text, config)
+
+    assert body["error"]["code"] == "VALIDATION_FAILED"
+    assert body["error"]["message"] == f"{REJECTION_PREFIX}{core_text}"
+    assert "closest_matches" not in body
+
+
+async def test_platforms_that_never_answer_release_the_subscription(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first event that never came left the subscription open on the shared
+    socket; the rejection still carries Core's text.
+
+    Core acknowledges the subscription, then holds its trigger descriptions;
+    released, Core answers with its own.
+    """
+    released = asyncio.Event()
+    core_descriptions = ws_commands.async_get_all_trigger_descriptions
+
+    async def descriptions_held(core: HomeAssistant) -> dict[str, Any]:
+        await released.wait()
+        return await core_descriptions(core)
+
+    monkeypatch.setattr(
+        ws_commands, "async_get_all_trigger_descriptions", descriptions_held
+    )
+    monkeypatch.setattr(automation_errors, "DESCRIPTIONS_TIMEOUT_S", 0.05)
+    ws = await get_websocket_client(
+        url=core_client.base_url, token=core_client.token, verify_ssl=False
+    )
+    monkeypatch.setattr(
+        ws, "release_subscription", AsyncMock(wraps=ws.release_subscription)
+    )
+    config = {"alias": "porch", "triggers": [{"trigger": "stat"}], "actions": []}
+    core_text = await _core_rejection(hass, core_client, config)
+    try:
+        body = await _rejection(core_client, core_text, config)
+    finally:
+        released.set()
+        await hass.async_block_till_done()
+
+    assert body["error"]["message"] == f"{REJECTION_PREFIX}{core_text}"
+    assert "closest_matches" not in body
+    cast("AsyncMock", ws.release_subscription).assert_awaited_once()
+
+
+# --- closest keys: the domain first -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        # A renamed key's replacement lives in the key's own domain.
+        ("schedule.turned_on", ["schedule.block_started", "schedule.block_ended"]),
+        # A near miss inside a registered domain ranks by similarity.
+        (
+            "schedule.block_strt",
+            ["schedule.block_started", "schedule.block_ended"],
+        ),
+        # A misspelt domain registers nothing, so every domain is searched.
+        (
+            "schedul.block_started",
+            ["schedule.block_started", "schedule.block_ended"],
+        ),
+        # A key without a domain is searched across every key.
+        (
+            "restart_required",
+            ["homeassistant.restart_required", "homeassistant.host_reboot_required"],
+        ),
+        # Nothing in the domain comes close: its other keys are not corrections.
+        ("schedule.qwzxvjkpqwzxvjkp", []),
+    ],
+    ids=[
+        "renamed-in-domain",
+        "near-miss-in-domain",
+        "misspelt-domain",
+        "no-domain",
+        "nothing-close-in-domain",
+    ],
+)
+async def test_closest_keys_come_from_the_keys_domain_first(
+    core_client: HomeAssistantClient,
+    schedule_triggers: None,
+    key: str,
+    expected: list[str],
+) -> None:
+    keys = sorted(await platform_descriptions(core_client, "trigger") or {})
+
+    assert closest_matches(key, keys) == expected
+
+
+# --- hints from Core's text -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("config", "names"),
+    [
+        (
+            {
+                "alias": "porch",
+                "triggers": [{"trigger": "state", "entity_id": "light.porch"}],
+                "actions": [],
+                "variables": "porch",
+            },
+            "variables",
+        ),
+        (
+            {
+                "alias": "porch",
+                "triggers": [{"trigger": "state", "entity_id": "light.porch"}],
+                "conditions": [{"platform": "state", "entity_id": "light.porch"}],
+                "actions": [],
+            },
+            "'platform'",
+        ),
+    ],
+    ids=["variables-not-a-dict", "condition-as-trigger"],
+)
+async def test_rejection_hint_names_what_core_objected_to(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    config: dict[str, Any],
+    names: str,
+) -> None:
+    core_text = await _core_rejection(hass, core_client, config)
+
+    suggestions = text_suggestions(core_text, config)
+
+    assert len(suggestions) == 1
+    assert names in suggestions[0]
+
+
+async def test_rejection_relays_the_checker_warnings_where_the_scan_leaves_them_out(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+) -> None:
+    """The checker's examples name entities that are not this install's; the
+    enforce scan of a gated write's error leaves out the suggestion that relays
+    them and keeps Core's rejection."""
+    config = {
+        "alias": "porch",
+        "triggers": [{"trigger": "zz_bogus"}],
+        "conditions": [
+            {
+                "condition": "template",
+                "value_template": "{{ states('sensor.zz_other') | float > 25 }}",
+            }
+        ],
+        "actions": [],
+    }
+    bp_warnings = check_automation_config(config)
+    assert any("sensor.temp" in warning for warning in bp_warnings)
+    core_text = await _core_rejection(hass, core_client, config)
+
+    with pytest.raises(ToolError) as exc:
+        await raise_core_rejection(
+            core_client,
+            core_text,
+            config,
+            failed_section="triggers",
+            context={},
+            bp_warnings=bp_warnings,
+        )
+
+    scanned = serialize_error(exc.value, {"skill_content"})
+    assert "sensor.temp" in str(exc.value)
+    assert "sensor.temp" not in scanned
+    assert core_text in json.loads(scanned)["error"]["message"]

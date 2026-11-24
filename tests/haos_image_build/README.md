@@ -3,7 +3,8 @@
 Builds the pre-baked HAOS qcow2 used by the HAOS E2E test tier (#1281).
 The image bundles a configured HAOS install with the ha-mcp addon repository
 registered, a v1 set of addons installed (Frigate, ESPHome, Node-RED,
-Mosquitto, Zigbee2MQTT), and HACS bootstrapped.
+Mosquitto, Zigbee2MQTT), and the E2E seed state from
+`tests/initial_test_state` (including the Marketplace's stored state).
 
 ## Local build
 
@@ -27,16 +28,40 @@ partition, then runs onboarding and addon installs. Total wall time on a
 `build-haos-test-image.yml` runs the same script on `ubuntu-22.04`. On every
 run it uploads the qcow2 as a workflow artifact (reviewer sanity-check). On
 `master` (push / weekly cron / manual dispatch) it additionally primes the
-shared Actions cache used by the E2E lanes — `haos-e2e-tests.yml` and
-`haos-e2e-inaddon-tests.yml` restore the qcow2 from that cache and fall back
-to a local build on a miss.
+shared Actions cache used by the HAOS E2E lanes: `haos-e2e`,
+`haos-e2e-inaddon` and `haos-e2e-embedded` in `haos-e2e-tests.yml`, and the
+manual `haos-e2e-stdio.yml`. Each restores the qcow2 from that cache and falls
+back to a local build on a miss.
 
 ## Version pinning
 
-`HAOS_VERSION` in `build_image.py` is the single source of truth. Renovate
-watches the `home-assistant/operating-system` releases via the annotation
-comment above the constant and opens a bump PR when HAOS releases. The
-image-build workflow runs on that PR (uploading the new qcow2 as a workflow
-artifact so reviewers can sanity-check). Merging the PR triggers the
-master-only cache-prime; the E2E lanes then restore the new image from the
-shared cache automatically.
+`build_image.py` has three Renovate-managed stable inputs:
+
+- `STABLE_HAOS_VERSION`: the promoted operating-system release from
+  `https://version.home-assistant.io/stable.json` (`hassos.ova`). The GitHub
+  release object appears hours before its per-board assets finish uploading,
+  so the release list is not the promotion signal.
+- `STABLE_SUPERVISOR_VERSION`: the promoted Supervisor version from
+  `https://version.home-assistant.io/stable.json`, used as a minimum.
+- `STABLE_CORE_VERSION`: the exact Core version, updated together with the
+  container E2E pins.
+
+All three dependencies bypass Renovate's ordinary seven-day age gate and
+Tuesday window. The scanner runs hourly. A builder-input change invalidates
+the stable image cache; the PR's HAOS E2E lanes build on a miss. Merging the PR
+also triggers the master image-cache prime. Supervisor can still self-update
+past its recorded minimum within the selected channel.
+
+Beta lanes independently read `beta.json`: `hassos.ova`, `supervisor`, and
+`homeassistant.qemux86-64`. They set `HAOS_BUILD_OS_VERSION`,
+`HAOS_BUILD_SUPERVISOR_CHANNEL=beta`, `HAOS_BUILD_SUPERVISOR_MIN_VERSION`, and
+`HAOS_BUILD_CORE_VERSION`. These environment overrides also remain available
+for explicit local builds. OS prerelease versions such as `18.2.rc1` select
+the corresponding release qcow2 instead of the stable OS pin.
+
+The beta lanes do not use the Actions cache: each bakes its own qcow2 whenever it
+runs, so a ~4.9 GB image never competes for the repository cache budget with the
+stable qcow2 and the Home Assistant container images. Automatic beta runs skip
+only when all three channel versions equal stable, so an OS-only beta release
+still runs. Manual dispatch always runs, and the beta canary checks the booted
+VM's OS, Supervisor channel/minimum, and exact Core version.

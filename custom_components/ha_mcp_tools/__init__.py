@@ -16,7 +16,7 @@ import posixpath
 import re
 import secrets
 import shutil
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime
 from io import StringIO
 from pathlib import Path, PurePosixPath
@@ -24,9 +24,12 @@ from typing import Any
 
 import voluptuous as vol
 import yaml  # type: ignore[import-untyped]
+from annotatedyaml import SECRET_YAML
+from homeassistant.bootstrap import ERROR_LOG_FILENAME
 from homeassistant.components import persistent_notification
 from homeassistant.config import async_check_ha_config_file
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import SERVICE_RELOAD
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -34,20 +37,23 @@ from homeassistant.core import (
     SupportsResponse,
 )
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import service as ha_service
 from homeassistant.helpers.storage import Store
 from homeassistant.loader import async_get_integration
 from ruamel.yaml import YAMLError
 
 from .const import (
     ALLOWED_READ_DIRS,
+    ALLOWED_READ_FILES,
     ALLOWED_VOLUME_ROOTS,
     ALLOWED_WRITE_DIRS,
     ALLOWED_YAML_CONFIG_FILES,
     ALLOWED_YAML_KEYS,
     COMPONENT_VERSION,
     CONF_ENTRY_TYPE,
+    CUSTOM_COMPONENTS_READ_PATTERN,
     DASHBOARD_URL_PATH_PATTERN,
+    DEFAULT_LOG_TAIL_LINES,
     DENY_PATH_SEGMENTS,
     DENY_READ_BASENAMES,
     DOMAIN,
@@ -55,15 +61,46 @@ from .const import (
     ENTRY_TYPE_TOOLS,
     PACKAGES_ONLY_YAML_KEYS,
     RESERVED_DASHBOARD_URL_PATHS,
+    TAILED_LOG_FILES,
     TOOLS_ENTRY_LEGACY_TITLE,
     TOOLS_ENTRY_TITLE,
-    YAML_KEY_DEFAULT_POST_ACTION,
-    YAML_KEY_POST_ACTIONS,
+    YAML_KEY_DENYLIST,
 )
+from .core_log import read_allowlist_applies, read_log_tail_sync, read_target
+from .entry_device import async_register_entry_device
+from .entry_migration import async_migrate_entry as async_migrate_entry
+from .extra_yaml_keys import (
+    _HASS_DATA_EXTRA_YAML_KEYS_KEY,
+    _apply_extra_yaml_keys,
+    _current_extra_yaml_keys,
+    _normalize_extra_yaml_keys,
+)
+from .file_ops import (
+    SERVICE_EDIT_FILE,
+    _delete_file_sync,
+    _replace_file_sync,
+    file_read_error,
+    register_edit_file,
+    run_file_job,
+    run_locked,
+    write_text_atomic,
+)
+from .file_post_action import after_file_write, reload_after_edit
+from .tools_settings_store import (
+    ALLOWED_PATHS_KEY,
+    EXTRA_YAML_KEYS_KEY,
+    TOOLS_STORAGE_VERSION,
+    save_allowed_paths,
+    save_extra_yaml_keys,
+    store_writes,
+)
+from .volume_mounts import PARENT_ERRORS, on_mounted_volume, os_error_text
 from .websocket_api import async_register_commands
+from .yaml_find import SERVICE_FIND_YAML_KEY, register_find_yaml_key
 from .yaml_rt import (
     apply_seq_indent,
     detect_seq_indent,
+    drop_key,
     make_yaml,
     yaml_dumps,
     yaml_jsonify,
@@ -80,6 +117,8 @@ SERVICE_EDIT_YAML_CONFIG = "edit_yaml_config"
 SERVICE_GET_CALLER_TOKEN = "get_caller_token"
 SERVICE_GET_ALLOWED_PATHS = "get_allowed_paths"
 SERVICE_SET_ALLOWED_PATHS = "set_allowed_paths"
+SERVICE_GET_EXTRA_YAML_KEYS = "get_extra_yaml_keys"
+SERVICE_SET_EXTRA_YAML_KEYS = "set_extra_yaml_keys"
 # Read-only access to pre-#1579 YAML backups in .ha_mcp_tools_backups/, so the
 # shared edits-backup interface can list/view/diff/restore them (#1579). These
 # historical artifacts predate the fold into the shared store; new writes no
@@ -88,9 +127,12 @@ SERVICE_LIST_LEGACY_BACKUPS = "list_legacy_backups"
 SERVICE_READ_LEGACY_BACKUP = "read_legacy_backup"
 
 # Caller-token auth (PR: restrict ha_mcp_tools.* to ha-mcp callers).
-# ha-mcp injects this field in every service-call payload; non-ha-mcp callers
-# (HA UI, automations, other integrations, the ha_call_service LLM bypass)
-# omit it and are rejected with a structured unauthorized response.
+# ha-mcp injects this field in every service call except the get_caller_token
+# bootstrap; non-ha-mcp callers (HA UI, automations, other integrations, the
+# ha_call_service LLM bypass) omit it. Non-admin users are already refused by
+# the admin-only service registration; admin and no-user-context callers
+# without the token are rejected with a structured unauthorized response by
+# every handler except that bootstrap.
 CALLER_TOKEN_FIELD = "_ha_mcp_token"
 _TOKEN_STORAGE_KEY = f"{DOMAIN}_auth"
 _TOKEN_STORAGE_VERSION = 1
@@ -101,9 +143,8 @@ _HASS_DATA_TOKEN_KEY = "caller_token"
 # affect token bootstrap, and the security credential is never mixed with user
 # config. Loaded into hass.data at setup and updated in place by
 # set_allowed_paths so enforcement picks up changes with no HA restart.
-_ALLOWED_PATHS_STORAGE_KEY = f"{DOMAIN}_allowed_paths"
-_ALLOWED_PATHS_STORAGE_VERSION = 1
 _HASS_DATA_ALLOWED_PATHS_KEY = "allowed_paths"
+
 
 # Service schemas
 SERVICE_EDIT_YAML_CONFIG_SCHEMA = vol.Schema(
@@ -112,7 +153,7 @@ SERVICE_EDIT_YAML_CONFIG_SCHEMA = vol.Schema(
         vol.Required("action"): vol.In(["add", "replace", "remove", "replace_file"]),
         vol.Required("yaml_path"): cv.string,
         vol.Optional("content"): cv.string,
-        # Back-compat shim: the component reaches users via HACS ahead of the
+        # Back-compat shim: the component reaches users via the store ahead of the
         # server, so a 0.10.0 component runs against the prior stable server
         # until that server's next release. Pre-7.9.0 servers still send
         # "backup": true on every edit_yaml_config call; this strict
@@ -128,6 +169,15 @@ SERVICE_EDIT_YAML_CONFIG_SCHEMA = vol.Schema(
         # stay symmetric — if ha-mcp's flag is off, the component also
         # refuses, defending against bypass attempts.
         vol.Optional("disabled_packages_keys", default=list): vol.All(
+            cv.ensure_list, [cv.string]
+        ),
+        # Caller-provided extra top-level keys the operator has opted into
+        # on top of ALLOWED_YAML_KEYS (#1887). Additive only: the handler
+        # filters YAML_KEY_DENYLIST out before use, so a caller cannot
+        # unlock a trust-boundary key by sending it here. Empty list (the
+        # default) means the built-in allowlist applies unchanged, which
+        # is also what a caller that predates this field produces.
+        vol.Optional("extra_allowed_keys", default=list): vol.All(
             cv.ensure_list, [cv.string]
         ),
         # Two-step preview/confirm flow (#1720). Both optional with
@@ -159,6 +209,7 @@ SERVICE_READ_FILE_SCHEMA = vol.Schema(
         # under ``parsed`` (ha_config_get_yaml's include_parsed, #1788). HA tags
         # are rendered to source form, never resolved.
         vol.Optional("include_parsed", default=False): cv.boolean,
+        vol.Optional("keep_line_endings", default=False): cv.boolean,
         vol.Optional(CALLER_TOKEN_FIELD): cv.string,
     }
 )
@@ -182,7 +233,7 @@ SERVICE_DELETE_FILE_SCHEMA = vol.Schema(
 
 # get_caller_token is the bootstrap surface: ha-mcp does not know the token
 # yet on first run, so this service intentionally does NOT require the token
-# itself. HA's default admin-auth still applies to the service call.
+# itself. Like every service in this domain it is registered admin-only.
 SERVICE_GET_CALLER_TOKEN_SCHEMA = vol.Schema(
     {
         vol.Optional(CALLER_TOKEN_FIELD): cv.string,
@@ -190,20 +241,45 @@ SERVICE_GET_CALLER_TOKEN_SCHEMA = vol.Schema(
 )
 
 # get_allowed_paths / set_allowed_paths back the ha-mcp settings UI's custom
-# filesystem-directory editor (issues #1567, #1586). Both are caller-token +
-# admin gated. set_allowed_paths receives the FULL replacement list (mirrors how
-# disabled_packages_keys sends the whole set each call); the handler validates
-# and drops any entry that hits the deny floor, or that escapes the config dir
-# without being one of the fixed HAOS sibling-volume roots (#1586).
+# filesystem-directory editor (issues #1567, #1586). Both are caller-token
+# gated; the registration is admin-only. set_allowed_paths receives the FULL
+# replacement list (mirrors how disabled_packages_keys sends the whole set each
+# call); the handler validates and drops any entry that hits the deny floor, or
+# that escapes the config dir without being one of the fixed HAOS sibling-volume
+# roots (#1586).
 SERVICE_GET_ALLOWED_PATHS_SCHEMA = vol.Schema(
     {
         vol.Optional(CALLER_TOKEN_FIELD): cv.string,
     }
 )
 
+# ``only_if`` (both set services): write only while the current list is one of
+# these, so a settings import's undo keeps a save made after the import.
+_ONLY_IF = vol.All(list, [vol.All(list, [cv.string])])
+
 SERVICE_SET_ALLOWED_PATHS_SCHEMA = vol.Schema(
     {
         vol.Optional("paths", default=list): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional("only_if"): _ONLY_IF,
+        vol.Optional(CALLER_TOKEN_FIELD): cv.string,
+    }
+)
+
+# get_extra_yaml_keys / set_extra_yaml_keys back the component's own options
+# flow and the ha-mcp settings UI (#1887). Both are caller-token gated, and the
+# registration is admin-only, like the allowed-paths pair. set_extra_yaml_keys
+# receives the FULL replacement list; the handler strips whitespace/empties and
+# drops any YAML_KEY_DENYLIST member, reporting drops in ``rejected``.
+SERVICE_GET_EXTRA_YAML_KEYS_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CALLER_TOKEN_FIELD): cv.string,
+    }
+)
+
+SERVICE_SET_EXTRA_YAML_KEYS_SCHEMA = vol.Schema(
+    {
+        vol.Optional("keys", default=list): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional("only_if"): _ONLY_IF,
         vol.Optional(CALLER_TOKEN_FIELD): cv.string,
     }
 )
@@ -220,19 +296,6 @@ SERVICE_READ_LEGACY_BACKUP_SCHEMA = vol.Schema(
         vol.Optional(CALLER_TOKEN_FIELD): cv.string,
     }
 )
-
-# Files that are allowed to be read (even if not in ALLOWED_READ_DIRS)
-ALLOWED_READ_FILES = [
-    "configuration.yaml",
-    "automations.yaml",
-    "scripts.yaml",
-    "scenes.yaml",
-    "secrets.yaml",
-    "home-assistant.log",
-]
-
-# Default tail lines for log files
-DEFAULT_LOG_TAIL_LINES = 1000
 
 
 async def _load_or_create_caller_token(hass: HomeAssistant) -> str:
@@ -278,9 +341,7 @@ async def _load_allowed_paths(hass: HomeAssistant) -> list[str]:
     first run or a malformed store — fail safe to "no extra access" rather than
     raising, mirroring :func:`_load_or_create_caller_token`.
     """
-    store: Store = Store(
-        hass, _ALLOWED_PATHS_STORAGE_VERSION, _ALLOWED_PATHS_STORAGE_KEY
-    )
+    store: Store = Store(hass, TOOLS_STORAGE_VERSION, ALLOWED_PATHS_KEY)
     try:
         data = await store.async_load()
     except Exception:
@@ -327,12 +388,86 @@ async def _load_allowed_paths(hass: HomeAssistant) -> list[str]:
     return normalized
 
 
-async def _save_allowed_paths(hass: HomeAssistant, paths: list[str]) -> None:
-    """Persist the user-configurable extra directories to .storage."""
-    store: Store = Store(
-        hass, _ALLOWED_PATHS_STORAGE_VERSION, _ALLOWED_PATHS_STORAGE_KEY
-    )
-    await store.async_save({"paths": paths})
+async def _load_extra_yaml_keys(hass: HomeAssistant) -> list[str]:
+    """Return the persisted user-configurable extra YAML write keys (#1887).
+
+    Fail-safe like :func:`_load_allowed_paths`: a corrupt/unreadable or
+    hand-edited store never propagates out of ``async_setup_entry``. Every entry
+    is re-validated through :func:`_normalize_extra_yaml_keys`, so a denylisted
+    or malformed key can never load into ``hass.data`` (defense in depth - the
+    deny floor is also re-checked at enforcement). Empty list on first run or a
+    malformed store.
+    """
+    store: Store = Store(hass, TOOLS_STORAGE_VERSION, EXTRA_YAML_KEYS_KEY)
+    try:
+        data = await store.async_load()
+    except Exception:
+        _LOGGER.warning(
+            "ha_mcp_tools: could not load the extra-YAML-keys store; ignoring "
+            "it and granting no extra write keys.",
+            exc_info=True,
+        )
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("keys")
+    if raw is not None and not isinstance(raw, list):
+        _LOGGER.warning(
+            "ha_mcp_tools extra-YAML-keys store is malformed (keys is %s, "
+            "expected list); ignoring it.",
+            type(raw).__name__,
+        )
+        return []
+    kept, dropped = _normalize_extra_yaml_keys(raw)
+    if dropped:
+        _LOGGER.warning(
+            "ha_mcp_tools: dropped %d invalid entr%s from the persisted "
+            "extra-YAML-keys store: %r",
+            len(dropped),
+            "y" if len(dropped) == 1 else "ies",
+            dropped,
+        )
+    return kept
+
+
+async def _apply_allowed_paths(
+    hass: HomeAssistant, raw_paths: Any, only_if: list[list[str]] | None = None
+) -> tuple[list[str], list[Any]] | None:
+    """Shared by the ``set_allowed_paths`` service and the tools-entry options flow.
+
+    Returns None, without writing, when the current list is not in ``only_if``.
+    """
+    async with store_writes(hass, ALLOWED_PATHS_KEY).writing():
+        if only_if is not None and _current_extra_dirs(hass) not in only_if:
+            return None
+        return await _apply_allowed_paths_locked(hass, raw_paths)
+
+
+async def _apply_allowed_paths_locked(
+    hass: HomeAssistant, raw_paths: Any
+) -> tuple[list[str], list[Any]]:
+    """Normalize, persist, and hot-swap the extra directories (#1567, #1887).
+
+    The caller holds ``store_writes(hass, ALLOWED_PATHS_KEY).lock`` and owns the
+    revision bump. Each entry runs through
+    :func:`_normalize_extra_dir`; traversal / out-of-config / deny-floor entries
+    are dropped into ``rejected``. Persists to .storage and updates hass.data so
+    enforcement applies live. Returns ``(kept, rejected)``.
+    """
+    config_dir = Path(hass.config.config_dir)
+    normalized: list[str] = []
+    rejected: list[Any] = []
+    for entry in raw_paths if isinstance(raw_paths, list) else []:
+        norm = (
+            _normalize_extra_dir(entry, config_dir) if isinstance(entry, str) else None
+        )
+        if norm is None:
+            rejected.append(entry)
+        elif norm not in normalized:
+            normalized.append(norm)
+    await save_allowed_paths(hass, normalized)
+    hass.data.setdefault(DOMAIN, {})[_HASS_DATA_ALLOWED_PATHS_KEY] = normalized
+    return normalized, rejected
 
 
 def _unified_diff(before: str, after: str, rel_path: str, max_lines: int = 200) -> str:
@@ -425,26 +560,6 @@ def _caller_token_ok(hass: HomeAssistant, call: ServiceCall) -> bool:
     return secrets.compare_digest(expected, presented)
 
 
-async def _caller_is_admin(hass: HomeAssistant, call: ServiceCall) -> bool:
-    """Return True if the caller is an admin user (or a no-user-context call).
-
-    HA's service registry has no built-in admin requirement — `Service`
-    has no admin flag, `async_call` performs no permission check, and
-    WS / REST `call_service` lack `@require_admin`. Gate explicitly here.
-
-    Calls without `context.user_id` (system-internal events) are treated
-    as trusted, matching HA's `async_admin_handler_factory` convention.
-    The supported deployment shapes all use admin tokens: addon's
-    SUPERVISOR_TOKEN maps to HA's `hassio_user`, which HA force-promotes
-    into `GROUP_ID_ADMIN` (hassio/__init__.py); standalone Docker/pip
-    deployments use a user-supplied admin LLAT.
-    """
-    if not call.context.user_id:
-        return True
-    user = await hass.auth.async_get_user(call.context.user_id)
-    return user is not None and bool(user.is_admin)
-
-
 def _is_within_config_dir(config_dir: Path, normalized: str) -> bool:
     """Resolve ``config_dir / normalized`` and confirm it stays within
     ``config_dir`` (symlink-aware).
@@ -456,7 +571,7 @@ def _is_within_config_dir(config_dir: Path, normalized: str) -> bool:
     try:
         resolved = (config_dir / normalized).resolve()
         config_resolved = config_dir.resolve()
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return False
     return resolved == config_resolved or resolved.is_relative_to(config_resolved)
 
@@ -493,21 +608,26 @@ def _violates_deny_floor(config_dir: Path, normalized: str) -> bool:
     try:
         resolved = (config_dir / normalized).resolve()
         rel_parts = resolved.relative_to(config_dir.resolve()).parts
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return True
     if any(seg.lower() in DENY_PATH_SEGMENTS for seg in rel_parts):
         return True
-    # secrets.yaml — by basename of BOTH the requested path AND the resolved
+    # Denied basenames — matched on BOTH the requested path AND the resolved
     # target, so a renamed symlink (``www/notes.txt`` → ``secrets.yaml``) can't
     # dodge it and then escape masking (the read handler masks only the literal
-    # ``secrets.yaml``). The canonical config-root file is the one exception,
-    # matched EXACTLY (not lowercased) because that is the only path the handler
-    # masks — a mixed-case ``SECRETS.YAML`` at the root is NOT masked, so it
-    # must be denied.
+    # ``secrets.yaml``). The canonical config-root ``secrets.yaml`` is the one
+    # exception, matched EXACTLY (not lowercased) because that is the only path
+    # the handler masks — a mixed-case ``SECRETS.YAML`` at the root is NOT
+    # masked, so it must be denied. The exception also requires the resolved
+    # target to still be a ``secrets.yaml``, so the one permitted path cannot
+    # be pointed at another denied file. No other denied basename has an
+    # exception: ``approval_pin.json`` is out of reach wherever it appears.
+    if normalized == SECRET_YAML and resolved.name.lower() == SECRET_YAML:
+        return False
     return (
         os.path.basename(normalized).lower() in DENY_READ_BASENAMES
         or resolved.name.lower() in DENY_READ_BASENAMES
-    ) and normalized != "secrets.yaml"
+    )
 
 
 def _volume_root_for(abs_path: str) -> str | None:
@@ -515,7 +635,7 @@ def _volume_root_for(abs_path: str) -> str | None:
     ``abs_path`` falls within, or ``None`` (issue #1586).
 
     Boundary-aware on a path-separator: ``/share`` and ``/share/x`` match
-    ``/share``; ``/shared`` and ``/backups`` do NOT (a string-prefix match would
+    ``/share``; ``/shared`` and ``/medias`` do NOT (a string-prefix match would
     wrongly admit them). ``abs_path`` must already be ``posixpath.normpath``'d —
     the volume roots are inherently POSIX and the component only runs on HA Core
     (Linux), so we never use the host ``os.sep`` here.
@@ -543,7 +663,7 @@ def _resolves_within(base: Path, raw_path: str) -> bool:
         candidate = Path(raw_path) if raw_path.startswith("/") else base / raw_path
         real = candidate.resolve()
         base_real = base.resolve()
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return False
     return real == base_real or real.is_relative_to(base_real)
 
@@ -553,11 +673,11 @@ def _violates_volume_deny_floor(abs_path: str) -> bool:
     (issue #1586).
 
     The same floor as the config dir — a ``.storage`` segment anywhere, or a
-    ``secrets.yaml`` basename — applied to both the requested path and its
-    symlink-resolved target, case-insensitively. Unlike the config dir there is
-    NO canonical ``secrets.yaml`` exception: volume reads are never masked, so a
-    ``secrets.yaml`` on any volume is always denied. Fails closed on any
-    resolution error.
+    denied basename (``const.DENY_READ_BASENAMES``) — applied to both the
+    requested path and its symlink-resolved target, case-insensitively. Unlike
+    the config dir there is NO canonical ``secrets.yaml`` exception: volume
+    reads are never masked, so a ``secrets.yaml`` on any volume is always
+    denied. Fails closed on any resolution error.
     """
     req = PurePosixPath(abs_path)
     if any(seg.lower() in DENY_PATH_SEGMENTS for seg in req.parts):
@@ -566,7 +686,7 @@ def _violates_volume_deny_floor(abs_path: str) -> bool:
         return True
     try:
         resolved = Path(abs_path).resolve()
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return True
     if any(seg.lower() in DENY_PATH_SEGMENTS for seg in resolved.parts):
         return True
@@ -579,8 +699,7 @@ def _normalize_volume_dir(entry: str) -> str | None:
     Returns the cleaned absolute path, or ``None`` if it is not at/under a known
     volume root or hits the deny floor. POSIX-normalized regardless of host OS
     (the roots are inherently POSIX and the component only runs on HA Core).
-    Existence is NOT required (mirrors config-relative extra dirs); an unmounted
-    volume just yields ``not found`` at use time.
+    Existence is NOT required; _write_file_sync checks the mount (issue #2875).
     """
     normalized = posixpath.normpath(entry)
     root = _volume_root_for(normalized)
@@ -720,7 +839,7 @@ def _follow_include(loader: yaml.Loader, node: yaml.nodes.Node) -> Any:
                 return sub.get_single_data()
             finally:
                 sub.dispose()
-    except (OSError, yaml.YAMLError):
+    except OSError, yaml.YAMLError:
         return None
 
 
@@ -781,7 +900,7 @@ def _load_package_dir_markers_tracked(config_path: str) -> tuple[set[str], list[
                 data = loader.get_single_data()
             finally:
                 loader.dispose()
-    except (OSError, yaml.YAMLError):
+    except OSError, yaml.YAMLError:
         return set(), opened
     return _extract_package_dir_markers(data), opened
 
@@ -1000,7 +1119,8 @@ def _is_path_allowed_for_read(
 
     Allowed:
     - Files directly in config dir: configuration.yaml, automations.yaml, etc.
-    - Files in allowed directories: www/, themes/, custom_templates/
+    - Files in allowed directories: www/, themes/, custom_templates/,
+      dashboards/, blueprints/ (blueprints is read-only — issue #1965)
     - Files matching patterns: <packages-folder>/*.yaml, custom_components/**/*.py
     - User-configured extra directories (``extra_dirs``), granted read+write
       (issue #1567)
@@ -1056,7 +1176,7 @@ def _is_path_allowed_for_read(
         return True
 
     # Check for custom_components/**/*.py pattern
-    if fnmatch.fnmatch(normalized, "custom_components/**/*.py"):
+    if fnmatch.fnmatch(normalized, CUSTOM_COMPONENTS_READ_PATTERN):
         return True
 
     # User-configured extra directories (read+write) — issue #1567. Prefix
@@ -1097,7 +1217,7 @@ def _mask_secrets_content(content: str) -> str:
         return "\n".join(f'{key}: "[MASKED]"' for key in parsed)
     except YAMLError:
         return "# secrets.yaml could not be parsed — content withheld to avoid leaking secrets"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "# secrets.yaml could not be masked — content withheld to avoid leaking secrets"
 
 
@@ -1148,6 +1268,16 @@ def _list_files_sync(
     for item in target_dir.iterdir():
         if pattern and not fnmatch.fnmatch(item.name, pattern):
             continue
+        # The deny floor gates the directory being listed, not the entries
+        # coming back from it, so a name it protects would otherwise be
+        # enumerable inside an allowed directory -- reporting its size and
+        # mtime for a file no handler will open. Matched on the entry's own
+        # name, which is what the floor denies; nothing here resolves a
+        # symlink, because a link's own name is not the protected one and
+        # reading through it is refused anyway.
+        lowered = item.name.lower()
+        if lowered in DENY_READ_BASENAMES or lowered in DENY_PATH_SEGMENTS:
+            continue
         stat = item.stat()
         # Config-relative paths report relative to the config dir; absolute
         # HAOS sibling-volume paths (issue #1586) are not under it, so report
@@ -1169,14 +1299,21 @@ def _list_files_sync(
     return {"files": files}
 
 
-def _read_file_sync(target_file: Path) -> dict[str, Any]:
-    """Bundle read_file blocking I/O for a single executor offload."""
+def _read_file_sync(
+    target_file: Path, keep_line_endings: bool = False
+) -> dict[str, Any]:
+    """Bundle read_file blocking I/O for a single executor offload.
+
+    ``keep_line_endings`` returns CRLF as stored (auto-backup); otherwise LF.
+    """
     if not target_file.exists():
         return {"_error": "not_found"}
     if not target_file.is_file():
         return {"_error": "not_a_file"}
     stat = target_file.stat()
-    content = target_file.read_text()
+    content = target_file.read_text(
+        encoding="utf-8", newline="" if keep_line_endings else None
+    )
     return {"content": content, "size": stat.st_size, "mtime": stat.st_mtime}
 
 
@@ -1188,6 +1325,10 @@ def _write_file_sync(
     config_dir: Path,
 ) -> dict[str, Any]:
     """Bundle write_file blocking I/O for a single executor offload."""
+    # Never write into an unmounted volume (volume_mounts.py, #2875).
+    root = _volume_root_for(posixpath.normpath(str(target_file)))
+    if root is not None and not on_mounted_volume(target_file, root):
+        return {"_error": "not_mounted", "parent": root}
     exists = target_file.exists()
     if exists and not overwrite:
         return {"_error": "exists_no_overwrite"}
@@ -1195,44 +1336,15 @@ def _write_file_sync(
         target_file.parent.mkdir(parents=True, exist_ok=True)
     elif not target_file.parent.exists():
         # Config-relative parents report relative to the config dir; an absolute
-        # HAOS sibling-volume parent (issue #1586) is not under it, so report it
-        # absolute rather than raising ValueError on relative_to.
+        # volume parent (issue #1586) is not under it, so report it absolute.
         try:
             parent = str(target_file.parent.relative_to(config_dir))
         except ValueError:
             parent = str(target_file.parent)
-        return {
-            "_error": "no_parent",
-            "parent": parent,
-        }
-    target_file.write_text(content)
+        return {"_error": "no_parent", "parent": parent}
+    target_file.write_bytes(content.encode("utf-8"))  # line endings as sent
     stat = target_file.stat()
     return {"size": stat.st_size, "mtime": stat.st_mtime, "is_new": not exists}
-
-
-def _delete_file_sync(target_file: Path) -> dict[str, Any]:
-    """Bundle delete_file blocking I/O for a single executor offload."""
-    if not target_file.exists():
-        return {"_error": "not_found"}
-    if not target_file.is_file():
-        return {"_error": "not_a_file"}
-    stat = target_file.stat()
-    target_file.unlink()
-    return {"size": stat.st_size}
-
-
-def _replace_file_sync(target_file: Path, content: str) -> dict[str, Any]:
-    """Bundle whole-file replace I/O for a single executor offload.
-
-    mkdir parent + atomic temp-write + rename + stat, mirroring
-    ``_write_file_sync``. Used by edit_yaml_config(action="replace_file").
-    """
-    target_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp_file = target_file.with_suffix(".tmp")
-    tmp_file.write_text(content)
-    os.replace(str(tmp_file), str(target_file))
-    stat = target_file.stat()
-    return {"size": stat.st_size, "mtime": stat.st_mtime}
 
 
 # Pre-#1579 YAML backups live here (config-root dotdir, never under www/ —
@@ -1338,7 +1450,7 @@ async def _run_config_check(hass: HomeAssistant, rel_path: str) -> dict[str, Any
     """
     try:
         errors = await async_check_ha_config_file(hass)
-    except Exception as check_err:
+    except Exception as check_err:  # noqa: BLE001
         _LOGGER.warning(
             "Config check unavailable after editing %s: %s", rel_path, check_err
         )
@@ -1706,8 +1818,7 @@ def _apply_lovelace_dashboard_action(
                     f"Dashboard '{url_path}' not found under lovelace.dashboards."
                 ),
             }
-        del dashboards[url_path]
-        # Clean up empty parent containers to keep the file tidy
+        drop_key(dashboards, url_path)
         if not dashboards:
             del lovelace["dashboards"]
         if not lovelace:
@@ -1770,7 +1881,7 @@ def _apply_single_key_edit(
                 "success": False,
                 "error": f"{label} '{yaml_key}' not found in '{rel_path}'.",
             }
-        del data[yaml_key]
+        drop_key(data, yaml_key)
     return None
 
 
@@ -1897,39 +2008,17 @@ def _maybe_build_confirm_preview(
 async def _resolve_post_action(
     hass: HomeAssistant, kind: str, path_parts: tuple[str, ...]
 ) -> dict[str, Any]:
-    """Return the post-edit activation info (restart/reload) for the edit kind."""
-    # Surface the post-edit action required to activate the change
-    post_info: dict[str, Any]
-    if kind == "lovelace_dashboard":
-        post_info = {"post_action": "restart_required"}
-    elif kind == "theme":
-        # Trigger frontend.reload_themes to load the theme change
-        try:
-            await hass.services.async_call(
-                "frontend",
-                "reload_themes",
-                {},
-                blocking=True,
-            )
-            post_info = {
-                "post_action": "reload_performed",
-                "reload_service": "frontend.reload_themes",
-            }
-        except Exception as reload_err:
-            post_info = {
-                "post_action": "reload_available",
-                "reload_service": "frontend.reload_themes",
-                "reload_error": str(reload_err),
-            }
-            _LOGGER.warning(
-                "frontend.reload_themes failed after theme edit: %s",
-                reload_err,
-            )
-    else:
-        post_info = YAML_KEY_POST_ACTIONS.get(
-            path_parts[0], YAML_KEY_DEFAULT_POST_ACTION
-        )
-    return post_info
+    """What makes the edit live: a reload Core has for the key, or a restart."""
+    if kind == "theme":
+        return await reload_after_edit(hass, "frontend", "reload_themes")
+    # Core registers ``<domain>.reload`` while the key's integration is loaded.
+    # It registers a YAML dashboard at start-up only, whatever lovelace reloads.
+    if kind != "lovelace_dashboard" and hass.services.has_service(
+        path_parts[0], SERVICE_RELOAD
+    ):
+        reload_service = f"{path_parts[0]}.{SERVICE_RELOAD}"
+        return {"post_action": "reload_available", "reload_service": reload_service}
+    return {"post_action": "restart_required"}
 
 
 async def _apply_yaml_key_edit(
@@ -1997,13 +2086,7 @@ async def _apply_yaml_key_edit(
             lambda: target_file.parent.mkdir(parents=True, exist_ok=True)
         )
 
-        # Atomic write: write to temp file, then rename into place
-        def _atomic_write() -> None:
-            tmp_file = target_file.with_suffix(".tmp")
-            tmp_file.write_text(new_content)
-            os.replace(str(tmp_file), str(target_file))
-
-        await hass.async_add_executor_job(_atomic_write)
+        await hass.async_add_executor_job(write_text_atomic, target_file, new_content)
 
         stat = await hass.async_add_executor_job(target_file.stat)
         modified_dt = datetime.fromtimestamp(stat.st_mtime)
@@ -2049,7 +2132,7 @@ async def _apply_yaml_key_edit(
 
 def _build_edit_yaml_config_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[dict[str, Any]]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, dict[str, Any]]]:
     """Build and return the async handle_edit_yaml_config handler.
 
     Extracted to module level so it can be tested without registering
@@ -2084,8 +2167,11 @@ def _build_edit_yaml_config_handler(
         # validation, the atomic temp-write+rename, and the post-write config
         # check. No new files become writable; yaml_path is ignored here.
         if action == "replace_file":
-            return await _apply_replace_file(
-                hass, config_dir, rel_path, normalized, action, yaml_path, content
+            return await run_locked(
+                hass,
+                lambda: _apply_replace_file(
+                    hass, config_dir, rel_path, normalized, action, yaml_path, content
+                ),
             )
 
         gate_err = _check_packages_key_gate(call, yaml_path, is_package)
@@ -2094,7 +2180,10 @@ def _build_edit_yaml_config_handler(
 
         # Parse and validate yaml_path (replaces the old ALLOWED_YAML_KEYS check)
         kind, path_parts, path_err = _parse_and_validate_yaml_path(
-            yaml_path, is_package=is_package, is_theme=is_theme
+            yaml_path,
+            is_package=is_package,
+            is_theme=is_theme,
+            extra_allowed_keys=_effective_extra_allowed_keys(hass, call),
         )
         if path_err is not None:
             return {"success": False, "error": path_err}
@@ -2105,17 +2194,21 @@ def _build_edit_yaml_config_handler(
         if content_err is not None:
             return content_err
 
-        return await _apply_yaml_key_edit(
+        # Shared with edit_file, which can write the same theme file.
+        return await run_locked(
             hass,
-            config_dir,
-            call,
-            rel_path,
-            normalized,
-            action,
-            yaml_path,
-            kind,
-            path_parts,
-            parsed_content,
+            lambda: _apply_yaml_key_edit(
+                hass,
+                config_dir,
+                call,
+                rel_path,
+                normalized,
+                action,
+                yaml_path,
+                kind,
+                path_parts,
+                parsed_content,
+            ),
         )
 
     return handle_edit_yaml_config
@@ -2217,18 +2310,59 @@ def _validate_lovelace_dashboard_path(
     return "lovelace_dashboard", parts, None
 
 
+def _caller_extra_allowed_keys(call: ServiceCall) -> frozenset[str]:
+    """Return the operator-configured extra write keys for this call (#1887).
+
+    ``YAML_KEY_DENYLIST`` members are dropped here so they can never widen the
+    ``allowed`` set that the generic "not in the allowed list" rejection lists
+    for some *other* invalid key. A direct write to a denied key does not rely
+    on this drop: ``_parse_and_validate_yaml_path`` checks the denylist first
+    and returns the categorical floor message before any allow-set is
+    consulted. Keys already covered by the built-in sets are harmless
+    duplicates and stay.
+    """
+    return frozenset(
+        key
+        for key in call.data.get("extra_allowed_keys", [])
+        if key and key not in YAML_KEY_DENYLIST
+    )
+
+
+def _effective_extra_allowed_keys(
+    hass: HomeAssistant, call: ServiceCall
+) -> frozenset[str]:
+    """Union the per-call wire keys with the component-stored keys (#1887).
+
+    The ha-mcp server passes its own ``HA_MCP_EXTRA_YAML_KEYS`` on the wire; the
+    component's own options flow / settings store contributes
+    :func:`_current_extra_yaml_keys`. Both sources are denylist-filtered - the
+    wire in :func:`_caller_extra_allowed_keys`, the store on save/load - and
+    :func:`_parse_and_validate_yaml_path` re-checks the deny floor regardless,
+    so the union can never lift a forbidden key. The store side is filtered
+    again here purely as defense in depth.
+    """
+    stored = frozenset(
+        key for key in _current_extra_yaml_keys(hass) if key not in YAML_KEY_DENYLIST
+    )
+    return _caller_extra_allowed_keys(call) | stored
+
+
 def _parse_and_validate_yaml_path(
     yaml_path: str,
     *,
     is_package: bool = False,
     is_theme: bool = False,
+    extra_allowed_keys: frozenset[str] = frozenset(),
 ) -> tuple[str, tuple[str, ...], str | None]:
     """Parse and validate a yaml_path argument.
 
     Three accepted shapes:
     1. Single segment in ALLOWED_YAML_KEYS -> kind='single'
        When ``is_package=True``, single segments in PACKAGES_ONLY_YAML_KEYS
-       (automation, script, scene) are also accepted.
+       (automation, script, scene) are also accepted. ``extra_allowed_keys``
+       adds operator-opted-in keys on top of ALLOWED_YAML_KEYS (#1887); it
+       overrides neither ``YAML_KEY_DENYLIST`` (filtered out before it gets
+       here) nor the packages-only restriction.
     2. Exactly 'lovelace.dashboards.<url_path>' -> kind='lovelace_dashboard'
     3. Single segment theme name (no dots) when ``is_theme=True`` -> kind='theme'
 
@@ -2255,13 +2389,41 @@ def _parse_and_validate_yaml_path(
     # Shape 1: single key
     if len(parts) == 1:
         key = parts[0]
+        # The deny floor is checked before every single-key accept branch, so
+        # it holds even if a denied key is ever added to one of the allow
+        # sets. It deliberately does not cover the theme branch above: under
+        # ``is_theme`` the segment names a file in themes/, not a top-level
+        # configuration key, so the same word carries no trust-boundary
+        # meaning there.
+        if key in YAML_KEY_DENYLIST:
+            return (
+                "",
+                (),
+                (
+                    f"Key '{yaml_path}' can never be edited through this "
+                    "service: it redefines Home Assistant's own trust "
+                    "boundary (authentication, proxy/CORS handling, or "
+                    "frontend module loading). This floor cannot be lifted "
+                    "by the extra-write-keys setting. Edit it by hand if "
+                    "you really need to change it."
+                ),
+            )
         if key in ALLOWED_YAML_KEYS:
             return "single", parts, None
         if is_package and key in PACKAGES_ONLY_YAML_KEYS:
             return "single", parts, None
+        # Operator extra keys widen ALLOWED_YAML_KEYS only. They deliberately
+        # do NOT lift the packages-only restriction: those keys reach
+        # packages/*.yaml through the branch above (still governed by their
+        # per-key toggle) and stay rejected in configuration.yaml, so the
+        # storage-mode/YAML-mode collision guarantee holds however the
+        # operator fills the setting.
+        if key in extra_allowed_keys and key not in PACKAGES_ONLY_YAML_KEYS:
+            return "single", parts, None
         # Reaching here means the key was not accepted. If it is a
-        # PACKAGES_ONLY key, we know is_package=False (otherwise the
-        # preceding branch would have returned) — emit the targeted
+        # PACKAGES_ONLY key, we know is_package=False (the packages branch
+        # would have returned, and the extra-keys branch excludes them
+        # precisely so this guidance still fires) – emit the targeted
         # "move it to a package file" guidance instead of the generic
         # allowlist dump below.
         if key in PACKAGES_ONLY_YAML_KEYS:
@@ -2277,9 +2439,9 @@ def _parse_and_validate_yaml_path(
                 ),
             )
         allowed = (
-            ALLOWED_YAML_KEYS | PACKAGES_ONLY_YAML_KEYS
+            ALLOWED_YAML_KEYS | PACKAGES_ONLY_YAML_KEYS | extra_allowed_keys
             if is_package
-            else ALLOWED_YAML_KEYS
+            else ALLOWED_YAML_KEYS | extra_allowed_keys
         )
         return (
             "",
@@ -2367,21 +2529,10 @@ def _migrate_legacy_backup_dir(config_dir: Path) -> tuple[int, int]:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a config entry, dispatching on its entry type.
 
-    The integration serves two entry types under one domain: the ``tools``
-    services entry (the original component) and the in-process ``server`` entry
-    (issue #1527). A missing ``entry_type`` means ``tools`` so pre-existing
-    entries keep working across the component update with no migration.
+    Two entry types share the domain: ``tools`` (the original services entry)
+    and the in-process ``server`` (#1527); a missing ``entry_type`` means
+    ``tools``, so entries from before the server entry need no migration.
     """
-    # Lazy import (matches the embedded chain's own convention in
-    # embedded_entry.py): keeps homeassistant.const's import surface out of
-    # every hermetic unit test that merely imports this package, not just the
-    # ones that actually call async_setup_entry.
-    from .install_source_check import async_schedule_install_source_check
-
-    # Runs for BOTH entry types: HACS delivers the component as a whole, not
-    # just the server entry, so a legacy-repo install needs detecting either way.
-    async_schedule_install_source_check(hass)
-
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_SERVER:
         from .embedded_entry import async_setup_server_entry
 
@@ -2401,8 +2552,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle config-entry removal, dispatching on its entry type.
 
-    The server entry revokes the credentials it provisioned; the tools entry has
-    nothing to clean up beyond what unload already did.
+    The server entry releases the credentials an older release provisioned; the
+    tools entry has nothing to clean up beyond what unload already did.
     """
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_SERVER:
         from .embedded_entry import async_remove_server_entry
@@ -2420,9 +2571,21 @@ def _current_extra_dirs(hass: HomeAssistant) -> list[str]:
     return []
 
 
+def _write_denied(hass: HomeAssistant, rel_path: str) -> str | None:
+    """Return why ``rel_path`` may not be written, or None when it may."""
+    extra_dirs = _current_extra_dirs(hass)
+    config_dir = Path(hass.config.config_dir)
+    if _is_path_allowed_for_dir(config_dir, rel_path, ALLOWED_WRITE_DIRS, extra_dirs):
+        return None
+    _LOGGER.warning("Attempted to write to disallowed path: %s", rel_path)
+    return (
+        f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS + extra_dirs)}"
+    )
+
+
 def _build_list_files_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, ServiceResponse]]:
     """Build the handle_list_files service handler."""
     config_dir = Path(hass.config.config_dir)
 
@@ -2509,8 +2672,8 @@ async def _shape_read_file_response(
 ) -> dict[str, Any]:
     """Shape a successful _read_file_sync result into the read_file response.
 
-    Applies secrets masking, log tailing, optional tail, and yaml_path
-    subtree extraction.
+    Applies secrets masking, log tailing (with a hint to ha_get_logs on
+    Core's log), optional tail, and yaml_path subtree extraction.
     """
     modified_dt = datetime.fromtimestamp(result["mtime"])
     content = result["content"]
@@ -2519,30 +2682,32 @@ async def _shape_read_file_response(
     # Apply special handling for specific files
     normalized = os.path.normpath(rel_path)  # noqa: ASYNC240
 
-    # Mask secrets.yaml
-    if normalized == "secrets.yaml":
-        content = _mask_secrets_content(content)
+    # Mask secrets.yaml. Offloaded because the first make_yaml() call on a
+    # thread constructs a ruamel YAML instance, whose plugin discovery globs
+    # the site-packages tree — blocking work that must stay off the loop.
+    if normalized == SECRET_YAML:
+        content = await hass.async_add_executor_job(_mask_secrets_content, content)
 
-    # Apply tail for log files
-    if normalized == "home-assistant.log":
-        lines = content.split("\n")
+    # Log files arrive already tailed by ``read_log_tail_sync``.
+    if normalized in TAILED_LOG_FILES:
         limit = tail_lines if tail_lines else DEFAULT_LOG_TAIL_LINES
-        if len(lines) > limit:
-            content = "\n".join(lines[-limit:])
-            truncated = True
-        else:
-            truncated = False
-
-        return {
+        total_lines = result["total_lines"]
+        log_response: dict[str, Any] = {
             "success": True,
             "path": rel_path,
             "content": content,
             "size": stat_size,
             "modified": modified_dt.isoformat(),
-            "lines_returned": min(len(lines), limit),
-            "total_lines": len(lines),
-            "truncated": truncated,
+            "lines_returned": min(total_lines, limit),
+            "total_lines": total_lines,
+            "truncated": result["truncated"],
         }
+        if normalized == ERROR_LOG_FILENAME:
+            log_response["hint"] = (
+                "ha_get_logs(source='error_log') is the tool built for "
+                "Home Assistant's log."
+            )
+        return log_response
 
     # Apply tail for other files if requested
     full_content = content
@@ -2570,9 +2735,44 @@ async def _shape_read_file_response(
     return response
 
 
+async def _resolve_read(
+    hass: HomeAssistant, config_dir: Path, rel_path: str
+) -> dict[str, Any] | tuple[Path, str]:
+    """The file a read_file of ``rel_path`` opens and what a not-found answer
+    adds, or the error when it may not or cannot be opened.
+
+    Package files may live under a non-default folder (issue #1854), so resolve
+    the configured folder(s) — the same way the YAML editor does — and honour
+    them here too, otherwise the pre-write backup snapshot (a read of the
+    target) blocks edits to those files.
+    """
+    extra_dirs = _current_extra_dirs(hass)
+    package_dirs = await _detect_package_dirs(hass)
+    name = os.path.normpath(rel_path)  # noqa: ASYNC240
+    if read_allowlist_applies(hass, name) and not _is_path_allowed_for_read(
+        config_dir, rel_path, extra_dirs, package_dirs
+    ):
+        _LOGGER.warning("Attempted to read disallowed path: %s", rel_path)
+        allowed_patterns = (
+            ALLOWED_READ_FILES
+            + [f"{d}/**" for d in ALLOWED_READ_DIRS]
+            + [f"{d}/*.yaml" for d in sorted(package_dirs)]
+            + [CUSTOM_COMPONENTS_READ_PATTERN]
+            + [f"{d}/**" for d in extra_dirs]
+        )
+        return file_read_error(
+            "path_not_allowed",
+            f"Path not allowed. Allowed paths: {', '.join(allowed_patterns)}",
+        )
+    target_file, why = read_target(hass, config_dir, rel_path)
+    if target_file is None:
+        return file_read_error("not_found", f"File does not exist: {rel_path}{why}")
+    return target_file, why
+
+
 def _build_read_file_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, ServiceResponse]]:
     """Build the handle_read_file service handler."""
     config_dir = Path(hass.config.config_dir)
 
@@ -2585,62 +2785,46 @@ def _build_read_file_handler(
         yaml_path = call.data.get("yaml_path")
         include_parsed = bool(call.data.get("include_parsed", False))
 
-        # Security check. Package files may live under a non-default folder
-        # (issue #1854), so resolve the configured folder(s) — the same way the
-        # YAML editor does — and honour them here too, otherwise the pre-write
-        # backup snapshot (a read of the target) blocks edits to those files.
-        extra_dirs = _current_extra_dirs(hass)
-        package_dirs = await _detect_package_dirs(hass)
-        if not _is_path_allowed_for_read(
-            config_dir, rel_path, extra_dirs, package_dirs
-        ):
-            _LOGGER.warning("Attempted to read disallowed path: %s", rel_path)
-            allowed_patterns = (
-                ALLOWED_READ_FILES
-                + [f"{d}/**" for d in ALLOWED_READ_DIRS]
-                + [f"{d}/*.yaml" for d in sorted(package_dirs)]
-                + ["custom_components/**/*.py"]
-                + [f"{d}/**" for d in extra_dirs]
-            )
-            return {
-                "success": False,
-                "error": f"Path not allowed. Allowed patterns: {', '.join(allowed_patterns)}",
-            }
-
-        target_file = config_dir / rel_path
+        target = await _resolve_read(hass, config_dir, rel_path)
+        if isinstance(target, dict):
+            return target
+        target_file, why = target
 
         try:
-            result = await hass.async_add_executor_job(_read_file_sync, target_file)
+            if os.path.normpath(rel_path) in TAILED_LOG_FILES:  # noqa: ASYNC240
+                # Bounded read: the logs are append-only, the fault log for the
+                # life of the install, so never materialise a whole file.
+                result = await hass.async_add_executor_job(
+                    read_log_tail_sync,
+                    target_file,
+                    tail_lines if tail_lines else DEFAULT_LOG_TAIL_LINES,
+                )
+            else:
+                result = await hass.async_add_executor_job(
+                    _read_file_sync,
+                    target_file,
+                    call.data.get("keep_line_endings", False),
+                )
         except PermissionError:
             _LOGGER.error("Permission denied reading: %s", rel_path)
-            return {
-                "success": False,
-                "error": f"Permission denied: {rel_path}",
-            }
+            return file_read_error(
+                "permission_denied", f"Permission denied: {rel_path}"
+            )
         except UnicodeDecodeError:
             _LOGGER.error("Cannot read binary file: %s", rel_path)
-            return {
-                "success": False,
-                "error": f"Cannot read binary file: {rel_path}. Only text files are supported.",
-            }
+            return file_read_error(
+                "binary_file",
+                f"Cannot read binary file: {rel_path}. Only text files are supported.",
+            )
         except OSError as err:
             _LOGGER.error("Error reading file %s: %s", rel_path, err)
-            return {
-                "success": False,
-                "error": str(err),
-            }
+            return file_read_error("read_failed", str(err))
 
         err_kind = result.get("_error")
         if err_kind == "not_found":
-            return {
-                "success": False,
-                "error": f"File does not exist: {rel_path}",
-            }
+            return file_read_error(err_kind, f"File does not exist: {rel_path}{why}")
         if err_kind == "not_a_file":
-            return {
-                "success": False,
-                "error": f"Path is not a file: {rel_path}",
-            }
+            return file_read_error(err_kind, f"Path is not a file: {rel_path}")
 
         return await _shape_read_file_response(
             hass,
@@ -2656,7 +2840,7 @@ def _build_read_file_handler(
 
 def _build_write_file_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, ServiceResponse]]:
     """Build the handle_write_file service handler."""
     config_dir = Path(hass.config.config_dir)
 
@@ -2669,21 +2853,15 @@ def _build_write_file_handler(
         overwrite = call.data.get("overwrite", False)
         create_dirs = call.data.get("create_dirs", True)
 
-        # Security check - only allow writes to specific directories
-        extra_dirs = _current_extra_dirs(hass)
-        if not _is_path_allowed_for_dir(
-            config_dir, rel_path, ALLOWED_WRITE_DIRS, extra_dirs
-        ):
-            _LOGGER.warning("Attempted to write to disallowed path: %s", rel_path)
-            return {
-                "success": False,
-                "error": f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS + extra_dirs)}",
-            }
+        denied = _write_denied(hass, rel_path)
+        if denied is not None:
+            return {"success": False, "error": denied}
 
         target_file = config_dir / rel_path
 
         try:
-            result = await hass.async_add_executor_job(
+            result = await run_file_job(
+                hass,
                 _write_file_sync,
                 target_file,
                 content,
@@ -2701,7 +2879,7 @@ def _build_write_file_handler(
             _LOGGER.error("Error writing file %s: %s", rel_path, err)
             return {
                 "success": False,
-                "error": str(err),
+                "error": os_error_text(err, rel_path),
             }
 
         err_kind = result.get("_error")
@@ -2710,10 +2888,10 @@ def _build_write_file_handler(
                 "success": False,
                 "error": f"File already exists: {rel_path}. Set overwrite=true to replace.",
             }
-        if err_kind == "no_parent":
+        if err_kind in PARENT_ERRORS:
             return {
                 "success": False,
-                "error": f"Parent directory does not exist: {result['parent']}",
+                "error": PARENT_ERRORS[err_kind].format(result["parent"]),
             }
 
         size = result["size"]
@@ -2729,6 +2907,7 @@ def _build_write_file_handler(
             "modified": modified_dt.isoformat(),
             "created": is_new,
             "message": f"File {'created' if is_new else 'updated'} successfully",
+            **(await after_file_write(hass, rel_path, size)),
         }
 
     return handle_write_file
@@ -2736,7 +2915,7 @@ def _build_write_file_handler(
 
 def _build_delete_file_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, ServiceResponse]]:
     """Build the handle_delete_file service handler."""
     config_dir = Path(hass.config.config_dir)
 
@@ -2760,7 +2939,7 @@ def _build_delete_file_handler(
         target_file = config_dir / rel_path
 
         try:
-            result = await hass.async_add_executor_job(_delete_file_sync, target_file)
+            result = await run_file_job(hass, _delete_file_sync, target_file)
         except PermissionError:
             _LOGGER.error("Permission denied deleting: %s", rel_path)
             return {
@@ -2771,7 +2950,7 @@ def _build_delete_file_handler(
             _LOGGER.error("Error deleting file %s: %s", rel_path, err)
             return {
                 "success": False,
-                "error": str(err),
+                "error": os_error_text(err, rel_path),
             }
 
         err_kind = result.get("_error")
@@ -2801,24 +2980,17 @@ def _build_delete_file_handler(
 
 def _build_get_caller_token_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, ServiceResponse]]:
     """Build the handle_get_caller_token service handler."""
 
     async def handle_get_caller_token(call: ServiceCall) -> ServiceResponse:
         """Return the caller-auth token to the ha-mcp bootstrap caller.
 
-        Admin-gated explicitly (see `_caller_is_admin`): HA's service
-        registry has no built-in admin requirement, so the gate prevents
-        a non-admin caller from bootstrapping the token. The supported
-        deployments (addon supervisor user, standalone admin LLAT) all
-        pass this gate.
+        Registered admin-only like every service in this domain (see
+        `_async_setup_tools_entry`), so a non-admin caller cannot bootstrap
+        the token. The supported deployments (addon supervisor user,
+        standalone admin LLAT) all pass this gate.
         """
-        if not await _caller_is_admin(hass, call):
-            return {
-                "success": False,
-                "error_code": "unauthorized",
-                "error": "ha_mcp_tools.get_caller_token requires admin auth.",
-            }
         domain_data = hass.data.get(DOMAIN)
         token = (
             domain_data.get(_HASS_DATA_TOKEN_KEY)
@@ -2844,8 +3016,12 @@ def _build_get_caller_token_handler(
         # uses everywhere else.
         try:
             integration = await async_get_integration(hass, DOMAIN)
+            if integration.version is None:
+                # Reads as None rather than raising; an unreadable version and
+                # an absent one deserve the same answer.
+                raise ValueError("the manifest carries no version")
             version = str(integration.version)
-        except Exception as exc:  # pragma: no cover — manifest sanity
+        except Exception as exc:  # noqa: BLE001
             _LOGGER.warning(
                 "Could not read ha_mcp_tools manifest version for "
                 "get_caller_token response: %s",
@@ -2856,7 +3032,7 @@ def _build_get_caller_token_handler(
                 "error_code": "manifest_unreadable",
                 "error": (
                     "ha_mcp_tools manifest version could not be read. "
-                    "Reinstall the integration via HACS."
+                    "Reinstall the integration via the Marketplace."
                 ),
             }
         return {
@@ -2870,26 +3046,19 @@ def _build_get_caller_token_handler(
 
 def _build_get_allowed_paths_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, dict[str, Any]]]:
     """Build the handle_get_allowed_paths service handler."""
 
-    async def handle_get_allowed_paths(call: ServiceCall) -> ServiceResponse:
+    async def handle_get_allowed_paths(call: ServiceCall) -> dict[str, Any]:
         """Return the user-configurable extra directories plus the built-in
         allowlists and the non-overridable deny floor (issue #1567).
 
         Backs the ha-mcp settings UI's custom filesystem-directory editor.
-        Caller-token + admin gated (matching get_caller_token): it reveals the
-        filesystem layout, so it is not a public read.
+        Caller-token gated on top of the admin-only registration: it reveals
+        the filesystem layout, so it is not a public read.
         """
         if not _caller_token_ok(hass, call):
             return _unauthorized_response(SERVICE_GET_ALLOWED_PATHS, paths=[])
-        if not await _caller_is_admin(hass, call):
-            return {
-                "success": False,
-                "error_code": "unauthorized",
-                "error": "ha_mcp_tools.get_allowed_paths requires admin auth.",
-                "paths": [],
-            }
         return {
             "success": True,
             "paths": _current_extra_dirs(hass),
@@ -2903,11 +3072,10 @@ def _build_get_allowed_paths_handler(
 
 def _build_set_allowed_paths_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, dict[str, Any]]]:
     """Build the handle_set_allowed_paths service handler."""
-    config_dir = Path(hass.config.config_dir)
 
-    async def handle_set_allowed_paths(call: ServiceCall) -> ServiceResponse:
+    async def handle_set_allowed_paths(call: ServiceCall) -> dict[str, Any]:
         """Replace the user-configurable extra directories (issues #1567, #1586).
 
         Receives the FULL replacement list. Each entry is validated and
@@ -2917,29 +3085,16 @@ def _build_set_allowed_paths_handler(
         sibling-volume roots (#1586 — see ``const.ALLOWED_VOLUME_ROOTS``) are
         accepted; any other absolute path is dropped. Persists to .storage AND
         updates hass.data so enforcement applies live with no HA restart.
-        Caller-token + admin gated.
+        Caller-token gated; the registration is admin-only.
         """
         if not _caller_token_ok(hass, call):
             return _unauthorized_response(SERVICE_SET_ALLOWED_PATHS, paths=[])
-        if not await _caller_is_admin(hass, call):
-            return {
-                "success": False,
-                "error_code": "unauthorized",
-                "error": "ha_mcp_tools.set_allowed_paths requires admin auth.",
-                "paths": [],
-            }
-        raw_paths = call.data.get("paths", [])
-        normalized: list[str] = []
-        rejected: list[str] = []
-        for entry in raw_paths:
-            norm = _normalize_extra_dir(entry, config_dir)
-            if norm is None:
-                rejected.append(entry)
-            elif norm not in normalized:
-                normalized.append(norm)
-
-        await _save_allowed_paths(hass, normalized)
-        hass.data.setdefault(DOMAIN, {})[_HASS_DATA_ALLOWED_PATHS_KEY] = normalized
+        applied = await _apply_allowed_paths(
+            hass, call.data.get("paths", []), call.data.get("only_if")
+        )
+        if applied is None:
+            return {"success": True, "kept": True, "paths": _current_extra_dirs(hass)}
+        normalized, rejected = applied
         _LOGGER.info(
             "Updated ha_mcp_tools custom filesystem directories: %s (%d rejected)",
             normalized,
@@ -2954,14 +3109,79 @@ def _build_set_allowed_paths_handler(
     return handle_set_allowed_paths
 
 
+def _build_get_extra_yaml_keys_handler(
+    hass: HomeAssistant,
+) -> Callable[[ServiceCall], Coroutine[Any, Any, dict[str, Any]]]:
+    """Build the handle_get_extra_yaml_keys service handler (#1887)."""
+
+    async def handle_get_extra_yaml_keys(call: ServiceCall) -> dict[str, Any]:
+        """Return the component-configured extra YAML write keys plus the
+        non-overridable deny floor.
+
+        Backs the component's own options flow and the ha-mcp settings UI, and
+        is how the server reads this store to union it with its own
+        ``HA_MCP_EXTRA_YAML_KEYS``. Caller-token gated; the registration is
+        admin-only.
+        """
+        if not _caller_token_ok(hass, call):
+            return _unauthorized_response(SERVICE_GET_EXTRA_YAML_KEYS, keys=[])
+        return {
+            "success": True,
+            "keys": _current_extra_yaml_keys(hass),
+            "deny_floor": sorted(YAML_KEY_DENYLIST),
+        }
+
+    return handle_get_extra_yaml_keys
+
+
+def _build_set_extra_yaml_keys_handler(
+    hass: HomeAssistant,
+) -> Callable[[ServiceCall], Coroutine[Any, Any, dict[str, Any]]]:
+    """Build the handle_set_extra_yaml_keys service handler (#1887)."""
+
+    async def handle_set_extra_yaml_keys(call: ServiceCall) -> dict[str, Any]:
+        """Replace the component-configured extra YAML write keys.
+
+        Receives the FULL replacement list. Each entry is stripped and
+        validated; blanks and ``YAML_KEY_DENYLIST`` members are dropped and
+        reported in ``rejected``. Persists to .storage AND updates hass.data so
+        enforcement applies live with no HA restart. Caller-token gated; the
+        registration is admin-only.
+        """
+        if not _caller_token_ok(hass, call):
+            return _unauthorized_response(SERVICE_SET_EXTRA_YAML_KEYS, keys=[])
+        applied = await _apply_extra_yaml_keys(
+            hass, call.data.get("keys", []), call.data.get("only_if")
+        )
+        if applied is None:
+            return {
+                "success": True,
+                "kept": True,
+                "keys": _current_extra_yaml_keys(hass),
+            }
+        normalized, rejected = applied
+        _LOGGER.info(
+            "Updated ha_mcp_tools extra YAML write keys: %s (%d rejected)",
+            normalized,
+            len(rejected),
+        )
+        return {
+            "success": True,
+            "keys": normalized,
+            "rejected": rejected,
+        }
+
+    return handle_set_extra_yaml_keys
+
+
 def _build_list_legacy_backups_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, dict[str, Any]]]:
     """Build the handle_list_legacy_backups service handler."""
     config_dir = Path(hass.config.config_dir)
     legacy_backup_dir = config_dir / _LEGACY_BACKUP_DIRNAME
 
-    async def handle_list_legacy_backups(call: ServiceCall) -> ServiceResponse:
+    async def handle_list_legacy_backups(call: ServiceCall) -> dict[str, Any]:
         """List pre-#1579 YAML backups in .ha_mcp_tools_backups/ (read-only)."""
         if not _caller_token_ok(hass, call):
             return _unauthorized_response(SERVICE_LIST_LEGACY_BACKUPS, backups=[])
@@ -2979,7 +3199,7 @@ def _build_list_legacy_backups_handler(
 
 def _build_read_legacy_backup_handler(
     hass: HomeAssistant,
-) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+) -> Callable[[ServiceCall], Coroutine[Any, Any, ServiceResponse]]:
     """Build the handle_read_legacy_backup service handler."""
     config_dir = Path(hass.config.config_dir)
     legacy_backup_dir = config_dir / _LEGACY_BACKUP_DIRNAME
@@ -3025,9 +3245,9 @@ def _build_read_legacy_backup_handler(
 
         err_kind = result.get("_error")
         if err_kind == "not_found":
-            return {"success": False, "error": f"Backup does not exist: {filename}"}
+            return file_read_error(err_kind, f"Backup does not exist: {filename}")
         if err_kind == "not_a_file":
-            return {"success": False, "error": f"Path is not a file: {filename}"}
+            return file_read_error(err_kind, f"Path is not a file: {filename}")
 
         modified_dt = datetime.fromtimestamp(result["mtime"])
         decoded = _decode_legacy_backup_name(filename)
@@ -3062,6 +3282,13 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
         _HASS_DATA_ALLOWED_PATHS_KEY
     ] = await _load_allowed_paths(hass)
 
+    # Load the component-configured extra YAML write keys (#1887) into hass.data
+    # so enforcement reads them with no I/O. set_extra_yaml_keys updates this in
+    # place, so changes apply live (no HA restart).
+    hass.data.setdefault(DOMAIN, {})[
+        _HASS_DATA_EXTRA_YAML_KEYS_KEY
+    ] = await _load_extra_yaml_keys(hass)
+
     # One-time migration of pre-fix YAML backups out of the publicly-served
     # www/ directory (GHSA-g39v-cvjh-8fpf). Wrapped so a migration failure
     # cannot prevent the integration from loading — the integration's
@@ -3070,7 +3297,7 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
         moved, failed = await hass.async_add_executor_job(
             _migrate_legacy_backup_dir, config_dir
         )
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001
         # Defensive: a migration failure must not block setup_entry, since
         # the integration's normal value (file ops, edit_yaml_config) is
         # unaffected by whether old backups got relocated.
@@ -3113,7 +3340,7 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
                 title="HA MCP Tools — credential exposure (GHSA-g39v-cvjh-8fpf)",
                 notification_id="ha_mcp_tools_ghsa_g39v_cvjh_8fpf",
             )
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             # Defensive: log line above is the source of truth; the
             # notification is best-effort UX and must not block setup.
             _LOGGER.warning(
@@ -3123,108 +3350,82 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
                 err,
             )
 
-    handle_list_files = _build_list_files_handler(hass)
-    handle_read_file = _build_read_file_handler(hass)
-    handle_write_file = _build_write_file_handler(hass)
-    handle_delete_file = _build_delete_file_handler(hass)
-    handle_edit_yaml_config = _build_edit_yaml_config_handler(hass)
-    handle_get_caller_token = _build_get_caller_token_handler(hass)
-    handle_get_allowed_paths = _build_get_allowed_paths_handler(hass)
-    handle_set_allowed_paths = _build_set_allowed_paths_handler(hass)
-    handle_list_legacy_backups = _build_list_legacy_backups_handler(hass)
-    handle_read_legacy_backup = _build_read_legacy_backup_handler(hass)
-
-    # Register all services with response support
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_EDIT_YAML_CONFIG,
-        handle_edit_yaml_config,
-        schema=SERVICE_EDIT_YAML_CONFIG_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
+    # Every service registered below is admin-only; calls without a user context
+    # pass Core's check.
+    register_find_yaml_key(hass, _caller_token_ok, _unauthorized_response)
+    register_edit_file(
+        hass,
+        caller_token_ok=_caller_token_ok,
+        unauthorized_response=_unauthorized_response,
+        write_denied=_write_denied,
+        volume_root_for=_volume_root_for,
     )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_LIST_FILES,
-        handle_list_files,
-        schema=SERVICE_LIST_FILES_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_READ_FILE,
-        handle_read_file,
-        schema=SERVICE_READ_FILE_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_WRITE_FILE,
-        handle_write_file,
-        schema=SERVICE_WRITE_FILE_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_DELETE_FILE,
-        handle_delete_file,
-        schema=SERVICE_DELETE_FILE_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_GET_CALLER_TOKEN,
-        handle_get_caller_token,
-        schema=SERVICE_GET_CALLER_TOKEN_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_GET_ALLOWED_PATHS,
-        handle_get_allowed_paths,
-        schema=SERVICE_GET_ALLOWED_PATHS_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_ALLOWED_PATHS,
-        handle_set_allowed_paths,
-        schema=SERVICE_SET_ALLOWED_PATHS_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_LIST_LEGACY_BACKUPS,
-        handle_list_legacy_backups,
-        schema=SERVICE_LIST_LEGACY_BACKUPS_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_READ_LEGACY_BACKUP,
-        handle_read_legacy_backup,
-        schema=SERVICE_READ_LEGACY_BACKUP_SCHEMA,
-        supports_response=SupportsResponse.ONLY,
-    )
-
+    for service, schema, build_handler in (
+        (
+            SERVICE_EDIT_YAML_CONFIG,
+            SERVICE_EDIT_YAML_CONFIG_SCHEMA,
+            _build_edit_yaml_config_handler,
+        ),
+        (SERVICE_LIST_FILES, SERVICE_LIST_FILES_SCHEMA, _build_list_files_handler),
+        (SERVICE_READ_FILE, SERVICE_READ_FILE_SCHEMA, _build_read_file_handler),
+        (SERVICE_WRITE_FILE, SERVICE_WRITE_FILE_SCHEMA, _build_write_file_handler),
+        (SERVICE_DELETE_FILE, SERVICE_DELETE_FILE_SCHEMA, _build_delete_file_handler),
+        (
+            SERVICE_GET_CALLER_TOKEN,
+            SERVICE_GET_CALLER_TOKEN_SCHEMA,
+            _build_get_caller_token_handler,
+        ),
+        (
+            SERVICE_GET_ALLOWED_PATHS,
+            SERVICE_GET_ALLOWED_PATHS_SCHEMA,
+            _build_get_allowed_paths_handler,
+        ),
+        (
+            SERVICE_SET_ALLOWED_PATHS,
+            SERVICE_SET_ALLOWED_PATHS_SCHEMA,
+            _build_set_allowed_paths_handler,
+        ),
+        (
+            SERVICE_GET_EXTRA_YAML_KEYS,
+            SERVICE_GET_EXTRA_YAML_KEYS_SCHEMA,
+            _build_get_extra_yaml_keys_handler,
+        ),
+        (
+            SERVICE_SET_EXTRA_YAML_KEYS,
+            SERVICE_SET_EXTRA_YAML_KEYS_SCHEMA,
+            _build_set_extra_yaml_keys_handler,
+        ),
+        (
+            SERVICE_LIST_LEGACY_BACKUPS,
+            SERVICE_LIST_LEGACY_BACKUPS_SCHEMA,
+            _build_list_legacy_backups_handler,
+        ),
+        (
+            SERVICE_READ_LEGACY_BACKUP,
+            SERVICE_READ_LEGACY_BACKUP_SCHEMA,
+            _build_read_legacy_backup_handler,
+        ),
+    ):
+        ha_service.async_register_admin_service(
+            hass,
+            DOMAIN,
+            service,
+            build_handler(hass),
+            schema=schema,
+            supports_response=SupportsResponse.ONLY,
+        )
     # Register the in-process ha_mcp_tools/* WebSocket commands (info + search)
     # the server calls behind a capability gate. Idempotent, and independent of
     # the caller-token gate above — HA core authenticates the WS connection and
-    # @require_admin gates each command (see websocket_api.py).
+    # @require_admin gates each command (see websocket_api.py). The server
+    # (embedded) entry registers the same surface (#2289), so a server-only
+    # install has it as well; on a dual-entry install both entries register it
+    # and the second registration simply overwrites the first.
     async_register_commands(hass)
-
     # Entry-level finalization: pick up the #1853 rename on existing installs and
     # give the tools entry a device. Both are cosmetic to the integration's core
-    # value; the one fallible step (the manifest version read below) degrades to
-    # the compiled-in fallback rather than blocking setup.
+    # value; the device's manifest version read degrades rather than blocking
+    # setup.
     # Retitle an entry still carrying the pre-rename default; a user-customized
     # title is left untouched (only the exact old default migrates). The tools
     # entry registers no update listener, so this async_update_entry cannot
@@ -3233,27 +3434,8 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
     if entry.title == TOOLS_ENTRY_LEGACY_TITLE:
         hass.config_entries.async_update_entry(entry, title=TOOLS_ENTRY_TITLE)
 
-    # Register a device (parity with the server entry, which gets one via
-    # update.py's DeviceInfo). Tied to the config entry, so HA removes it with
-    # the entry — no unload cleanup needed. The component version comes from the
-    # manifest like the options-form version hint, degrading to the compiled-in
-    # COMPONENT_VERSION if that read fails so a manifest hiccup never breaks setup.
-    component_version = COMPONENT_VERSION
-    try:
-        integration = await async_get_integration(hass, DOMAIN)
-        component_version = str(integration.version)
-    except Exception as err:
-        _LOGGER.debug(
-            "Could not read the component version for the tools device: %s", err
-        )
-    dr.async_get(hass).async_get_or_create(
-        config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, entry.entry_id)},
-        name=TOOLS_ENTRY_TITLE,
-        manufacturer="homeassistant-ai",
-        model="File & YAML editing services",
-        sw_version=component_version,
-        configuration_url="https://github.com/homeassistant-ai/ha-mcp",
+    await async_register_entry_device(
+        hass, entry, name=TOOLS_ENTRY_TITLE, model="File & YAML editing services"
     )
 
     _LOGGER.info("HA-MCP File & YAML Tools initialized with file management services")
@@ -3262,22 +3444,29 @@ async def _async_setup_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> b
 
 async def _async_unload_tools_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload the File & YAML services (tools entry) config entry."""
-    # Remove all services
     hass.services.async_remove(DOMAIN, SERVICE_EDIT_YAML_CONFIG)
     hass.services.async_remove(DOMAIN, SERVICE_LIST_FILES)
+    hass.services.async_remove(DOMAIN, SERVICE_FIND_YAML_KEY)
     hass.services.async_remove(DOMAIN, SERVICE_READ_FILE)
     hass.services.async_remove(DOMAIN, SERVICE_WRITE_FILE)
+    hass.services.async_remove(DOMAIN, SERVICE_EDIT_FILE)
     hass.services.async_remove(DOMAIN, SERVICE_DELETE_FILE)
     hass.services.async_remove(DOMAIN, SERVICE_GET_CALLER_TOKEN)
     hass.services.async_remove(DOMAIN, SERVICE_GET_ALLOWED_PATHS)
     hass.services.async_remove(DOMAIN, SERVICE_SET_ALLOWED_PATHS)
+    hass.services.async_remove(DOMAIN, SERVICE_GET_EXTRA_YAML_KEYS)
+    hass.services.async_remove(DOMAIN, SERVICE_SET_EXTRA_YAML_KEYS)
     hass.services.async_remove(DOMAIN, SERVICE_LIST_LEGACY_BACKUPS)
     hass.services.async_remove(DOMAIN, SERVICE_READ_LEGACY_BACKUP)
 
-    # Drop the cached token + allowlist from hass.data so a subsequent
-    # setup_entry re-reads from storage (covers the reload-after-rotate path).
+    # Drop the cached token + allowlist + extra YAML keys from hass.data so a
+    # subsequent setup_entry re-reads from storage (covers the
+    # reload-after-rotate path). The WS command surface is deliberately NOT
+    # unregistered here — it is shared with the server entry and HA offers no
+    # unregister (#2292); see ``websocket_api.async_register_commands``.
     domain_data = hass.data.get(DOMAIN)
     if isinstance(domain_data, dict):
         domain_data.pop(_HASS_DATA_TOKEN_KEY, None)
         domain_data.pop(_HASS_DATA_ALLOWED_PATHS_KEY, None)
+        domain_data.pop(_HASS_DATA_EXTRA_YAML_KEYS_KEY, None)
     return True
