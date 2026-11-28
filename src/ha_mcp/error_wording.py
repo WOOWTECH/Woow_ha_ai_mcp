@@ -23,6 +23,16 @@ def has_command_failed_prefix(text: str) -> bool:
     return text.lower().startswith(COMMAND_FAILED.lower().rstrip())
 
 
+# --- Core: helpers/entity_registry.py and helpers/device_registry.py --------
+# _validate_area_and_labels (2026.12) raises ValueError "Area '<id>' not found.";
+# config/entity_registry/update and config/device_registry/update answer it
+# ``invalid_info``, the code of every other ValueError an update raises.
+
+
+def registry_unknown_area(message: str) -> bool:
+    return "Area '" in message and "' not found" in message
+
+
 # --- Core: blueprint/websocket_api.py --------------------------------------
 # ws_substitute_blueprint answers ERR_UNKNOWN_ERROR with str(err) for every
 # BlueprintException (MissingInput: "Missing input ...", FailedToLoad: "Failed
@@ -119,6 +129,21 @@ def config_resource_not_found(response_data: dict[str, Any] | None) -> bool:
     """BaseEditConfigView.delete, shared by the id- and key-based views,
     answers 400 for an id it does not have."""
     return (response_data or {}).get("message") == "Resource not found"
+
+
+# BaseEditConfigView.post, shared by the id- and key-based views, sends these two
+# verdicts on a write: a key its key schema refuses (checked first) and a config
+# its validator refuses. Its other 400 ("Invalid JSON specified") and any other
+# 400 text, such as a proxy's page, are not Core judging the config.
+_KEY_MALFORMED = "Key malformed: "
+
+
+def config_view_rejection(text: str) -> bool:
+    return text.startswith((_KEY_MALFORMED, "Message malformed: "))
+
+
+def config_key_malformed(text: str) -> bool:
+    return text.startswith(_KEY_MALFORMED)
 
 
 # --- Supervisor --------------------------------------------------------------
