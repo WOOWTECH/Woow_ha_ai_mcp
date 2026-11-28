@@ -21,9 +21,11 @@ from custom_components.ha_mcp_tools import (
     automation_config,
     card_definitions,
     config_file_items,
+    config_keys,
     config_references,
     core_contract,
     entity_restore,
+    flow_format,
     flow_outline,
     flow_record,
     helper_collections,
@@ -53,6 +55,7 @@ _GATED_COMMANDS: dict[str, dict[str, Any]] = {
     c.WS_DEVICE_GET: {"device_id": "d1"},
     c.WS_DEVICE_LIST: {},
     c.WS_ENTITY_ENRICH: {"entity_ids": []},
+    c.WS_ENTITY_ALIASES: {"entity_ids": []},
     c.WS_EXPOSURE: {},
     c.WS_CONFIG_ENTRIES: {},
     c.WS_REGISTRY_LOOKUP: {"entity_ids": ["light.x"]},
@@ -139,9 +142,11 @@ async def test_every_command_is_registered_and_config_get_is_not(
         config_references.WS_CONFIG_REFERENCES,
         config_file_items.WS_CONFIG_FILE_ITEMS,
         flow_record.WS_FLOW_RECORD,
+        flow_format.WS_FLOW_FORMAT,
         recorder_status.WS_RECORDER_STATUS,
         flow_outline.WS_FLOW_OUTLINE,
         scene_editor.WS_SCENE_IGNORED_DOMAINS,
+        config_keys.WS_CONFIG_KEYS,
     }
     assert "ha_mcp_tools/config_get" not in registered
 

@@ -9,14 +9,16 @@ build that lacks a part is the real module with that attribute removed.
 from __future__ import annotations
 
 import copy
+import importlib
 import logging
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import probatio
 import pytest
 from homeassistant.components import automation as automation_core
 from homeassistant.components.automation import config as automation_core_config
+from homeassistant.const import MAJOR_VERSION, MINOR_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import condition, trigger
@@ -126,10 +128,51 @@ async def test_validation_reports_what_cores_repair_issue_says(
 
     got = await _command(component_ws, action="validate", config=_BAD_TRIGGER)
 
-    assert got == {
+    # Core 2026.12 also lists each error with its path (tested below).
+    assert {key: got[key] for key in ("status", "error")} == {
         "status": "failed_triggers",
         "error": issue.translation_placeholders["error"],
     }
+
+
+@pytest.mark.skipif(
+    (MAJOR_VERSION, MINOR_VERSION) < (2026, 12),
+    reason="Core lists located validation errors since 2026.12",
+)
+async def test_a_failed_config_lists_every_error_with_its_path(
+    component_ws: MockHAClientWebSocket,
+) -> None:
+    """Two broken actions, one nested in a choose: each error comes back with
+    its path in the config, as Core's config view lists them."""
+    config = {
+        "triggers": [{"trigger": "event", "event_type": "x"}],
+        "actions": [
+            {"delay": "not a time"},
+            {"choose": [{"conditions": [], "sequence": [{"delay": "nope"}]}]},
+        ],
+    }
+
+    got = await _command(component_ws, action="validate", config=config)
+
+    paths = [error["path"] for error in got["errors"]]
+    assert all(path[0] == "actions" for path in paths)
+    assert {path[1] for path in paths} == {0, 1}
+    assert ["actions", 1, "choose", 0, "sequence", 0] in [p[:6] for p in paths]
+
+
+async def test_a_refused_config_imports_nothing_in_the_handler(
+    component_ws: MockHAClientWebSocket,
+) -> None:
+    """The handler runs on the event loop, where Core reports an import as a
+    blocking call and asks the user to file a bug against this integration."""
+    with patch.object(
+        importlib, "import_module", wraps=importlib.import_module
+    ) as imported:
+        got = await _command(component_ws, action="validate", config=_BAD_TRIGGER)
+
+    assert got["status"] == "failed_triggers"
+    looked_up = [call.args[0] for call in imported.call_args_list if call.args]
+    assert "homeassistant.helpers.validation_errors" not in looked_up
 
 
 async def test_validation_leaves_the_callers_config_unchanged(
@@ -436,6 +479,114 @@ async def test_references_are_absent_while_the_automation_is_not_loaded(
     assert got["found"] is True
     assert got["loaded"] is False
     assert got["references"] is None
+
+
+# --- lookup of a script -------------------------------------------------------
+
+_SCRIPT_BLUEPRINT_PATH = "ha_mcp_test/flash.yaml"
+_SCRIPT_BLUEPRINT = """\
+blueprint:
+  name: Flash
+  domain: script
+  input:
+    target:
+      selector: {target: {}}
+sequence:
+  - action: light.turn_on
+    target: !input target
+"""
+FLASH = "script.flash"
+
+
+async def _load_scripts(hass: HomeAssistant, scripts: dict[str, Any]) -> None:
+    """Load ``scripts`` the way Core loads ``scripts.yaml`` at start."""
+    await write_config_files(
+        hass,
+        {
+            f"blueprints/script/{_SCRIPT_BLUEPRINT_PATH}": _SCRIPT_BLUEPRINT,
+            "scripts.yaml": dump(scripts),
+            "configuration.yaml": "script: !include scripts.yaml\n",
+        },
+    )
+    await setup_from_configuration(hass, "script")
+
+
+async def test_a_script_lookup_carries_the_references_core_reads(
+    hass: HomeAssistant, component_ws: MockHAClientWebSocket
+) -> None:
+    flash = {
+        "use_blueprint": {
+            "path": _SCRIPT_BLUEPRINT_PATH,
+            "input": {"target": {"entity_id": ["light.porch"], "floor_id": "f1"}},
+        }
+    }
+    await _load_scripts(hass, {"flash": flash})
+
+    got = await _command(
+        component_ws, action="lookup", domain="script", unique_id="flash"
+    )
+
+    assert got["found"] is True
+    assert got["entity"]["entity_id"] == FLASH
+    assert got["loaded"] is True
+    assert got["validation"] is None
+    assert got["references"] == {
+        "entities": ["light.porch"],
+        "devices": [],
+        "areas": [],
+        "floors": ["f1"],
+        "labels": [],
+        "blueprint": _SCRIPT_BLUEPRINT_PATH,
+    }
+
+
+async def test_a_script_lookup_reports_the_validation_issue_core_filed(
+    hass: HomeAssistant,
+    component_ws: MockHAClientWebSocket,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """A blueprint script missing a required input fails to load; Core files
+    a repair issue for it under the script domain."""
+    await _load_scripts(
+        hass, {"flash": {"use_blueprint": {"path": _SCRIPT_BLUEPRINT_PATH}}}
+    )
+    issue = issue_registry.async_get_issue(
+        "script", f"{FLASH}_validation_failed_blueprint"
+    )
+    assert issue is not None
+    assert issue.translation_placeholders is not None
+
+    got = await _command(
+        component_ws, action="lookup", domain="script", entity_id=FLASH
+    )
+
+    assert got["found"] is True
+    assert got["validation"] == {
+        "status": "failed_blueprint",
+        "error": issue.translation_placeholders["error"],
+    }
+    assert got["loaded"] is False
+    assert got["references"] is None
+
+
+async def test_a_script_lookup_does_not_answer_for_an_automation(
+    hass: HomeAssistant, component_ws: MockHAClientWebSocket
+) -> None:
+    await _load(hass, _MORNING)
+
+    got = await _command(
+        component_ws, action="lookup", domain="script", entity_id=MORNING
+    )
+
+    assert got["found"] is False
+
+
+async def test_only_the_lookup_takes_the_script_domain(hass: HomeAssistant) -> None:
+    """Answered, a script validate would run Core's automation validator."""
+    with pytest.raises(HomeAssistantError):
+        await automation_config.async_automation_config(
+            hass, {"action": "validate", "domain": "script", "config": {}}
+        )
 
 
 @pytest.mark.parametrize(

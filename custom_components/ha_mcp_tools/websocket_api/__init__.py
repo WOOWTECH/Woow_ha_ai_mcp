@@ -78,6 +78,9 @@ the info handshake carries no capability entry:
   ``area_id`` / label *ids*, not resolved names) without the caller fanning out
   its own area/floor/label registry reads. Registry-only entities (no state) are
   enriched too — the join keys off the registry, not the state machine.
+* ``ha_mcp_tools/entity_aliases`` — Core's own names for a set of entity_ids
+  (``er.async_get_entity_aliases``), which the statistics listing's query
+  matches.
 * ``ha_mcp_tools/exposure`` — voice-assistant exposure with names/areas attached.
   List mode mirrors core's ``ws_list_exposed_entities`` (``{exposed_entities:
   {id: {assistant: True}}}`` — the same entries as ``homeassistant/expose_entity/
@@ -122,8 +125,9 @@ the info handshake carries no capability entry:
 * ``ha_mcp_tools/automation_config`` — Core's automation validator run on a
   proposed config (``validate``: Core's ``validation_status`` and humanized
   error), Core's trigger/condition descriptions (``describe``), and an
-  automation's registry row, validation repair issue and references
-  (``lookup``). See ``automation_config.py``.
+  automation's or, with ``domain: "script"`` (capability ``script_lookup``), a
+  script's registry row, validation repair issue and references (``lookup``).
+  See ``automation_config.py``.
 * ``ha_mcp_tools/config_references`` — a proposed automation, script or scene
   validated by Core, its references collected by Core's own helpers and
   checked against Core's registries, and each entity target put to Core's
@@ -132,7 +136,14 @@ the info handshake carries no capability entry:
   config or options flow (most helper flows): each form's fields as Core
   serializes a form it shows, and the step that follows it, read from the
   loaded flow handler on every call. A form or next step Core computes from
-  earlier answers is marked, not evaluated. See ``flow_outline.py``.
+  earlier answers is marked, not evaluated. On Home Assistant 2026.12 each
+  declared form's fields carry Core's labels and help text, from Core's flow
+  formatter. See ``flow_outline.py``.
+* ``ha_mcp_tools/flow_format`` — a flow step as Home Assistant 2026.12's
+  ``llm.flow.format_result`` formats it (titles, field labels and help, errors,
+  menu labels, progress, create-entry and abort texts), with the translations
+  Core's own config and repairs tools use; ``supported: false`` before 2026.12.
+  See ``flow_format.py``.
 * ``ha_mcp_tools/flow_record`` — what a config, options, subentry or Repairs
   fix flow in progress was started for (its handler, source, entry and issue
   anchors), read from the flow manager that holds it. Core's flow endpoints
@@ -153,6 +164,9 @@ the info handshake carries no capability entry:
 * ``ha_mcp_tools/scene_ignored_domains`` — the domains the scene editor leaves
   out of a picked device's entities, read from the installed frontend build,
   the only place the list exists. See ``scene_editor.py``.
+* ``ha_mcp_tools/config_keys`` — the top-level keys an automation or script
+  config takes, read from Core's schema for the domain and the blueprint
+  instance fields. See ``config_keys.py``.
 * ``ha_mcp_tools/logbook_events`` — Core's own logbook query run in-process:
   ``EventProcessor`` with the REST flags (``timestamp=False`` ISO ``when``,
   ``include_entity_name=True``) and the ``logbook/get_events`` filter set
@@ -380,10 +394,12 @@ from homeassistant.helpers import entity_registry as er
 from .. import (
     automation_config,
     config_file_items,
+    config_keys,
     config_references,
     core_contract,
     dashboard_cards_ws,
     entity_restore,
+    flow_format,
     flow_outline,
     flow_record,
     helper_collections,
@@ -408,6 +424,7 @@ from .lookups import (
     _blueprint_get_prep,
     _do_blueprint_get,
     _do_device_list,
+    _do_entity_aliases,
     _do_entity_enrich,
     _do_entity_lookup,
     _do_exposure,
@@ -427,6 +444,7 @@ from .schemas import (
     _dashboards_schema,
     _device_get_schema,
     _device_list_schema,
+    _entity_aliases_schema,
     _entity_enrich_schema,
     _entity_lookup_schema,
     _exposure_schema,
@@ -528,6 +546,7 @@ def _command_specs() -> list[tuple[dict[Any, Any], Any, Any]]:
         (_device_get_schema(), do_device_get, None),
         (_device_list_schema(), _do_device_list, None),
         (_entity_enrich_schema(), _do_entity_enrich, None),
+        (_entity_aliases_schema(), _do_entity_aliases, None),
         (_exposure_schema(), _do_exposure, None),
         (_config_entries_schema(), _do_config_entries, _config_entries_prep),
         (_registry_lookup_schema(), _do_registry_lookup, None),
@@ -578,8 +597,10 @@ def _command_specs() -> list[tuple[dict[Any, Any], Any, Any]]:
         *todo_items.command_specs(vol),
         *update_entities.command_specs(vol),
         *flow_record.command_specs(vol),
+        *flow_format.command_specs(vol),
         *flow_outline.command_specs(vol),
         *scene_editor.command_specs(vol),
+        *config_keys.command_specs(vol),
         *automation_config.command_specs(vol),
         *config_references.command_specs(vol),
         *config_file_items.command_specs(vol),
